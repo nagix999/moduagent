@@ -16,6 +16,9 @@ from moduagent.persistence import (
     InMemoryConversationStore,
 )
 from moduagent.runtime import AgentEvent, AgentResult, AgentRuntime, RunRequest
+from moduagent.skills import SkillLimits, SkillRegistry, SkillSelector
+from moduagent.skills.runtime import SkillRuntime
+from moduagent.skills.tools import SkillReadTool, SkillSearchTool
 from moduagent.tools import (
     AllowAllAuthorizer,
     Tool,
@@ -41,10 +44,32 @@ class Agent:
         tool_authorizer: ToolAuthorizer | None = None,
         checkpoint_store: CheckpointStore | None = None,
         conversation_memory_policy: ConversationMemoryPolicy | None = None,
+        skill_registry: SkillRegistry | None = None,
+        skill_selector: SkillSelector | None = None,
+        skill_limits: SkillLimits | None = None,
     ) -> None:
+        if skill_selector is not None and skill_registry is None:
+            raise ValueError("skill_selector requires skill_registry")
         self.config = config
         self.model = model
-        self.tool_registry = ToolRegistry(tools)
+        self.skill_registry = skill_registry
+        self.skill_runtime = (
+            SkillRuntime(
+                skill_registry,
+                selector=skill_selector,
+                limits=skill_limits,
+            )
+            if skill_registry is not None
+            else None
+        )
+        registered_tools = tuple(tools)
+        if self.skill_runtime is not None:
+            registered_tools = (
+                *registered_tools,
+                SkillReadTool(self.skill_runtime),
+                SkillSearchTool(self.skill_runtime),
+            )
+        self.tool_registry = ToolRegistry(registered_tools)
         self.tool_executor = ToolExecutor(
             self.tool_registry,
             authorizer=tool_authorizer or AllowAllAuthorizer(),
@@ -65,6 +90,7 @@ class Agent:
             event_sink=event_sink or NoopEventSink(),
             checkpoint_store=checkpoint_store,
             conversation_memory_policy=self.conversation_memory_policy,
+            skill_runtime=self.skill_runtime,
         )
 
     async def run(
@@ -74,12 +100,16 @@ class Agent:
         session_id: str | None = None,
         user_context: Mapping[str, Any] | None = None,
         resume_run_id: str | None = None,
+        skills: Iterable[str] = (),
+        skill_mode: str | None = None,
     ) -> AgentResult:
         request = self._request(
             text,
             session_id=session_id,
             user_context=user_context,
             resume_run_id=resume_run_id,
+            skills=skills,
+            skill_mode=skill_mode,
         )
         return await self.runtime.execute(request)
 
@@ -90,12 +120,16 @@ class Agent:
         session_id: str | None = None,
         user_context: Mapping[str, Any] | None = None,
         resume_run_id: str | None = None,
+        skills: Iterable[str] = (),
+        skill_mode: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         request = self._request(
             text,
             session_id=session_id,
             user_context=user_context,
             resume_run_id=resume_run_id,
+            skills=skills,
+            skill_mode=skill_mode,
         )
         return self.runtime.stream(request)
 
@@ -113,12 +147,30 @@ class Agent:
         session_id: str | None,
         user_context: Mapping[str, Any] | None,
         resume_run_id: str | None,
+        skills: Iterable[str],
+        skill_mode: str | None,
     ) -> RunRequest:
         if not isinstance(text, str):
             raise TypeError("agent input must be a string")
+        if isinstance(skills, (str, bytes)):
+            raise TypeError("skills must be an iterable of Skill names")
+        requested_skills = tuple(skills)
+        resolved_skill_mode = (
+            skill_mode
+            if skill_mode is not None
+            else ("explicit" if requested_skills else "disabled")
+        )
+        if requested_skills and resolved_skill_mode == "disabled":
+            raise ValueError("skills cannot be requested when skill_mode is disabled")
+        if requested_skills and resolved_skill_mode == "auto":
+            raise ValueError("use skill_mode='hybrid' with explicitly requested skills")
+        if resume_run_id is not None and (requested_skills or skill_mode is not None):
+            raise ValueError("resume restores Skills from the checkpoint")
         return RunRequest(
             input=text,
             session_id=session_id or uuid.uuid4().hex,
             user_context=dict(user_context or {}),
             resume_run_id=resume_run_id,
+            requested_skills=requested_skills,
+            skill_mode=resolved_skill_mode,
         )

@@ -9,6 +9,7 @@ from moduagent.decision.base import DecisionKind, ExecutionDecision
 from moduagent.messages import Message
 from moduagent.models import ModelClient, ModelRequest, ModelResponse
 from moduagent.runtime.context import RunContext
+from moduagent.skills.prompting import compose_skill_prompt
 from moduagent.tools import ToolResult
 
 
@@ -100,12 +101,17 @@ class LLMPlanGenerator:
 
     async def create(self, context: RunContext) -> Plan:
         request = ModelRequest(
-            messages=(
-                Message.system(
-                    "Create a concise execution plan. Return JSON only as "
-                    '{"steps":[{"description":"...","expected_output":"..."}]}.'
+            messages=compose_skill_prompt(
+                self._base_messages(
+                    context,
+                    Message.system(
+                        "Create a concise execution plan. Return JSON only as "
+                        '{"steps":[{"description":"...",'
+                        '"expected_output":"..."}]}.'
+                    ),
+                    Message.user(context.request.input),
                 ),
-                Message.user(context.request.input),
+                context.skill_messages,
             ),
             output_schema=self._schema(),
         )
@@ -115,24 +121,37 @@ class LLMPlanGenerator:
 
     async def revise(self, context: RunContext, plan: Plan, feedback: str) -> Plan:
         request = ModelRequest(
-            messages=(
-                Message.system("Revise the plan. Return the same JSON shape only."),
-                Message.user(
-                    json.dumps(
-                        {
-                            "request": context.request.input,
-                            "plan": plan.to_dict(),
-                            "feedback": feedback,
-                        },
-                        ensure_ascii=False,
-                    )
+            messages=compose_skill_prompt(
+                self._base_messages(
+                    context,
+                    Message.system("Revise the plan. Return the same JSON shape only."),
+                    Message.user(
+                        json.dumps(
+                            {
+                                "request": context.request.input,
+                                "plan": plan.to_dict(),
+                                "feedback": feedback,
+                            },
+                            ensure_ascii=False,
+                        )
+                    ),
                 ),
+                context.skill_messages,
             ),
             output_schema=self._schema(),
         )
         response = await self.model.complete(request)
         context.usage = context.usage + response.usage
         return self._parse(response.message.content, context.request.input)
+
+    @staticmethod
+    def _base_messages(
+        context: RunContext,
+        *phase_messages: Message,
+    ) -> tuple[Message, ...]:
+        if context.messages and context.messages[0].role.value == "system":
+            return (context.messages[0], *phase_messages)
+        return tuple(phase_messages)
 
     def _parse(self, content: str | None, fallback: str) -> Plan:
         try:

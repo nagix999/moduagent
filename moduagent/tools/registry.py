@@ -37,8 +37,19 @@ class ToolRegistry:
             raise KeyError(f"unknown tool: {name}")
         return tool
 
-    def schemas(self) -> tuple[ToolSchema, ...]:
-        return tuple(tool.schema for tool in self._tools.values())
+    def schemas(self, names: Iterable[str] | None = None) -> tuple[ToolSchema, ...]:
+        """Return schemas in registration order, optionally restricted by name."""
+
+        if names is None:
+            return tuple(tool.schema for tool in self._tools.values())
+        selected = frozenset(str(name) for name in names)
+        unknown = selected.difference(self._tools)
+        if unknown:
+            missing = ", ".join(sorted(unknown))
+            raise KeyError(f"unknown tools: {missing}")
+        return tuple(
+            tool.schema for name, tool in self._tools.items() if name in selected
+        )
 
     @property
     def schema_list(self) -> tuple[ToolSchema, ...]:

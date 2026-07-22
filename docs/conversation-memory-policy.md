@@ -236,7 +236,7 @@ assistant(tool_calls=[A, B])
 - 손상된 과거 Tool 블록은 해당 turn 전체를 제외하고 이벤트를 남긴다.
 - 현재 실행의 Tool 블록이 손상됐으면 `MemoryIntegrityError`로 실패한다.
 
-현재 실행의 Tool 결과가 너무 큰 경우에도 기본값은 오류다. 검색 결과나 로그처럼 축약이 허용된 Tool만 별도 `ToolResultReducer`를 명시적으로 설정할 수 있다. reducer는 원본 해시와 원래 크기를 남기고 assistant/Tool 관계는 유지해야 한다.
+현재 실행의 Tool 결과가 너무 큰 경우에도 기본값은 오류다. 0.2.0에는 Tool 결과를 의미 보존 방식으로 축약하는 public reducer API가 없으므로, Tool 자체의 pagination과 `max_result_bytes`를 사용해 결과 크기를 제한한다.
 
 ## 요약과 상태 저장
 
@@ -286,7 +286,11 @@ async def _prepare_model_request(
     *,
     phase: MemoryPhase,
     deadline: float,
-) -> ModelRequest:
+) -> tuple[ModelRequest, AgentEvent | None]:
+    request = replace(
+        request,
+        messages=compose_skill_prompt(request.messages, context.skill_messages),
+    )
     memory = await self._within(
         deadline,
         lambda: self.conversation_memory_policy.prepare(
@@ -295,14 +299,29 @@ async def _prepare_model_request(
                 session_id=context.request.session_id,
                 phase=phase,
                 model_request=request,
-                protected_from=context.current_run_start,
+                protected_from=(
+                    context.current_run_start + len(context.skill_messages)
+                ),
                 user_context=context.request.user_context,
             )
         ),
     )
     context.usage = context.usage + memory.usage
-    return replace(request, messages=memory.messages)
+    prepared = replace(request, messages=tuple(memory.messages))
+    compacted = (
+        prepared.messages != request.messages
+        or memory.summarized_messages > 0
+        or memory.dropped_messages > 0
+    )
+    event = (
+        AgentEvent(EventType.MEMORY_COMPACTED, context.run_id, dict(memory.metadata))
+        if compacted
+        else None
+    )
+    return prepared, event
 ```
+
+위 코드는 흐름을 설명한 축약 예시다. 실제 이벤트에는 token·요약·제외 수치도 포함하며, view가 바뀐 경우에만 생성한다.
 
 호출 순서는 다음과 같다.
 
@@ -315,7 +334,7 @@ ConversationStore.load
 → bounded ModelRequest 전송
 ```
 
-체크포인트는 전체 원문과 `current_run_start`, `policy_fingerprint`, 사용한 memory snapshot 식별자를 저장한다. resume 시 fingerprint가 다르면 조용히 다른 view를 만들지 않고 명확한 호환 오류를 반환한다. 요약 성공 후 usage와 snapshot 식별자를 checkpoint에 저장한 다음 모델을 호출한다.
+체크포인트는 전체 실행 메시지와 `current_run_start`, 누적 usage를 저장한다. 요약 cache의 `policy_fingerprint`와 covered-prefix digest는 `MemoryStateStore`의 `MemorySnapshot`이 관리하며 0.2.0 checkpoint에는 snapshot 식별자를 중복 저장하지 않는다. Resume 후 cache가 현재 Policy나 원문 prefix와 맞지 않으면 MemoryPolicy가 cache를 사용하지 않고 다시 요약한다.
 
 `LLMPlanGenerator`는 현재 과거 대화 전체가 아니라 현재 `request.input`만 모델에 보내므로 긴 history에 의한 context 초과 대상은 아니다. 다만 “아까 말한 내용”처럼 과거 참조를 포함하는 계획의 품질은 떨어질 수 있다. 후속 단계에서 PLAN도 동일한 request-preparation 경로를 사용하도록 Model 호출 책임을 Runtime으로 이동한다.
 

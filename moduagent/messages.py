@@ -40,26 +40,53 @@ class Message:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def system(cls, content: str) -> "Message":
-        return cls(MessageRole.SYSTEM, content)
+    def system(
+        cls,
+        content: str,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> "Message":
+        return cls(MessageRole.SYSTEM, content, metadata=dict(metadata or {}))
 
     @classmethod
-    def user(cls, content: str) -> "Message":
-        return cls(MessageRole.USER, content)
+    def user(
+        cls,
+        content: str,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> "Message":
+        return cls(MessageRole.USER, content, metadata=dict(metadata or {}))
 
     @classmethod
     def assistant(
-        cls, content: str | None, tool_calls: tuple[ToolCall, ...] = ()
+        cls,
+        content: str | None,
+        tool_calls: tuple[ToolCall, ...] = (),
+        *,
+        metadata: Mapping[str, Any] | None = None,
     ) -> "Message":
-        return cls(MessageRole.ASSISTANT, content, tool_calls=tool_calls)
+        return cls(
+            MessageRole.ASSISTANT,
+            content,
+            tool_calls=tool_calls,
+            metadata=dict(metadata or {}),
+        )
 
     @classmethod
-    def tool(cls, content: str, *, call_id: str, name: str) -> "Message":
+    def tool(
+        cls,
+        content: str,
+        *,
+        call_id: str,
+        name: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> "Message":
         return cls(
             MessageRole.TOOL,
             content,
             tool_call_id=call_id,
             name=name,
+            metadata=dict(metadata or {}),
         )
 
     def to_dict(self) -> dict[str, Any]:

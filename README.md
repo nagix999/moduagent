@@ -1,8 +1,9 @@
 # ModuAgent
 
-PDF 기술 설계에 따라 구현한 합성형 Python AI Agent 프레임워크입니다. `Agent`/`AgentRuntime`, vLLM·Ollama, Function Tool, 토큰 스트리밍, 구조화 출력, RBAC, 대화·체크포인트 저장, Plan-and-Execute, 관측성 컴포넌트를 제공합니다.
+PDF 기술 설계에 따라 구현한 합성형 Python AI Agent 프레임워크입니다. `Agent`/`AgentRuntime`, vLLM·Ollama, Function Tool, Agent Skills, 토큰 스트리밍, 구조화 출력, RBAC, 대화·체크포인트 저장, Plan-and-Execute, 관측성 컴포넌트를 제공합니다.
 
-- [ConversationMemoryPolicy 설계](docs/conversation-memory-policy.md)
+- [ConversationMemoryPolicy 설계](https://github.com/nagix999/moduagent/blob/main/docs/conversation-memory-policy.md)
+- [Agent Skills 사용과 보안](https://github.com/nagix999/moduagent/blob/main/docs/skills.md)
 
 ## 설치
 
@@ -73,6 +74,97 @@ asyncio.run(main())
 ```
 
 `InMemoryConversationStore`는 단일 프로세스 메모리에 대화 원문을 저장합니다. 동일한 `session_id`를 사용하면 이전 대화가 이어지며, 위 예제에서는 마지막 접근 후 1시간이 지나면 대화가 만료됩니다. `RecentTurnsConversationMemoryPolicy(max_turns=6)`는 저장된 원문을 지우지 않고, 모델 요청에만 최근 완료 대화 6개와 현재 실행 내용을 전달합니다. Tool Call과 그 결과는 하나의 대화로 묶어서 유지됩니다.
+
+## Agent Skills
+
+Skill은 모델에 업무 절차와 지식을 제공하고, Tool은 실제 작업을 실행합니다. Skill을 활성화해도 Tool 권한은 추가되지 않습니다.
+
+0.2.0은 운영자가 검토한 로컬·agent-scoped Skill catalog를 신뢰 경계로 사용합니다. 서로 신뢰하지 않는 tenant가 같은 catalog를 공유해야 한다면 tenant별 Registry 또는 별도 Skill 접근 제어 계층을 둡니다.
+
+공식 Agent Skills 형식처럼 Skill마다 `SKILL.md`를 둡니다.
+
+```text
+skills/
+└── invoice-review/
+    ├── SKILL.md
+    ├── references/
+    │   └── policy.md
+    └── assets/
+        └── report-template.md
+```
+
+```markdown
+---
+name: invoice-review
+description: 회사 정책에 따라 청구서를 검토한다. 청구서 오류와 승인 여부를 확인할 때 사용한다.
+metadata:
+  version: "1.0.0"
+allowed-tools: lookup_invoice lookup_vendor
+---
+
+# Invoice review
+
+1. 필요하면 `references/policy.md`를 읽는다.
+2. 등록된 조회 Tool로 원본을 확인한다.
+3. 확인되지 않은 내용은 추측하지 않는다.
+```
+
+명시적으로 Skill을 선택하는 방식이 기본입니다.
+
+```python
+from moduagent import Agent, AgentConfig, SkillRegistry
+
+skills = SkillRegistry.from_paths("./skills")
+agent = Agent(
+    config=AgentConfig(
+        name="invoice-agent",
+        instructions="근거가 확인된 내용만 답한다.",
+    ),
+    model=model,
+    tools=[lookup_invoice, lookup_vendor],
+    skill_registry=skills,
+)
+
+result = await agent.run(
+    "이 청구서를 검토해줘",
+    session_id="invoice-42",
+    skills=["invoice-review"],
+)
+```
+
+모델이 `name`과 `description`만 보고 자동 선택하게 하려면 별도 Selector를 설정합니다. 선택 단계는 Tool 없이 구조화 출력만 사용하는 독립 호출이므로 Tool Calling과 최종 `PydanticOutputCodec`을 방해하지 않습니다.
+
+```python
+from moduagent import ModelSkillSelector
+
+agent = Agent(
+    config=AgentConfig(name="assistant", instructions="정확하게 답한다."),
+    model=model,
+    skill_registry=skills,
+    skill_selector=ModelSkillSelector(model=model, max_skills=2),
+)
+
+result = await agent.run("이 청구서를 검토해줘", skill_mode="auto")
+```
+
+`skill_mode="hybrid"`와 `skills=[...]`를 함께 전달하면 명시 Skill을 먼저 고정하고 남은 범위를 자동 선택합니다.
+
+활성화된 `SKILL.md` 본문은 PLAN·ACT·FINALIZE에 적용되지만 대화 저장소와 `AgentResult.messages`에는 저장되지 않습니다. `references/`와 text `assets/`는 모델이 내부 `moduagent_skill_read`·`moduagent_skill_search` Tool로 필요한 부분만 읽습니다. Resource 호출은 `max_tool_calls` 대신 `SkillLimits.max_resource_reads`를 사용하지만 모델 판단 단계는 추가되므로 `RunLimits.max_steps`는 소비합니다.
+
+`allowed-tools`는 권한을 주는 설정이 아닙니다. 실제 사용 범위는 등록된 Tool과 Skill 선언의 교집합이며, 실행 직전에 `ToolAuthorizer`를 다시 적용합니다. RBAC을 사용할 때는 필요한 내부 Resource Tool도 정책에 허용해야 합니다. `scripts/`는 패키지 digest에는 포함되지만 0.2.0에서는 자동 실행하거나 읽지 않습니다.
+
+Skill 작성과 검증:
+
+```bash
+moduagent skills init invoice-review --path ./skills
+moduagent skills validate ./skills
+moduagent skills inspect ./skills --json
+moduagent skills lock ./skills
+```
+
+운영 환경에서는 생성된 lock을 `SkillRegistry.from_paths("./skills", lockfile="./skills/skills.lock.json")`로 검증하면 시작 시 catalog·version·source·digest 불일치를 차단합니다.
+
+보안 경로 검증을 위해 `FilesystemSkillSource`는 POSIX `openat`/`O_NOFOLLOW`를 요구합니다. 이를 제공하지 않는 플랫폼에서는 `InMemorySkillSource` 또는 같은 격리 계약을 구현한 custom source를 사용하세요.
 
 ### 긴 대화의 토큰 제한
 
