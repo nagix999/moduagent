@@ -10,10 +10,16 @@ from datetime import datetime, timezone
 from typing import Any, Protocol, runtime_checkable
 
 from moduagent.messages import Message, Usage
-from moduagent.runtime.context import RunContext, RunRequest, RunStatus
+from moduagent.runtime.context import (
+    RunContext,
+    RunRequest,
+    RunStatus,
+    SkillRunState,
+)
 
 
-_CHECKPOINT_VERSION = 1
+_CHECKPOINT_VERSION = 2
+_SUPPORTED_CHECKPOINT_VERSIONS = frozenset({1, _CHECKPOINT_VERSION})
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +31,8 @@ class RunCheckpoint:
     messages: tuple[Message, ...]
     input: str = ""
     user_context: Mapping[str, Any] = field(default_factory=dict)
+    requested_skills: tuple[str, ...] = ()
+    skill_mode: str = "disabled"
     new_messages: tuple[Message, ...] = ()
     step: int = 0
     tool_call_count: int = 0
@@ -35,6 +43,7 @@ class RunCheckpoint:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     current_run_start: int = 0
+    skill_state: SkillRunState = field(default_factory=SkillRunState)
 
     def __post_init__(self) -> None:
         _validate_identifier(self.run_id, "run_id")
@@ -47,10 +56,13 @@ class RunCheckpoint:
             object.__setattr__(self, "status", RunStatus(str(self.status)))
         object.__setattr__(self, "messages", tuple(self.messages))
         object.__setattr__(self, "new_messages", tuple(self.new_messages))
+        object.__setattr__(self, "requested_skills", tuple(self.requested_skills))
         if not all(isinstance(message, Message) for message in self.messages):
             raise TypeError("messages must contain Message instances")
         if not all(isinstance(message, Message) for message in self.new_messages):
             raise TypeError("new_messages must contain Message instances")
+        if not isinstance(self.skill_state, SkillRunState):
+            raise TypeError("skill_state must be a SkillRunState")
 
     @classmethod
     def from_context(
@@ -65,6 +77,8 @@ class RunCheckpoint:
             session_id=context.request.session_id,
             input=context.request.input,
             user_context=dict(context.request.user_context),
+            requested_skills=context.request.requested_skills,
+            skill_mode=context.request.skill_mode,
             messages=tuple(context.messages),
             new_messages=tuple(context.new_messages),
             step=context.step,
@@ -76,6 +90,7 @@ class RunCheckpoint:
             created_at=created_at or now,
             updated_at=now,
             current_run_start=context.current_run_start,
+            skill_state=context.skill_state,
         )
 
     def to_context(self) -> RunContext:
@@ -84,6 +99,8 @@ class RunCheckpoint:
             session_id=self.session_id,
             user_context=dict(self.user_context),
             resume_run_id=self.run_id,
+            requested_skills=self.requested_skills,
+            skill_mode=self.skill_mode,
         )
         return RunContext(
             run_id=self.run_id,
@@ -97,6 +114,7 @@ class RunCheckpoint:
             usage=self.usage,
             metadata=dict(self.metadata),
             current_run_start=self.current_run_start,
+            skill_state=self.skill_state,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -106,6 +124,8 @@ class RunCheckpoint:
             "session_id": self.session_id,
             "input": self.input,
             "user_context": dict(self.user_context),
+            "requested_skills": list(self.requested_skills),
+            "skill_mode": self.skill_mode,
             "messages": [message.to_dict() for message in self.messages],
             "new_messages": [message.to_dict() for message in self.new_messages],
             "step": self.step,
@@ -120,14 +140,15 @@ class RunCheckpoint:
             },
             "metadata": dict(self.metadata),
             "current_run_start": self.current_run_start,
+            "skill_state": self.skill_state.to_dict(),
             "created_at": _as_utc(self.created_at).isoformat(),
             "updated_at": _as_utc(self.updated_at).isoformat(),
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "RunCheckpoint":
-        version = int(value.get("version", _CHECKPOINT_VERSION))
-        if version != _CHECKPOINT_VERSION:
+        version = int(value.get("version", 1))
+        if version not in _SUPPORTED_CHECKPOINT_VERSIONS:
             raise ValueError(f"unsupported checkpoint version: {version}")
         raw_usage = value.get("usage", {})
         if not isinstance(raw_usage, Mapping):
@@ -138,11 +159,21 @@ class RunCheckpoint:
             total_tokens=int(raw_usage.get("total_tokens", 0)),
             provider=dict(raw_usage.get("provider", {})),
         )
+        raw_requested_skills = value.get("requested_skills", ())
+        if isinstance(raw_requested_skills, (str, bytes)) or not isinstance(
+            raw_requested_skills, (list, tuple)
+        ):
+            raise ValueError("checkpoint requested_skills must be an array")
+        raw_skill_state = value.get("skill_state", {})
+        if not isinstance(raw_skill_state, Mapping):
+            raise ValueError("checkpoint skill_state must be an object")
         return cls(
             run_id=str(value["run_id"]),
             session_id=str(value["session_id"]),
             input=str(value.get("input", "")),
             user_context=dict(value.get("user_context", {})),
+            requested_skills=tuple(str(skill) for skill in raw_requested_skills),
+            skill_mode=str(value.get("skill_mode", "disabled")),
             messages=tuple(
                 Message.from_dict(message) for message in value.get("messages", ())
             ),
@@ -165,6 +196,14 @@ class RunCheckpoint:
                     "current_run_start",
                     min(1, len(value.get("messages", ()))),
                 )
+            ),
+            # Version 1 did not persist skill activation state. It resumes with
+            # skills disabled instead of re-selecting against a possibly changed
+            # catalog.
+            skill_state=(
+                SkillRunState.from_dict(raw_skill_state)
+                if version >= 2
+                else SkillRunState()
             ),
         )
 

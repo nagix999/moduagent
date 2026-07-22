@@ -31,7 +31,20 @@ from moduagent.runtime.context import (
     RunStatus,
 )
 from moduagent.runtime.events import AgentEvent, EventType
-from moduagent.tools import ToolExecutionContext, ToolExecutor, ToolResult
+from moduagent.skills.prompting import compose_skill_prompt, is_ephemeral_message
+from moduagent.skills.runtime import SkillRuntime
+from moduagent.skills.tools import (
+    SKILL_READ_TOOL_NAME,
+    SKILL_RESOURCE_TOOL_NAMES,
+    SKILL_SEARCH_TOOL_NAME,
+)
+from moduagent.tools import (
+    ToolError,
+    ToolErrorType,
+    ToolExecutionContext,
+    ToolExecutor,
+    ToolResult,
+)
 
 
 T = TypeVar("T")
@@ -61,6 +74,7 @@ class AgentRuntime:
         event_sink: EventSink,
         checkpoint_store: CheckpointStore | None = None,
         conversation_memory_policy: ConversationMemoryPolicy | None = None,
+        skill_runtime: SkillRuntime | None = None,
     ) -> None:
         self.config = config
         self.model = model
@@ -70,6 +84,7 @@ class AgentRuntime:
         self.output_codec = output_codec
         self.event_sink = event_sink
         self.checkpoint_store = checkpoint_store
+        self.skill_runtime = skill_runtime
         self.conversation_memory_policy = (
             conversation_memory_policy
             if conversation_memory_policy is not None
@@ -162,11 +177,19 @@ class AgentRuntime:
                 ]
                 context.current_run_start = 1 + len(history)
 
+            async for skill_event in self._skill_events(
+                context,
+                deadline,
+                resumed=bool(request.resume_run_id),
+            ):
+                yield skill_event
+            await self._save_checkpoint(context, deadline)
+
             context.status = RunStatus.RUNNING
             await self._within(deadline, lambda: self.decision_policy.begin(context))
             await self._save_checkpoint(context, deadline)
 
-            tool_schemas = tuple(self.tool_executor.registry.schemas())
+            tool_schemas = self._tool_schemas(context)
             output_schema = self.output_codec.schema()
             staged_finalization = bool(tool_schemas and output_schema is not None)
 
@@ -306,11 +329,71 @@ class AgentRuntime:
                     continue
 
                 calls = tuple(decision.tool_calls)
+                skill_resource_calls = tuple(
+                    call for call in calls if call.name in SKILL_RESOURCE_TOOL_NAMES
+                )
+                business_calls = tuple(
+                    call for call in calls if call.name not in SKILL_RESOURCE_TOOL_NAMES
+                )
+                protocol_error: str | None = None
+                if skill_resource_calls and business_calls:
+                    protocol_error = (
+                        "a model response cannot mix Skill resource and business tools"
+                    )
+                elif skill_resource_calls:
+                    if self.skill_runtime is None:
+                        protocol_error = "Skill resource tools are not configured"
+                    else:
+                        next_resource_reads = context.skill_state.resource_reads + len(
+                            skill_resource_calls
+                        )
+                        if (
+                            next_resource_reads
+                            > self.skill_runtime.limits.max_resource_reads
+                        ):
+                            protocol_error = "Skill resource read limit exceeded"
+                        else:
+                            context.skill_state = replace(
+                                context.skill_state,
+                                resource_reads=next_resource_reads,
+                            )
+                if protocol_error is not None:
+                    rejected_results = self._record_rejected_tool_calls(
+                        context,
+                        calls,
+                        error_message=protocol_error,
+                    )
+                    for call, rejected in zip(calls, rejected_results):
+                        is_skill_resource = call.name in SKILL_RESOURCE_TOOL_NAMES
+                        event_data: dict[str, Any] = {
+                            "tool_name": call.name,
+                            "success": False,
+                            "error": protocol_error,
+                        }
+                        if is_skill_resource:
+                            event_data.update(
+                                {
+                                    "skill_name": call.arguments.get("skill_name"),
+                                    "path": call.arguments.get("path"),
+                                }
+                            )
+                        else:
+                            event_data.update({"tool_call": call, "result": rejected})
+                        tool_event = AgentEvent(
+                            EventType.TOOL_COMPLETED,
+                            run_id,
+                            event_data,
+                        )
+                        await self._publish(tool_event)
+                        yield tool_event
+                    # This is a terminal protocol rejection. The outer error path
+                    # persists the now-complete Tool Call block and checkpoint.
+                    raise RuntimeError(protocol_error)
                 if (
-                    context.tool_call_count + len(calls)
+                    context.tool_call_count + len(business_calls)
                     > self.config.limits.max_tool_calls
                 ):
-                    for call in calls:
+                    for call in business_calls:
                         context.add_message(
                             Message.tool(
                                 self._json(
@@ -338,12 +421,26 @@ class AgentRuntime:
                     return
 
                 context.status = RunStatus.WAITING_FOR_TOOLS
-                context.tool_call_count += len(calls)
+                context.tool_call_count += len(business_calls)
                 for call in calls:
+                    is_skill_resource = call.name in SKILL_RESOURCE_TOOL_NAMES
+                    event_data: dict[str, Any] = {"tool_name": call.name}
+                    if is_skill_resource:
+                        event_data.update(
+                            {
+                                "skill_name": call.arguments.get("skill_name"),
+                                "path": call.arguments.get("path"),
+                                "resource_operation": (
+                                    "read" if call.name.endswith("_read") else "search"
+                                ),
+                            }
+                        )
+                    else:
+                        event_data["tool_call"] = call
                     tool_event = AgentEvent(
                         EventType.TOOL_STARTED,
                         run_id,
-                        {"tool_call": call, "tool_name": call.name},
+                        event_data,
                     )
                     await self._publish(tool_event)
                     yield tool_event
@@ -352,7 +449,13 @@ class AgentRuntime:
                     run_id=run_id,
                     session_id=context.request.session_id,
                     user_context=dict(context.request.user_context),
-                    metadata={"agent": self.config.name},
+                    metadata={
+                        "agent": self.config.name,
+                        "active_skills": [
+                            activation.to_dict()
+                            for activation in context.skill_state.active_skills
+                        ],
+                    },
                 )
                 try:
                     remaining = self._remaining(deadline)
@@ -379,50 +482,139 @@ class AgentRuntime:
                         else (str(exc) or exc.__class__.__name__)
                     )
                     for call in calls:
+                        is_skill_resource = call.name in SKILL_RESOURCE_TOOL_NAMES
                         context.add_message(
                             Message.tool(
                                 self._json({"success": False, "error": error_message}),
                                 call_id=call.id,
                                 name=call.name,
-                            )
+                                metadata=(
+                                    {"moduagent.ephemeral": True}
+                                    if is_skill_resource
+                                    else None
+                                ),
+                            ),
+                            persist=not is_skill_resource,
                         )
+                        event_data = {
+                            "tool_name": call.name,
+                            "success": False,
+                            "error": error_message,
+                        }
+                        if is_skill_resource:
+                            event_data.update(
+                                {
+                                    "skill_name": call.arguments.get("skill_name"),
+                                    "path": call.arguments.get("path"),
+                                }
+                            )
+                        else:
+                            event_data["tool_call"] = call
                         tool_event = AgentEvent(
                             EventType.TOOL_COMPLETED,
                             run_id,
-                            {
-                                "tool_call": call,
-                                "tool_name": call.name,
-                                "success": False,
-                                "error": error_message,
-                            },
+                            event_data,
                         )
                         await self._publish(tool_event)
                         yield tool_event
                     raise
 
+                effective_results: list[ToolResult] = []
                 for call, result in zip(calls, results):
+                    is_skill_resource = call.name in SKILL_RESOURCE_TOOL_NAMES
+                    if (
+                        is_skill_resource
+                        and result.success
+                        and self.skill_runtime is not None
+                    ):
+                        added_tokens = self._resource_tokens(result.value)
+                        next_resource_tokens = (
+                            context.skill_state.resource_tokens + added_tokens
+                        )
+                        total_skill_tokens = (
+                            context.skill_state.instruction_tokens
+                            + next_resource_tokens
+                        )
+                        if (
+                            next_resource_tokens
+                            > self.skill_runtime.limits.max_resource_tokens
+                            or total_skill_tokens
+                            > self.skill_runtime.limits.max_total_skill_tokens
+                        ):
+                            result = ToolResult.failed(
+                                call_id=call.id,
+                                tool_name=call.name,
+                                error=ToolError(
+                                    ToolErrorType.RESULT_TOO_LARGE,
+                                    "Skill resource token budget exceeded",
+                                ),
+                                attempts=result.attempts,
+                                duration_seconds=result.duration_seconds,
+                            )
+                        else:
+                            context.skill_state = replace(
+                                context.skill_state,
+                                resource_tokens=next_resource_tokens,
+                            )
+                    effective_results.append(result)
                     context.add_message(
                         Message.tool(
                             self._tool_result_content(result),
                             call_id=call.id,
                             name=call.name,
-                        )
+                            metadata=(
+                                {"moduagent.ephemeral": True}
+                                if is_skill_resource
+                                else None
+                            ),
+                        ),
+                        persist=not is_skill_resource,
                     )
+                    event_data = {
+                        "tool_name": call.name,
+                        "success": result.success,
+                    }
+                    if is_skill_resource:
+                        event_data.update(
+                            {
+                                "skill_name": call.arguments.get("skill_name"),
+                                "path": call.arguments.get("path"),
+                            }
+                        )
+                    else:
+                        event_data.update({"tool_call": call, "result": result})
                     tool_event = AgentEvent(
                         EventType.TOOL_COMPLETED,
                         run_id,
-                        {
-                            "tool_call": call,
-                            "tool_name": call.name,
-                            "result": result,
-                            "success": result.success,
-                        },
+                        event_data,
                     )
                     await self._publish(tool_event)
                     yield tool_event
+                    if is_skill_resource:
+                        value = result.value if isinstance(result.value, dict) else {}
+                        resource_event = AgentEvent(
+                            EventType.SKILL_RESOURCE_READ,
+                            run_id,
+                            {
+                                "skill_name": call.arguments.get("skill_name"),
+                                "path": call.arguments.get("path"),
+                                "operation": (
+                                    "read" if call.name.endswith("_read") else "search"
+                                ),
+                                "success": result.success,
+                                "digest": value.get("digest"),
+                                "truncated": value.get("truncated"),
+                                "returned_bytes": value.get("returned_bytes"),
+                                "scanned_bytes": value.get("scanned_bytes"),
+                            },
+                        )
+                        await self._publish(resource_event)
+                        yield resource_event
                 await self._within(
                     deadline,
-                    lambda: self.decision_policy.observe(context, results),
+                    lambda: self.decision_policy.observe(
+                        context, tuple(effective_results)
+                    ),
                 )
                 context.status = RunStatus.RUNNING
                 await self._save_checkpoint(context, deadline)
@@ -465,6 +657,142 @@ class AgentRuntime:
             event = AgentEvent(EventType.RUN_FAILED, run_id, {"result": result})
             await self._publish(event)
             yield event
+
+    async def _skill_events(
+        self,
+        context: RunContext,
+        deadline: float,
+        *,
+        resumed: bool,
+    ) -> AsyncIterator[AgentEvent]:
+        skills_requested = context.request.skill_mode != "disabled" or bool(
+            context.skill_state.active_skills
+        )
+        if not skills_requested:
+            return
+        if self.skill_runtime is None:
+            raise RuntimeError(
+                "this run requests Skills but the Agent has no skill_registry"
+            )
+
+        discovered = AgentEvent(
+            EventType.SKILLS_DISCOVERED,
+            context.run_id,
+            {
+                "count": len(self.skill_runtime.registry),
+                "catalog_digest": self.skill_runtime.registry.catalog_digest,
+            },
+        )
+        await self._publish(discovered)
+        yield discovered
+
+        try:
+            restored = resumed and bool(context.skill_state.catalog_digest)
+            if restored:
+                report = await self._within(
+                    deadline,
+                    lambda: self.skill_runtime.arestore(context),
+                )
+            else:
+                started = AgentEvent(
+                    EventType.SKILL_SELECTION_STARTED,
+                    context.run_id,
+                    {
+                        "mode": context.request.skill_mode,
+                        "requested": list(context.request.requested_skills),
+                        "resumed": resumed,
+                    },
+                )
+                await self._publish(started)
+                yield started
+                business_tools = tuple(
+                    tool.name
+                    for tool in self.tool_executor.registry
+                    if tool.name not in SKILL_RESOURCE_TOOL_NAMES
+                )
+                report = await self._within(
+                    deadline,
+                    lambda: self.skill_runtime.activate(
+                        context,
+                        available_tools=business_tools,
+                    ),
+                )
+                completed = AgentEvent(
+                    EventType.SKILL_SELECTION_COMPLETED,
+                    context.run_id,
+                    {
+                        "mode": context.request.skill_mode,
+                        "selected": list(report.selected),
+                        "catalog_tokens": report.catalog_tokens,
+                        "instruction_tokens": report.instruction_tokens,
+                        "usage": report.usage,
+                    },
+                )
+                await self._publish(completed)
+                yield completed
+        except Exception as exc:
+            failed = AgentEvent(
+                EventType.SKILL_ERROR,
+                context.run_id,
+                {
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            await self._publish(failed)
+            yield failed
+            raise
+
+        selected_by = {
+            activation.name: activation.selected_by
+            for activation in context.skill_state.active_skills
+        }
+        if not restored:
+            for name in report.selected:
+                selected = AgentEvent(
+                    EventType.SKILL_SELECTED,
+                    context.run_id,
+                    {
+                        "name": name,
+                        "selected_by": selected_by[name],
+                    },
+                )
+                await self._publish(selected)
+                yield selected
+        for activation in context.skill_state.active_skills:
+            activated = AgentEvent(
+                EventType.SKILL_ACTIVATED,
+                context.run_id,
+                {
+                    "name": activation.name,
+                    "version": activation.version,
+                    "digest": activation.digest,
+                    "source_id": activation.source_id,
+                    "selected_by": activation.selected_by,
+                    "resumed": restored,
+                },
+            )
+            await self._publish(activated)
+            yield activated
+
+    def _tool_schemas(self, context: RunContext) -> tuple[Any, ...]:
+        if self.skill_runtime is None:
+            return tuple(self.tool_executor.registry.schemas())
+        business_names = {
+            tool.name
+            for tool in self.tool_executor.registry
+            if tool.name not in SKILL_RESOURCE_TOOL_NAMES
+        }
+        allowed = self.skill_runtime.allowed_tool_names(context)
+        if allowed is None:
+            selected = set(business_names)
+        else:
+            selected = set(allowed)
+            if self.skill_runtime.has_resources(context):
+                selected.add(SKILL_READ_TOOL_NAME)
+            if self.skill_runtime.supports_resource_search(context):
+                selected.add(SKILL_SEARCH_TOOL_NAME)
+        return tuple(self.tool_executor.registry.schemas(selected))
 
     async def _model_events(
         self,
@@ -553,11 +881,17 @@ class AgentRuntime:
             raise RuntimeError("model returned no response")
         context.usage = context.usage + response.usage
         if record_response:
+            response_calls = response.tool_calls or response.message.tool_calls
+            ephemeral = any(
+                call.name in SKILL_RESOURCE_TOOL_NAMES for call in response_calls
+            )
             context.add_message(
                 Message.assistant(
                     response.message.content,
-                    response.tool_calls or response.message.tool_calls,
-                )
+                    response_calls,
+                    metadata=({"moduagent.ephemeral": True} if ephemeral else None),
+                ),
+                persist=not ephemeral,
             )
         event = AgentEvent(
             EventType.MODEL_COMPLETED,
@@ -580,6 +914,10 @@ class AgentRuntime:
         phase: MemoryPhase,
         deadline: float,
     ) -> tuple[ModelRequest, AgentEvent | None]:
+        request = replace(
+            request,
+            messages=compose_skill_prompt(request.messages, context.skill_messages),
+        )
         memory = await self._within(
             deadline,
             lambda: self.conversation_memory_policy.prepare(
@@ -588,7 +926,9 @@ class AgentRuntime:
                     session_id=context.request.session_id,
                     phase=phase,
                     model_request=request,
-                    protected_from=context.current_run_start,
+                    protected_from=(
+                        context.current_run_start + len(context.skill_messages)
+                    ),
                     user_context=context.request.user_context,
                 )
             ),
@@ -723,14 +1063,27 @@ class AgentRuntime:
         output: Any = None,
         error: str | None = None,
     ) -> AgentResult:
+        metadata = dict(context.metadata)
+        if context.skill_state.catalog_digest:
+            metadata["skill_usage"] = {
+                "catalog_digest": context.skill_state.catalog_digest,
+                "active_skills": len(context.skill_state.active_skills),
+                "resource_reads": context.skill_state.resource_reads,
+                "instruction_tokens": context.skill_state.instruction_tokens,
+                "resource_tokens": context.skill_state.resource_tokens,
+            }
         return AgentResult(
             run_id=context.run_id,
             output=output,
-            messages=tuple(context.messages),
+            messages=tuple(
+                message
+                for message in context.messages
+                if not is_ephemeral_message(message)
+            ),
             usage=context.usage,
             finish_reason=reason,
             error=error,
-            metadata=dict(context.metadata),
+            metadata=metadata,
         )
 
     async def _save_checkpoint(self, context: RunContext, deadline: float) -> None:
@@ -787,6 +1140,11 @@ class AgentRuntime:
     def _json(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, default=str)
 
+    @classmethod
+    def _resource_tokens(cls, value: Any) -> int:
+        payload = cls._json(value).encode("utf-8")
+        return max(1, (len(payload) + 2) // 3)
+
     def _tool_result_content(self, result: ToolResult) -> str:
         for method_name in ("model_content", "to_message_content"):
             method = getattr(result, method_name, None)
@@ -800,3 +1158,38 @@ class AgentRuntime:
                 "error": (getattr(error, "message", str(error)) if error else None),
             }
         )
+
+    def _record_rejected_tool_calls(
+        self,
+        context: RunContext,
+        calls: tuple[Any, ...],
+        *,
+        error_message: str,
+    ) -> tuple[ToolResult, ...]:
+        # A response containing any Skill resource call is itself ephemeral.
+        # Keep every matching Tool result ephemeral as one protocol block so
+        # ConversationStore never receives an orphan from a mixed response.
+        ephemeral_block = any(call.name in SKILL_RESOURCE_TOOL_NAMES for call in calls)
+        results: list[ToolResult] = []
+        for call in calls:
+            result = ToolResult.failed(
+                call_id=call.id,
+                tool_name=call.name,
+                error=ToolError(
+                    ToolErrorType.EXECUTION_ERROR,
+                    error_message,
+                ),
+            )
+            results.append(result)
+            context.add_message(
+                Message.tool(
+                    self._tool_result_content(result),
+                    call_id=call.id,
+                    name=call.name,
+                    metadata=(
+                        {"moduagent.ephemeral": True} if ephemeral_block else None
+                    ),
+                ),
+                persist=not ephemeral_block,
+            )
+        return tuple(results)
