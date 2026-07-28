@@ -4,6 +4,7 @@ PDF 기술 설계에 따라 구현한 합성형 Python AI Agent 프레임워크�
 
 - [ConversationMemoryPolicy 설계](https://github.com/nagix999/moduagent/blob/main/docs/conversation-memory-policy.md)
 - [Agent Skills 사용과 보안](https://github.com/nagix999/moduagent/blob/main/docs/skills.md)
+- [Plan-and-Execute 상태 머신](https://github.com/nagix999/moduagent/blob/main/docs/plan-and-execute.md)
 
 ## 설치
 
@@ -79,7 +80,7 @@ asyncio.run(main())
 
 Skill은 모델에 업무 절차와 지식을 제공하고, Tool은 실제 작업을 실행합니다. Skill을 활성화해도 Tool 권한은 추가되지 않습니다.
 
-0.2.0은 운영자가 검토한 로컬·agent-scoped Skill catalog를 신뢰 경계로 사용합니다. 서로 신뢰하지 않는 tenant가 같은 catalog를 공유해야 한다면 tenant별 Registry 또는 별도 Skill 접근 제어 계층을 둡니다.
+0.3.0은 운영자가 검토한 로컬·agent-scoped Skill catalog를 신뢰 경계로 사용합니다. 서로 신뢰하지 않는 tenant가 같은 catalog를 공유해야 한다면 tenant별 Registry 또는 별도 Skill 접근 제어 계층을 둡니다.
 
 공식 Agent Skills 형식처럼 Skill마다 `SKILL.md`를 둡니다.
 
@@ -100,6 +101,9 @@ description: 회사 정책에 따라 청구서를 검토한다. 청구서 오류
 metadata:
   version: "1.0.0"
 allowed-tools: lookup_invoice lookup_vendor
+applies-to:
+  - plan
+  - act
 ---
 
 # Invoice review
@@ -149,9 +153,9 @@ result = await agent.run("이 청구서를 검토해줘", skill_mode="auto")
 
 `skill_mode="hybrid"`와 `skills=[...]`를 함께 전달하면 명시 Skill을 먼저 고정하고 남은 범위를 자동 선택합니다.
 
-활성화된 `SKILL.md` 본문은 PLAN·ACT·FINALIZE에 적용되지만 대화 저장소와 `AgentResult.messages`에는 저장되지 않습니다. `references/`와 text `assets/`는 모델이 내부 `moduagent_skill_read`·`moduagent_skill_search` Tool로 필요한 부분만 읽습니다. Resource 호출은 `max_tool_calls` 대신 `SkillLimits.max_resource_reads`를 사용하지만 모델 판단 단계는 추가되므로 `RunLimits.max_steps`는 소비합니다.
+`applies-to`는 Skill 지침을 `plan`, `act`, `finalize` 중 필요한 단계에만 적용합니다. 생략하면 세 단계 모두 적용됩니다. Skill 본문은 대화 저장소와 `AgentResult.messages`에는 저장되지 않습니다. `references/`와 text `assets/`는 모델이 내부 `moduagent_skill_read`·`moduagent_skill_search` Tool로 필요한 부분만 읽습니다. Resource 호출은 business Tool용 `max_tool_calls` 대신 `SkillLimits.max_resource_reads`를 사용합니다.
 
-`allowed-tools`는 권한을 주는 설정이 아닙니다. 실제 사용 범위는 등록된 Tool과 Skill 선언의 교집합이며, 실행 직전에 `ToolAuthorizer`를 다시 적용합니다. RBAC을 사용할 때는 필요한 내부 Resource Tool도 정책에 허용해야 합니다. `scripts/`는 패키지 digest에는 포함되지만 0.2.0에서는 자동 실행하거나 읽지 않습니다.
+`allowed-tools`는 권한을 주는 설정이 아닙니다. 실제 사용 범위는 등록된 Tool과 Skill 선언의 교집합이며, 실행 직전에 `ToolAuthorizer`를 다시 적용합니다. RBAC을 사용할 때는 필요한 내부 Resource Tool도 정책에 허용해야 합니다. `scripts/`는 패키지 digest에는 포함되지만 0.3.0에서도 자동 실행하거나 읽지 않습니다.
 
 Skill 작성과 검증:
 
@@ -266,14 +270,17 @@ model = OllamaClient(
 
 ## 토큰 스트리밍
 
-`Agent.stream()`은 토큰뿐 아니라 모델·Tool·정책·종료 이벤트를 순서대로 전달합니다. 토큰은 `MODEL_DELTA`, 최종 `AgentResult`는 마지막 `RUN_COMPLETED` 또는 `RUN_FAILED` 이벤트에 들어 있습니다.
+`PlanAndExecutePolicy`에서 기본 `Agent.stream()`은 내부 ACT token을 숨기고 FINALIZE token만 `FINAL_DELTA`로 공개합니다. 최종 `AgentResult`는 마지막 `RUN_COMPLETED` 또는 `RUN_FAILED` 이벤트에 들어 있습니다.
 
 ```python
 from moduagent import EventType
 
 result = None
-async for event in agent.stream("짧게 소개해줘", session_id="stream-session"):
-    if event.type is EventType.MODEL_DELTA:
+async for event in planning_agent.stream(
+    "요청을 수행해줘",
+    session_id="stream-session",
+):
+    if event.type is EventType.FINAL_DELTA:
         print(event.data["delta"], end="", flush=True)
     elif event.type in (EventType.RUN_COMPLETED, EventType.RUN_FAILED):
         result = event.data["result"]
@@ -282,6 +289,8 @@ print()
 if result is not None and result.error:
     raise RuntimeError(result.error)
 ```
+
+계획, 단계, Tool, 검증, `STEP_MODEL_DELTA`를 함께 확인할 때만 `planning_agent.stream_all(...)`을 사용합니다. 일반 `StandardDecisionPolicy`의 직접 응답 token은 기존처럼 `MODEL_DELTA`입니다.
 
 ## Pydantic 구조화 출력
 
@@ -311,7 +320,17 @@ result = await structured_agent.run("한국의 수도는?")
 print(result.output.answer, result.output.confidence)
 ```
 
-`tools`가 등록된 Agent에서는 실행과 최종 구조화를 분리합니다. ACT 요청에는 Tool 스키마만 전달하고 최종 출력 스키마는 전달하지 않습니다. Policy가 종료를 결정하면 런타임이 Tool 없이 Pydantic 스키마만 적용한 FINALIZE 요청을 한 번 더 보내 `result.output`을 만듭니다. 실제 Tool이 호출되지 않았더라도 이 추가 모델 호출은 발생합니다.
+일반 `StandardDecisionPolicy`에서 Tool과 구조화 출력을 함께 쓰면 ACT 요청에는 Tool schema만 전달하고, Tool 없이 Pydantic schema만 적용하는 최종화 요청을 분리합니다. 이 최종화의 공급자 원문도 공개 assistant 메시지로 `ConversationStore`에 저장됩니다.
+
+`AgentConfig.finalization_mode`의 기본값은 0.2의 Standard 호출 수와 호환되는 `structured_only`입니다.
+
+| 값 | `StandardDecisionPolicy` 동작 |
+|---|---|
+| `structured_only` | Tool과 구조화 출력이 함께 있을 때만 별도 최종화 |
+| `always` | 텍스트와 구조화 출력 모두 별도 최종화 |
+| `disabled` | 분리 최종화를 끔 |
+
+strict `PlanAndExecutePolicy`는 이 설정과 별개로 모든 단계가 커밋된 뒤 FINALIZE를 정상 실행당 한 번 수행합니다. 텍스트 출력은 schema 없이, 구조화 출력은 공개 Pydantic schema로 실행하며 둘 다 FINALIZE에는 Tool을 전달하지 않습니다. strict Policy와 `finalization_mode="disabled"`를 함께 설정하면 Agent 생성 시 `ValueError`가 발생합니다.
 
 ## RBAC Tool 권한
 
@@ -386,11 +405,11 @@ if failed.error and await checkpoints.load(failed.run_id) is not None:
     )
 ```
 
-재개 시에는 원래 실행과 같은 `session_id`, 호환되는 Agent 설정·Policy·Tool 구성을 사용해야 합니다. 완료된 실행의 체크포인트는 자동 삭제됩니다.
+재개 시에는 원래 실행과 같은 `session_id`, 호환되는 Agent 설정·Policy·Tool 구성을 사용해야 합니다. 일반 실행의 완료 checkpoint는 삭제됩니다. strict Plan-and-Execute는 FINALIZE 중복 억제를 위해 terminal `DONE` 상태를 checkpoint에 남길 수 있으므로 운영 TTL을 설정합니다.
 
 ## Plan-and-Execute
 
-복수 단계 작업은 `LLMPlanGenerator`와 `PlanAndExecutePolicy`를 조합합니다. 계획은 `policy_state`에 저장되므로 체크포인트와 함께 복구됩니다.
+복수 단계 작업은 `LLMPlanGenerator`와 strict `PlanAndExecutePolicy`를 조합합니다. 0.3.0의 `PlanAndExecutePolicy`는 일반 ACT 응답을 단계 완료로 간주하지 않고, strict `StepResult`의 검증과 명시적 커밋을 요구합니다.
 
 ```python
 from moduagent import (
@@ -398,12 +417,20 @@ from moduagent import (
     AgentConfig,
     LLMPlanGenerator,
     PlanAndExecutePolicy,
+    RunLimits,
 )
 
 planning_agent = Agent(
     config=AgentConfig(
         name="research-agent",
-        instructions="현재 계획 단계에 맞춰 실행하고 간결하게 답한다.",
+        instructions="검증된 단계 결과만 사용해 간결하게 답한다.",
+        limits=RunLimits(
+            max_steps=4,
+            max_step_attempts=2,
+            max_replans=1,
+            max_tool_calls=8,
+            timeout_seconds=120,
+        ),
     ),
     model=model,
     tools=[add],
@@ -414,13 +441,19 @@ planning_agent = Agent(
 )
 ```
 
-Pydantic 구조화 출력과 Tool을 함께 쓰면 모델 호출은 `PLAN → ACT → FINALIZE`로 분리됩니다.
+실행 경계는 다음과 같습니다.
 
-- PLAN: 계획 전용 스키마로 실행 계획을 생성합니다.
-- ACT: 최종 출력 스키마 없이 Tool을 선택·실행하며 계획을 진행합니다.
-- FINALIZE: Tool 없이 최종 Pydantic 스키마로 결과를 구조화합니다.
+```text
+PLAN → ACT_TOOL → STEP_RESULT → STEP_VALIDATE/COMMIT → VERIFY → FINALIZE
+```
 
-세 단계와 재시도는 모두 하나의 `RunLimits.timeout_seconds` 실행 제한을 공유합니다. FINALIZE는 추가 모델 호출이므로 모델 지연 시간과 계획 단계 수를 포함해 전체 제한을 설정해야 합니다.
+- `ACT_TOOL`: 현재 단계의 허용 Tool schema만 전달합니다.
+- `STEP_RESULT`: Tool 없이 내부 `StepResult` schema만 전달합니다.
+- `FINALIZE`: Tool 없이 텍스트 또는 공개 Pydantic schema로 응답합니다.
+
+vLLM에도 Tool과 출력 schema를 한 요청에 함께 전달하지 않습니다. `RunLimits.max_steps`는 strict 정책에서 모델 호출 수가 아니라 계획 단계 수이며, `max_step_attempts`와 `max_replans`가 재시도와 재계획을 별도로 제한합니다. 모든 호출과 저장 작업은 하나의 `timeout_seconds`를 공유합니다.
+
+0.2의 암묵적 단계 완료 동작이 잠시 필요하면 `LegacyPlanAndExecutePolicy`를 명시적으로 사용해야 하며 생성 시 `DeprecationWarning`이 발생합니다. 신규 코드는 strict 정책을 사용하세요. 상태, 스트림, vLLM 분리, checkpoint v3와 마이그레이션 내용은 [Plan-and-Execute 문서](https://github.com/nagix999/moduagent/blob/main/docs/plan-and-execute.md)에 정리했습니다.
 
 ## 관측성
 
@@ -493,5 +526,6 @@ python3 -m pytest -q tests/integration/test_live_persistence.py -k redis
 
 - 체크포인트는 실행 상태 재개를 지원하지만 Tool 부작용의 exactly-once 실행을 보장하지 않습니다. 쓰기 Tool은 자체 idempotency key와 중복 처리 방어를 구현해야 합니다.
 - `idempotent=True`는 프레임워크의 Tool 재시도를 허용한다는 의미이며 exactly-once 보장이 아닙니다.
+- strict Plan-and-Execute의 `final_emitted`는 동일 run의 중복 FINALIZE와 중복 방출을 억제하지만 end-to-end exactly-once 전달은 아닙니다. 손실·중복 없는 전달에는 durable outbox, 안정적인 event ID와 소비자 idempotency가 필요합니다.
 - 동일 세션 직렬화는 한 `AgentRuntime` 프로세스 안에서만 적용됩니다. 분산 lock, 분산 실행 큐, worker scheduler는 현재 범위에 포함되지 않습니다.
 - Redis 대화 저장은 list 명령을 지원하는 클라이언트에서 append 원자성을 사용하지만, 전체 Agent 실행의 분산 트랜잭션을 제공하지 않습니다.

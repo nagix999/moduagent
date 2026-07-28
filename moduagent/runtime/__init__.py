@@ -6,7 +6,7 @@ from moduagent.runtime.context import (
     SkillActivationState,
     SkillRunState,
 )
-from moduagent.runtime.events import AgentEvent, EventType
+from moduagent.runtime.events import AgentEvent, EventType, EventVisibility
 from moduagent.runtime.runtime import AgentRuntime
 
 __all__ = [
@@ -14,6 +14,7 @@ __all__ = [
     "AgentRuntime",
     "AgentResult",
     "EventType",
+    "EventVisibility",
     "RunContext",
     "RunRequest",
     "RunStatus",

@@ -31,6 +31,18 @@ def response(text: str) -> ModelResponse:
     return ModelResponse(Message("assistant", text))
 
 
+def test_run_limits_keeps_020_positional_argument_order() -> None:
+    limits = RunLimits(3, 7, 45.0, True, 2)
+
+    assert limits.max_steps == 3
+    assert limits.max_tool_calls == 7
+    assert limits.timeout_seconds == 45.0
+    assert limits.parallel_tool_calls is True
+    assert limits.max_parallel_tools == 2
+    assert limits.max_step_attempts == 2
+    assert limits.max_replans == 2
+
+
 def test_agent_returns_final_model_message() -> None:
     async def scenario() -> None:
         model = ScriptedModel([response("안녕하세요")])

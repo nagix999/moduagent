@@ -3,14 +3,23 @@ from moduagent.config import AgentConfig, RetryConfig, RunLimits
 from moduagent.decision import (
     DecisionKind,
     DecisionPolicy,
+    ExecutionState,
     ExecutionDecision,
+    LegacyPlanAndExecutePolicy,
     LLMPlanGenerator,
     Plan,
     PlanAndExecutePolicy,
     PlanGenerator,
     PlanStep,
     PlanStepStatus,
+    RunPhase,
     StandardDecisionPolicy,
+    StepResult,
+    StepStatus,
+    StepValidation,
+    StepValidator,
+    ValidationKind,
+    step_result_ref,
 )
 from moduagent.messages import (
     FinishReason,
@@ -63,7 +72,12 @@ from moduagent.observability import (
     MetricsEventSink,
     NoopEventSink,
 )
-from moduagent.output import OutputCodec, PydanticOutputCodec, TextOutputCodec
+from moduagent.output import (
+    OutputCodec,
+    PydanticOutputCodec,
+    StepResultCodec,
+    TextOutputCodec,
+)
 from moduagent.persistence import (
     CheckpointStore,
     ConversationStore,
@@ -79,6 +93,7 @@ from moduagent.runtime import (
     AgentResult,
     AgentRuntime,
     EventType,
+    EventVisibility,
     RunContext,
     RunRequest,
     RunStatus,
@@ -127,7 +142,7 @@ from moduagent.tools import (
     function_tool,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "__version__",
@@ -153,6 +168,8 @@ __all__ = [
     "DecisionPolicy",
     "EventSink",
     "EventType",
+    "EventVisibility",
+    "ExecutionState",
     "ExecutionDecision",
     "ExplicitSkillSelector",
     "FinishReason",
@@ -167,6 +184,7 @@ __all__ = [
     "InMemoryMemoryStateStore",
     "InMemoryMetricRecorder",
     "InMemorySkillSource",
+    "LegacyPlanAndExecutePolicy",
     "LLMPlanGenerator",
     "LoggingEventSink",
     "Message",
@@ -203,6 +221,7 @@ __all__ = [
     "RunCheckpoint",
     "RunContext",
     "RunLimits",
+    "RunPhase",
     "RunRequest",
     "RunStatus",
     "SkillActivation",
@@ -225,6 +244,11 @@ __all__ = [
     "SkillSource",
     "SkillValidationError",
     "StandardDecisionPolicy",
+    "StepResult",
+    "StepResultCodec",
+    "StepStatus",
+    "StepValidation",
+    "StepValidator",
     "SummaryResult",
     "SummarizingConversationMemoryPolicy",
     "TextOutputCodec",
@@ -243,6 +267,8 @@ __all__ = [
     "ToolResult",
     "ToolSchema",
     "Usage",
+    "ValidationKind",
     "VLLMClient",
     "function_tool",
+    "step_result_ref",
 ]

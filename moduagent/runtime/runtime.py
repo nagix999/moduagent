@@ -10,6 +10,7 @@ from typing import Any, TypeVar
 
 from moduagent.config import AgentConfig
 from moduagent.decision import DecisionKind, DecisionPolicy
+from moduagent.decision.planning import ExecutionState, RunPhase
 from moduagent.memory import (
     ConversationMemoryPolicy,
     FullConversationMemoryPolicy,
@@ -30,7 +31,7 @@ from moduagent.runtime.context import (
     RunRequest,
     RunStatus,
 )
-from moduagent.runtime.events import AgentEvent, EventType
+from moduagent.runtime.events import AgentEvent, EventType, EventVisibility
 from moduagent.skills.prompting import compose_skill_prompt, is_ephemeral_message
 from moduagent.skills.runtime import SkillRuntime
 from moduagent.skills.tools import (
@@ -57,6 +58,28 @@ _FINALIZATION_PROMPT = (
     "Using the preceding execution and tool results, return only the final answer "
     "that matches the required response schema. Do not call tools."
 )
+_STRICT_EXECUTOR_PROMPT = (
+    "Execute exactly one current plan step. Do not write the public final answer, "
+    "perform another step, or claim unsupported facts. Use only the supplied tools. "
+    "When the runtime requests a StepResult, return only that strict JSON object."
+)
+_STRICT_STEP_RESULT_PROMPT = (
+    "Return the current step result now. Use only the StepResult schema, keep the "
+    "step_id unchanged, and provide one completion_evidence item for every "
+    "completion criterion. Do not include final_answer, verdict, recommendation, "
+    "or any field outside the schema."
+)
+_STRICT_FINALIZER_PROMPT = (
+    "Create the one public final response from the original objective and committed "
+    "step results. Do not call tools, add new facts, expose internal execution logs, "
+    "or perform more work. Return only the requested public response."
+)
+_RUN_ID_METADATA_KEY = "moduagent.run_id"
+_PUBLIC_FINAL_METADATA_KEY = "moduagent.public_final"
+
+
+class _StrictToolCallLimitError(RuntimeError):
+    pass
 
 
 class AgentRuntime:
@@ -90,6 +113,16 @@ class AgentRuntime:
             if conversation_memory_policy is not None
             else FullConversationMemoryPolicy()
         )
+        if (
+            bool(
+                getattr(decision_policy, "strict_plan_execution", False)
+                or getattr(decision_policy, "strict_execution", False)
+            )
+            and config.finalization_mode == "disabled"
+        ):
+            raise ValueError(
+                "strict Plan-and-Execute requires finalization_mode to be enabled"
+            )
         self._session_locks: dict[str, asyncio.Lock] = {}
 
     async def execute(self, request: RunRequest) -> AgentResult:
@@ -103,9 +136,20 @@ class AgentRuntime:
             raise RuntimeError("agent run ended without a terminal result")
         return result
 
-    async def stream(self, request: RunRequest) -> AsyncIterator[AgentEvent]:
+    async def stream(
+        self,
+        request: RunRequest,
+        *,
+        include_internal: bool | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        include_internal = (
+            self.config.stream_visibility == "all"
+            if include_internal is None
+            else include_internal
+        )
         async for event in self._events(request, stream_model=True):
-            yield event
+            if include_internal or event.visibility is EventVisibility.PUBLIC:
+                yield event
 
     async def _events(
         self, request: RunRequest, *, stream_model: bool
@@ -122,7 +166,21 @@ class AgentRuntime:
         deadline = (
             asyncio.get_running_loop().time() + self.config.limits.timeout_seconds
         )
-        user_message = Message.user(request.input)
+        strict_execution = bool(
+            getattr(self.decision_policy, "strict_plan_execution", False)
+            or getattr(self.decision_policy, "strict_execution", False)
+        )
+        user_message = Message.user(
+            request.input,
+            metadata=(
+                {
+                    _RUN_ID_METADATA_KEY: run_id,
+                    "moduagent.public_input": True,
+                }
+                if strict_execution
+                else None
+            ),
+        )
         context = RunContext(
             run_id=run_id,
             request=request,
@@ -186,17 +244,57 @@ class AgentRuntime:
             await self._save_checkpoint(context, deadline)
 
             context.status = RunStatus.RUNNING
+            tool_schemas = self._tool_schemas(context)
+            context.metadata["_moduagent_available_tools"] = [
+                schema.name for schema in tool_schemas
+            ]
+            configure_limits = getattr(self.decision_policy, "configure_limits", None)
+            if strict_execution and callable(configure_limits):
+                configure_limits(
+                    max_step_attempts=self.config.limits.max_step_attempts,
+                    max_replans=self.config.limits.max_replans,
+                )
+            creating_plan = strict_execution and context.execution_state is None
             await self._within(deadline, lambda: self.decision_policy.begin(context))
             await self._save_checkpoint(context, deadline)
 
-            tool_schemas = self._tool_schemas(context)
+            if strict_execution:
+                state = context.execution_state
+                if not isinstance(state, ExecutionState):
+                    raise RuntimeError(
+                        "strict Plan-and-Execute did not initialize ExecutionState"
+                    )
+                if creating_plan:
+                    plan_event = AgentEvent(
+                        EventType.PLAN_CREATED,
+                        run_id,
+                        {
+                            "step_count": len(state.plan.steps),
+                            "plan_version": state.plan.version,
+                        },
+                        visibility=EventVisibility.INTERNAL,
+                    )
+                    await self._publish(plan_event)
+                    yield plan_event
+                async for strict_event in self._strict_plan_events(
+                    context,
+                    tool_schemas,
+                    deadline,
+                    stream_model=stream_model,
+                ):
+                    yield strict_event
+                return
+
             output_schema = self.output_codec.schema()
-            staged_finalization = bool(tool_schemas and output_schema is not None)
+            staged_finalization = self.config.finalization_mode == "always" or (
+                self.config.finalization_mode == "structured_only"
+                and bool(tool_schemas and output_schema is not None)
+            )
 
             if staged_finalization and context.policy_state.get(
                 _FINALIZATION_STATE_KEY
             ) in (_FINALIZATION_PENDING, _FINALIZATION_COMPLETED):
-                async for event in self._structured_finalization_events(
+                async for event in self._finalization_events(
                     context,
                     output_schema,
                     deadline,
@@ -212,7 +310,7 @@ class AgentRuntime:
                             _FINALIZATION_PENDING
                         )
                         await self._save_checkpoint(context, deadline)
-                        async for event in self._structured_finalization_events(
+                        async for event in self._finalization_events(
                             context,
                             output_schema,
                             deadline,
@@ -247,6 +345,7 @@ class AgentRuntime:
                     request_model,
                     phase=MemoryPhase.ACT,
                     deadline=deadline,
+                    skill_phase="act",
                 )
                 if memory_event is not None:
                     yield memory_event
@@ -287,7 +386,7 @@ class AgentRuntime:
                             _FINALIZATION_PENDING
                         )
                         await self._save_checkpoint(context, deadline)
-                        async for event in self._structured_finalization_events(
+                        async for event in self._finalization_events(
                             context,
                             output_schema,
                             deadline,
@@ -658,6 +757,859 @@ class AgentRuntime:
             await self._publish(event)
             yield event
 
+    async def _strict_plan_events(
+        self,
+        context: RunContext,
+        available_tool_schemas: tuple[Any, ...],
+        deadline: float,
+        *,
+        stream_model: bool,
+    ) -> AsyncIterator[AgentEvent]:
+        policy = self.decision_policy
+        state = context.execution_state
+        if not isinstance(state, ExecutionState):
+            raise RuntimeError("strict Plan-and-Execute state is missing")
+
+        if state.phase is RunPhase.DONE:
+            if state.final_response is None or not state.final_emitted:
+                raise RuntimeError(
+                    "completed execution state has no emitted final output"
+                )
+            try:
+                output = self.output_codec.decode(state.final_response)
+            except Exception as exc:
+                raise RuntimeError(
+                    "stored finalization response validation failed"
+                ) from exc
+            context.status = RunStatus.COMPLETED
+            result = self._result(
+                context,
+                FinishReason.COMPLETED,
+                output=output,
+            )
+            completed = AgentEvent(
+                EventType.RUN_COMPLETED,
+                context.run_id,
+                {"result": result, "resumed_terminal": True},
+            )
+            await self._publish(completed)
+            yield completed
+            return
+
+        while True:
+            state = context.execution_state
+            if not isinstance(state, ExecutionState):
+                raise RuntimeError("strict Plan-and-Execute state was lost")
+            if len(state.plan.steps) > self.config.limits.max_steps:
+                state.phase = RunPhase.FAILED
+                state.validation_error = (
+                    f"plan exceeds RunLimits.max_steps ({self.config.limits.max_steps})"
+                )
+                self._sync_execution_state(context, state)
+                await self._persist_pending_messages(context, deadline)
+                await self._save_checkpoint(context, deadline)
+                result = self._result(
+                    context,
+                    FinishReason.MAX_STEPS,
+                    error=state.validation_error,
+                )
+                completed = AgentEvent(
+                    EventType.RUN_COMPLETED,
+                    context.run_id,
+                    {"result": result},
+                )
+                await self._publish(completed)
+                yield completed
+                return
+            if state.phase is RunPhase.FAILED:
+                raise RuntimeError("strict Plan-and-Execute execution failed")
+            if state.phase is RunPhase.DONE:
+                raise RuntimeError("DONE cannot transition to another execution phase")
+
+            if state.phase is RunPhase.STEP_PREPARE:
+                step = state.plan.current
+                if step is None:
+                    state.phase = RunPhase.VERIFY
+                    self._sync_execution_state(context, state)
+                    await self._save_checkpoint(context, deadline)
+                    continue
+                step_tools = self._strict_step_tool_schemas(
+                    state,
+                    available_tool_schemas,
+                )
+                prepare_step = getattr(policy, "prepare_step", None)
+                if not callable(prepare_step):
+                    raise RuntimeError(
+                        "strict Plan-and-Execute policy must provide prepare_step()"
+                    )
+                prepared = prepare_step(context, has_tools=bool(step_tools))
+                if prepared is None:
+                    continue
+                context.clear_internal_messages()
+                started = AgentEvent(
+                    EventType.STEP_STARTED,
+                    context.run_id,
+                    {
+                        "step_id": prepared.step_id,
+                        "objective": prepared.objective,
+                        "attempt": prepared.attempt_count,
+                        "plan_version": state.plan.version,
+                    },
+                    visibility=EventVisibility.INTERNAL,
+                )
+                await self._publish(started)
+                yield started
+                await self._save_checkpoint(context, deadline)
+                continue
+
+            if state.phase is RunPhase.VERIFY:
+                if not state.plan.complete:
+                    raise RuntimeError("plan verification found incomplete steps")
+                missing_results = {
+                    step.step_id
+                    for step in state.plan.steps
+                    if step.status.value == "completed"
+                    and step.step_id not in state.committed_results
+                }
+                if missing_results:
+                    raise RuntimeError(
+                        "plan verification found completed steps without results: "
+                        + ", ".join(sorted(missing_results))
+                    )
+                begin_finalization = getattr(policy, "begin_finalization", None)
+                if not callable(begin_finalization):
+                    raise RuntimeError(
+                        "strict Plan-and-Execute policy must provide "
+                        "begin_finalization()"
+                    )
+                begin_finalization(context)
+                await self._save_checkpoint(context, deadline)
+                continue
+
+            if state.phase is RunPhase.FINALIZE:
+                async for final_event in self._strict_finalization_events(
+                    context,
+                    deadline,
+                    stream_model=stream_model,
+                ):
+                    yield final_event
+                return
+
+            step_tools: tuple[Any, ...] = ()
+            if state.phase is RunPhase.STEP_VALIDATE:
+                step = state.current_step
+                if step is None:
+                    raise RuntimeError("STEP_VALIDATE phase has no current plan step")
+                validate_pending = getattr(policy, "validate_pending", None)
+                if not callable(validate_pending):
+                    raise RuntimeError(
+                        "strict Plan-and-Execute policy must provide validate_pending()"
+                    )
+                decision = await self._within(
+                    deadline,
+                    lambda: validate_pending(context),
+                )
+            else:
+                if state.phase is not RunPhase.ACT:
+                    raise RuntimeError(
+                        f"unsupported strict execution phase: {state.phase.value}"
+                    )
+
+                step = state.current_step
+                if step is None:
+                    raise RuntimeError("ACT phase has no current plan step")
+                extracting = bool(
+                    getattr(policy, "needs_step_result_extraction")(context)
+                )
+                step_tools = self._strict_step_tool_schemas(
+                    state,
+                    available_tool_schemas,
+                )
+                request_tools = () if extracting else step_tools
+                output_schema = (
+                    getattr(policy, "step_result_schema")() if extracting else None
+                )
+                options = dict(self.config.model_options)
+                if not request_tools:
+                    options.pop("tool_choice", None)
+                    options.pop("parallel_tool_calls", None)
+                request_model = ModelRequest(
+                    messages=self._strict_step_messages(
+                        context,
+                        state,
+                        extracting=extracting,
+                    ),
+                    tools=request_tools,
+                    output_schema=output_schema,
+                    options=options,
+                )
+                request_model, memory_event = await self._prepare_model_request(
+                    context,
+                    request_model,
+                    phase=(MemoryPhase.STEP_RESULT if extracting else MemoryPhase.ACT),
+                    deadline=deadline,
+                    skill_phase="act",
+                    protected_from=0,
+                )
+                if memory_event is not None:
+                    yield memory_event
+
+                context.step += 1
+                context.status = RunStatus.WAITING_FOR_MODEL
+                await self._save_checkpoint(context, deadline)
+                response: ModelResponse | None = None
+                async for model_event in self._model_events(
+                    context,
+                    request_model,
+                    deadline,
+                    stream_model=stream_model,
+                    phase="step_result" if extracting else "act",
+                    record_response=False,
+                    record_internal=True,
+                    visibility=EventVisibility.INTERNAL,
+                    delta_event_type=EventType.STEP_MODEL_DELTA,
+                ):
+                    if model_event.type is EventType.MODEL_COMPLETED:
+                        candidate = model_event.data.get("response")
+                        if isinstance(candidate, ModelResponse):
+                            response = candidate
+                    yield model_event
+                if response is None:
+                    raise RuntimeError(
+                        "strict model invocation ended without a response"
+                    )
+
+                decision = await self._within(
+                    deadline,
+                    lambda: policy.decide(context, response),
+                )
+            decision_event = AgentEvent(
+                EventType.POLICY_DECISION,
+                context.run_id,
+                {
+                    "kind": decision.kind.value,
+                    "metadata": dict(decision.metadata),
+                },
+                visibility=EventVisibility.INTERNAL,
+            )
+            await self._publish(decision_event)
+            yield decision_event
+
+            if decision.kind is DecisionKind.CALL_TOOLS:
+                result_box: list[ToolResult] = []
+                try:
+                    async for tool_event in self._strict_tool_events(
+                        context,
+                        tuple(decision.tool_calls),
+                        allowed_schemas=step_tools,
+                        deadline=deadline,
+                        result_box=result_box,
+                    ):
+                        yield tool_event
+                except _StrictToolCallLimitError:
+                    state.phase = RunPhase.FAILED
+                    state.validation_error = "tool call limit exceeded"
+                    self._sync_execution_state(context, state)
+                    await self._persist_pending_messages(context, deadline)
+                    await self._save_checkpoint(context, deadline)
+                    result = self._result(
+                        context,
+                        FinishReason.MAX_TOOL_CALLS,
+                        error="tool call limit exceeded",
+                    )
+                    completed = AgentEvent(
+                        EventType.RUN_COMPLETED,
+                        context.run_id,
+                        {"result": result},
+                    )
+                    await self._publish(completed)
+                    yield completed
+                    return
+                before_replans = state.replan_count
+                await self._within(
+                    deadline,
+                    lambda: policy.observe(context, tuple(result_box)),
+                )
+                state = context.execution_state
+                if not isinstance(state, ExecutionState):
+                    raise RuntimeError("strict execution state was lost after tools")
+                if state.replan_count > before_replans:
+                    revised = AgentEvent(
+                        EventType.PLAN_REVISED,
+                        context.run_id,
+                        {
+                            "plan_version": state.plan.version,
+                            "replan_count": state.replan_count,
+                            "reason": state.validation_error,
+                        },
+                        visibility=EventVisibility.INTERNAL,
+                    )
+                    await self._publish(revised)
+                    yield revised
+                    context.clear_internal_messages()
+                await self._save_checkpoint(context, deadline)
+                continue
+
+            if decision.kind is DecisionKind.RETRY_STEP:
+                retry_event = AgentEvent(
+                    EventType.STEP_RETRY,
+                    context.run_id,
+                    {
+                        "step_id": step.step_id,
+                        "attempt": step.attempt_count,
+                        "reason": decision.metadata.get("reason"),
+                        "count_attempt": decision.metadata.get("count_attempt", True),
+                    },
+                    visibility=EventVisibility.INTERNAL,
+                )
+                await self._publish(retry_event)
+                yield retry_event
+                await self._save_checkpoint(context, deadline)
+                continue
+
+            if decision.kind is DecisionKind.REPLAN:
+                revised = AgentEvent(
+                    EventType.PLAN_REVISED,
+                    context.run_id,
+                    {
+                        "plan_version": state.plan.version,
+                        "replan_count": state.replan_count,
+                        "reason": decision.metadata.get("reason"),
+                    },
+                    visibility=EventVisibility.INTERNAL,
+                )
+                await self._publish(revised)
+                yield revised
+                context.clear_internal_messages()
+                await self._save_checkpoint(context, deadline)
+                continue
+
+            if decision.kind is DecisionKind.COMMIT_STEP:
+                state = context.execution_state
+                if not isinstance(state, ExecutionState):
+                    raise RuntimeError("strict execution state was lost at commit")
+                result = state.committed_results.get(step.step_id)
+                if result is None:
+                    raise RuntimeError("committed step has no StepResult")
+                result_created = AgentEvent(
+                    EventType.STEP_RESULT_CREATED,
+                    context.run_id,
+                    {
+                        "step_id": step.step_id,
+                        "status": result.status,
+                    },
+                    visibility=EventVisibility.INTERNAL,
+                )
+                validated = AgentEvent(
+                    EventType.STEP_VALIDATED,
+                    context.run_id,
+                    {
+                        "step_id": step.step_id,
+                        "decision": "commit",
+                    },
+                    visibility=EventVisibility.INTERNAL,
+                )
+                committed = AgentEvent(
+                    EventType.STEP_COMMITTED,
+                    context.run_id,
+                    {
+                        "step_id": step.step_id,
+                        "result_ref": step.result_ref,
+                        "plan_version": state.plan.version,
+                    },
+                    visibility=EventVisibility.INTERNAL,
+                )
+                for internal_event in (result_created, validated, committed):
+                    await self._publish(internal_event)
+                    yield internal_event
+                context.clear_internal_messages()
+                await self._save_checkpoint(context, deadline)
+                continue
+
+            if decision.kind is DecisionKind.FINALIZE:
+                getattr(policy, "begin_finalization")(context)
+                await self._save_checkpoint(context, deadline)
+                continue
+
+            if decision.kind is DecisionKind.FAIL:
+                raise RuntimeError(
+                    decision.error_message or "strict plan execution failed"
+                )
+            raise RuntimeError(f"unsupported strict decision: {decision.kind.value}")
+
+    def _strict_step_messages(
+        self,
+        context: RunContext,
+        state: ExecutionState,
+        *,
+        extracting: bool,
+    ) -> tuple[Message, ...]:
+        step = state.current_step
+        if step is None:
+            raise RuntimeError("strict step context has no current step")
+        dependencies = {
+            dependency: state.committed_results[dependency].model_dump(mode="json")
+            for dependency in step.dependencies
+            if dependency in state.committed_results
+        }
+        payload = {
+            "current_step": step.to_dict(),
+            "dependency_results": dependencies,
+        }
+        messages: list[Message] = [
+            Message.system(self.config.instructions),
+            Message.system(_STRICT_EXECUTOR_PROMPT),
+            Message.user(self._json(payload)),
+            *context.internal_messages,
+        ]
+        if extracting:
+            feedback = (
+                ""
+                if not state.validation_error
+                else f"\nValidation feedback: {state.validation_error}"
+            )
+            messages.append(Message.user(f"{_STRICT_STEP_RESULT_PROMPT}{feedback}"))
+        else:
+            messages.append(
+                Message.user(
+                    "Use an allowed tool when it is needed for this step. "
+                    "Stop after collecting enough evidence; the runtime will "
+                    "request the strict StepResult separately."
+                )
+            )
+        return tuple(messages)
+
+    @staticmethod
+    def _strict_step_tool_schemas(
+        state: ExecutionState,
+        available: tuple[Any, ...],
+    ) -> tuple[Any, ...]:
+        step = state.current_step or state.plan.current
+        if step is None or not step.allowed_tools:
+            return ()
+        by_name = {schema.name: schema for schema in available}
+        unknown = set(step.allowed_tools) - set(by_name)
+        if unknown:
+            raise RuntimeError(
+                "plan step requests unavailable tools: " + ", ".join(sorted(unknown))
+            )
+        allowed = set(step.allowed_tools)
+        return tuple(schema for schema in available if schema.name in allowed)
+
+    async def _strict_tool_events(
+        self,
+        context: RunContext,
+        calls: tuple[Any, ...],
+        *,
+        allowed_schemas: tuple[Any, ...],
+        deadline: float,
+        result_box: list[ToolResult],
+    ) -> AsyncIterator[AgentEvent]:
+        allowed_names = {schema.name for schema in allowed_schemas}
+        disallowed = sorted({call.name for call in calls} - allowed_names)
+        if disallowed:
+            message = "step attempted unavailable tools: " + ", ".join(disallowed)
+            self._record_internal_rejected_calls(context, calls, message)
+            raise RuntimeError("step attempted a disallowed tool")
+
+        skill_resource_calls = tuple(
+            call for call in calls if call.name in SKILL_RESOURCE_TOOL_NAMES
+        )
+        business_calls = tuple(
+            call for call in calls if call.name not in SKILL_RESOURCE_TOOL_NAMES
+        )
+        if skill_resource_calls and business_calls:
+            message = "a model response cannot mix Skill resource and business tools"
+            self._record_internal_rejected_calls(context, calls, message)
+            raise RuntimeError(message)
+        if skill_resource_calls:
+            if self.skill_runtime is None:
+                message = "Skill resource tools are not configured"
+                self._record_internal_rejected_calls(context, calls, message)
+                raise RuntimeError(message)
+            next_reads = context.skill_state.resource_reads + len(skill_resource_calls)
+            if next_reads > self.skill_runtime.limits.max_resource_reads:
+                message = "Skill resource read limit exceeded"
+                self._record_internal_rejected_calls(context, calls, message)
+                raise RuntimeError(message)
+            context.skill_state = replace(
+                context.skill_state,
+                resource_reads=next_reads,
+            )
+
+        if (
+            context.tool_call_count + len(business_calls)
+            > self.config.limits.max_tool_calls
+        ):
+            self._record_internal_rejected_calls(
+                context,
+                calls,
+                "tool call limit exceeded",
+            )
+            raise _StrictToolCallLimitError("tool call limit exceeded")
+
+        context.status = RunStatus.WAITING_FOR_TOOLS
+        context.tool_call_count += len(business_calls)
+        for call in calls:
+            started = AgentEvent(
+                EventType.TOOL_STARTED,
+                context.run_id,
+                {
+                    "tool_name": call.name,
+                    "tool_call": call,
+                    "step_id": (
+                        context.execution_state.current_step_id
+                        if isinstance(context.execution_state, ExecutionState)
+                        else None
+                    ),
+                },
+                visibility=EventVisibility.INTERNAL,
+            )
+            await self._publish(started)
+            yield started
+
+        tool_context = ToolExecutionContext(
+            run_id=context.run_id,
+            session_id=context.request.session_id,
+            user_context=dict(context.request.user_context),
+            metadata={
+                "agent": self.config.name,
+                "active_skills": [
+                    activation.to_dict()
+                    for activation in context.skill_state.active_skills
+                ],
+            },
+        )
+        try:
+            capabilities = getattr(self.model, "capabilities", None)
+            parallel = bool(
+                self.config.limits.parallel_tool_calls
+                and getattr(capabilities, "parallel_tool_calling", True)
+            )
+            raw_results = await asyncio.wait_for(
+                self.tool_executor.execute_many(
+                    calls,
+                    tool_context,
+                    parallel=parallel,
+                    max_parallel=self.config.limits.max_parallel_tools,
+                ),
+                timeout=self._remaining(deadline),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error_message = (
+                "tool execution timed out"
+                if isinstance(exc, asyncio.TimeoutError)
+                else (str(exc) or exc.__class__.__name__)
+            )
+            self._record_internal_rejected_calls(
+                context,
+                calls,
+                error_message,
+            )
+            if isinstance(exc, asyncio.TimeoutError):
+                raise
+            raise RuntimeError("tool execution failed") from exc
+
+        effective: list[ToolResult] = []
+        for call, raw_result in zip(calls, raw_results):
+            result = raw_result
+            is_skill_resource = call.name in SKILL_RESOURCE_TOOL_NAMES
+            if is_skill_resource and result.success and self.skill_runtime is not None:
+                added_tokens = self._resource_tokens(result.value)
+                next_resource_tokens = (
+                    context.skill_state.resource_tokens + added_tokens
+                )
+                total_skill_tokens = (
+                    context.skill_state.instruction_tokens + next_resource_tokens
+                )
+                if (
+                    next_resource_tokens > self.skill_runtime.limits.max_resource_tokens
+                    or total_skill_tokens
+                    > self.skill_runtime.limits.max_total_skill_tokens
+                ):
+                    result = ToolResult.failed(
+                        call_id=call.id,
+                        tool_name=call.name,
+                        error=ToolError(
+                            ToolErrorType.RESULT_TOO_LARGE,
+                            "Skill resource token budget exceeded",
+                        ),
+                        attempts=result.attempts,
+                        duration_seconds=result.duration_seconds,
+                    )
+                else:
+                    context.skill_state = replace(
+                        context.skill_state,
+                        resource_tokens=next_resource_tokens,
+                    )
+            effective.append(result)
+            context.add_internal_message(
+                Message.tool(
+                    self._tool_result_content(result),
+                    call_id=call.id,
+                    name=call.name,
+                    metadata={"moduagent.ephemeral": True},
+                )
+            )
+            completed = AgentEvent(
+                EventType.TOOL_COMPLETED,
+                context.run_id,
+                {
+                    "tool_name": call.name,
+                    "success": result.success,
+                    "tool_call": call,
+                    "result": result,
+                },
+                visibility=EventVisibility.INTERNAL,
+            )
+            await self._publish(completed)
+            yield completed
+            if is_skill_resource:
+                value = result.value if isinstance(result.value, dict) else {}
+                resource_event = AgentEvent(
+                    EventType.SKILL_RESOURCE_READ,
+                    context.run_id,
+                    {
+                        "skill_name": call.arguments.get("skill_name"),
+                        "path": call.arguments.get("path"),
+                        "operation": (
+                            "read" if call.name.endswith("_read") else "search"
+                        ),
+                        "success": result.success,
+                        "digest": value.get("digest"),
+                        "truncated": value.get("truncated"),
+                        "returned_bytes": value.get("returned_bytes"),
+                        "scanned_bytes": value.get("scanned_bytes"),
+                    },
+                    visibility=EventVisibility.INTERNAL,
+                )
+                await self._publish(resource_event)
+                yield resource_event
+        result_box.extend(effective)
+        context.status = RunStatus.RUNNING
+
+    async def _strict_finalization_events(
+        self,
+        context: RunContext,
+        deadline: float,
+        *,
+        stream_model: bool,
+    ) -> AsyncIterator[AgentEvent]:
+        policy = self.decision_policy
+        state = context.execution_state
+        if not isinstance(state, ExecutionState):
+            raise RuntimeError("strict finalization state is missing")
+        buffered_deltas: tuple[str, ...] = ()
+
+        if state.final_response is None:
+            started = AgentEvent(
+                EventType.FINALIZATION_STARTED,
+                context.run_id,
+                {"count": state.finalization_count},
+                visibility=EventVisibility.INTERNAL,
+            )
+            await self._publish(started)
+            yield started
+            context.status = RunStatus.WAITING_FOR_MODEL
+            await self._save_checkpoint(context, deadline)
+            options = dict(self.config.model_options)
+            options.pop("tool_choice", None)
+            options.pop("parallel_tool_calls", None)
+            payload = getattr(policy, "finalization_payload")(context)
+            request = ModelRequest(
+                messages=(
+                    Message.system(self.config.instructions),
+                    Message.system(_STRICT_FINALIZER_PROMPT),
+                    Message.user(self._json(payload)),
+                ),
+                tools=(),
+                output_schema=self.output_codec.schema(),
+                options=options,
+            )
+            request, memory_event = await self._prepare_model_request(
+                context,
+                request,
+                phase=MemoryPhase.FINALIZE,
+                deadline=deadline,
+                skill_phase="finalize",
+                protected_from=0,
+            )
+            if memory_event is not None:
+                yield memory_event
+            response: ModelResponse | None = None
+            async for model_event in self._model_events(
+                context,
+                request,
+                deadline,
+                stream_model=stream_model,
+                phase="finalize",
+                record_response=False,
+                visibility=EventVisibility.INTERNAL,
+                buffer_deltas=True,
+            ):
+                if model_event.type is EventType.MODEL_COMPLETED:
+                    candidate = model_event.data.get("response")
+                    if isinstance(candidate, ModelResponse):
+                        response = candidate
+                    buffered_deltas = tuple(
+                        str(item)
+                        for item in model_event.data.get("buffered_deltas", ())
+                    )
+                yield model_event
+            if response is None:
+                raise RuntimeError("finalization returned no response")
+            if response.tool_calls or response.message.tool_calls:
+                raise RuntimeError("finalization returned tool calls")
+            finish_reason = (response.finish_reason or "").lower()
+            if finish_reason in {"timeout", "length", "max_tokens"}:
+                raise RuntimeError(
+                    f"incomplete finalization response ({finish_reason})"
+                )
+            raw_response = response.message.content
+            if raw_response is None or not str(raw_response).strip():
+                raise RuntimeError("finalization response is empty")
+            # Decode before any public delta or persistence. An invalid public
+            # schema therefore cannot leak a partial final response.
+            try:
+                output = self.output_codec.decode(response)
+            except Exception as exc:
+                raise RuntimeError("finalization response validation failed") from exc
+            getattr(policy, "record_final_response")(
+                context,
+                str(raw_response),
+            )
+            state = context.execution_state
+            await self._save_checkpoint(context, deadline)
+        else:
+            try:
+                output = self.output_codec.decode(state.final_response)
+            except Exception as exc:
+                raise RuntimeError(
+                    "stored finalization response validation failed"
+                ) from exc
+
+        if not isinstance(state, ExecutionState) or state.final_response is None:
+            raise RuntimeError("finalization did not record a stable response")
+        final_message_exists = any(
+            message.role.value == "assistant"
+            and message.metadata.get(_RUN_ID_METADATA_KEY) == context.run_id
+            and message.metadata.get(_PUBLIC_FINAL_METADATA_KEY) is True
+            for message in context.messages
+        )
+        if not final_message_exists:
+            context.add_message(
+                Message.assistant(
+                    state.final_response,
+                    metadata={
+                        _RUN_ID_METADATA_KEY: context.run_id,
+                        _PUBLIC_FINAL_METADATA_KEY: True,
+                    },
+                )
+            )
+
+        if not state.final_persisted:
+            await self._persist_pending_messages(context, deadline)
+            getattr(policy, "record_final_response")(
+                context,
+                state.final_response,
+                persisted=True,
+            )
+            state = context.execution_state
+            await self._save_checkpoint(context, deadline)
+
+        if not isinstance(state, ExecutionState):
+            raise RuntimeError("strict finalization state was lost")
+        if not state.final_emitted:
+            # Persist the at-most-once emission marker before exposing buffered
+            # tokens. Durable exactly-once delivery still requires an external
+            # outbox, but resume will never re-run the model or re-emit here.
+            getattr(policy, "record_final_response")(
+                context,
+                state.final_response,
+                persisted=True,
+                emitted=True,
+            )
+            state = context.execution_state
+            context.status = RunStatus.COMPLETED
+            await self._save_checkpoint(context, deadline)
+            if stream_model:
+                public_deltas = (
+                    buffered_deltas
+                    if buffered_deltas
+                    and "".join(buffered_deltas) == state.final_response
+                    else (state.final_response,)
+                )
+                for delta in public_deltas:
+                    delta_event = AgentEvent(
+                        EventType.FINAL_DELTA,
+                        context.run_id,
+                        {
+                            "phase": "finalize",
+                            "delta": delta,
+                        },
+                        visibility=EventVisibility.PUBLIC,
+                    )
+                    await self._publish(delta_event)
+                    yield delta_event
+            finalized = AgentEvent(
+                EventType.FINALIZATION_COMPLETED,
+                context.run_id,
+                {
+                    "count": state.finalization_count,
+                    "persisted": state.final_persisted,
+                },
+            )
+            await self._publish(finalized)
+            yield finalized
+
+        result = self._result(
+            context,
+            FinishReason.COMPLETED,
+            output=output,
+        )
+        completed = AgentEvent(
+            EventType.RUN_COMPLETED,
+            context.run_id,
+            {"result": result},
+        )
+        await self._publish(completed)
+        yield completed
+
+    def _record_internal_rejected_calls(
+        self,
+        context: RunContext,
+        calls: tuple[Any, ...],
+        error_message: str,
+    ) -> None:
+        for call in calls:
+            result = ToolResult.failed(
+                call_id=call.id,
+                tool_name=call.name,
+                error=ToolError(
+                    ToolErrorType.EXECUTION_ERROR,
+                    error_message,
+                ),
+            )
+            context.add_internal_message(
+                Message.tool(
+                    self._tool_result_content(result),
+                    call_id=call.id,
+                    name=call.name,
+                    metadata={"moduagent.ephemeral": True},
+                )
+            )
+
+    @staticmethod
+    def _sync_execution_state(
+        context: RunContext,
+        state: ExecutionState,
+    ) -> None:
+        context.execution_state = state
+        context.policy_state["execution_state"] = state.to_dict()
+        context.policy_state["plan"] = state.plan.to_dict()
+
     async def _skill_events(
         self,
         context: RunContext,
@@ -803,14 +1755,20 @@ class AgentRuntime:
         stream_model: bool,
         phase: str,
         record_response: bool = True,
+        record_internal: bool = False,
+        visibility: EventVisibility = EventVisibility.PUBLIC,
+        delta_event_type: EventType = EventType.MODEL_DELTA,
+        buffer_deltas: bool = False,
     ) -> AsyncIterator[AgentEvent]:
         response: ModelResponse | None = None
         emitted_delta = False
+        buffered_deltas: list[str] = []
         for attempt in range(1, self.config.retry.max_attempts + 1):
             event = AgentEvent(
                 EventType.MODEL_STARTED,
                 context.run_id,
                 {"step": context.step, "attempt": attempt, "phase": phase},
+                visibility=visibility,
             )
             await self._publish(event)
             yield event
@@ -829,18 +1787,21 @@ class AgentRuntime:
                             break
                         if chunk.delta:
                             emitted_delta = True
-                            delta_event = AgentEvent(
-                                EventType.MODEL_DELTA,
-                                context.run_id,
-                                {
-                                    "step": context.step,
-                                    "phase": phase,
-                                    "delta": chunk.delta,
-                                    "metadata": dict(chunk.provider_metadata),
-                                },
-                            )
-                            await self._publish(delta_event)
-                            yield delta_event
+                            buffered_deltas.append(chunk.delta)
+                            if not buffer_deltas:
+                                delta_event = AgentEvent(
+                                    delta_event_type,
+                                    context.run_id,
+                                    {
+                                        "step": context.step,
+                                        "phase": phase,
+                                        "delta": chunk.delta,
+                                        "metadata": dict(chunk.provider_metadata),
+                                    },
+                                    visibility=visibility,
+                                )
+                                await self._publish(delta_event)
+                                yield delta_event
                         if chunk.response is not None:
                             response = chunk.response
                     if response is None:
@@ -867,6 +1828,7 @@ class AgentRuntime:
                         "phase": phase,
                         "error": str(exc),
                     },
+                    visibility=visibility,
                 )
                 await self._publish(retry_event)
                 yield retry_event
@@ -893,6 +1855,11 @@ class AgentRuntime:
                 ),
                 persist=not ephemeral,
             )
+        elif record_internal:
+            response_calls = response.tool_calls or response.message.tool_calls
+            context.add_internal_message(
+                Message.assistant(response.message.content, response_calls)
+            )
         event = AgentEvent(
             EventType.MODEL_COMPLETED,
             context.run_id,
@@ -901,7 +1868,9 @@ class AgentRuntime:
                 "phase": phase,
                 "response": response,
                 "usage": response.usage,
+                "buffered_deltas": tuple(buffered_deltas),
             },
+            visibility=visibility,
         )
         await self._publish(event)
         yield event
@@ -913,10 +1882,21 @@ class AgentRuntime:
         *,
         phase: MemoryPhase,
         deadline: float,
+        skill_phase: str | None = None,
+        protected_from: int | None = None,
     ) -> tuple[ModelRequest, AgentEvent | None]:
         request = replace(
             request,
-            messages=compose_skill_prompt(request.messages, context.skill_messages),
+            messages=compose_skill_prompt(
+                request.messages,
+                context.skill_messages,
+                phase=skill_phase,
+            ),
+        )
+        protected_boundary = (
+            context.current_run_start + len(context.skill_messages)
+            if protected_from is None
+            else protected_from
         )
         memory = await self._within(
             deadline,
@@ -926,9 +1906,7 @@ class AgentRuntime:
                     session_id=context.request.session_id,
                     phase=phase,
                     model_request=request,
-                    protected_from=(
-                        context.current_run_start + len(context.skill_messages)
-                    ),
+                    protected_from=protected_boundary,
                     user_context=context.request.user_context,
                 )
             ),
@@ -957,7 +1935,7 @@ class AgentRuntime:
         await self._publish(event)
         return prepared, event
 
-    async def _structured_finalization_events(
+    async def _finalization_events(
         self,
         context: RunContext,
         output_schema: Any,
@@ -986,6 +1964,7 @@ class AgentRuntime:
                 request,
                 phase=MemoryPhase.FINALIZE,
                 deadline=deadline,
+                skill_phase="finalize",
             )
             if memory_event is not None:
                 yield memory_event
@@ -1003,20 +1982,45 @@ class AgentRuntime:
                         response = candidate
                 yield event
             if response is None:
-                raise RuntimeError("structured finalization returned no response")
+                raise RuntimeError("finalization returned no response")
             if response.tool_calls or response.message.tool_calls:
-                raise RuntimeError("structured finalization returned tool calls")
-            output = self.output_codec.decode(response)
-            context.policy_state[_FINALIZATION_OUTPUT_KEY] = response.message.content
+                raise RuntimeError("finalization returned tool calls")
+            finish_reason = (response.finish_reason or "").lower()
+            if finish_reason in {"timeout", "length", "max_tokens"}:
+                raise RuntimeError(
+                    f"incomplete finalization response ({finish_reason})"
+                )
+            try:
+                output = self.output_codec.decode(response)
+            except Exception as exc:
+                raise RuntimeError("finalization response validation failed") from exc
+            raw_response = response.message.content
+            if raw_response is None:
+                raise RuntimeError("finalization response is empty")
+            context.add_message(
+                Message.assistant(
+                    raw_response,
+                    metadata={
+                        _RUN_ID_METADATA_KEY: context.run_id,
+                        _PUBLIC_FINAL_METADATA_KEY: True,
+                    },
+                )
+            )
+            context.policy_state[_FINALIZATION_OUTPUT_KEY] = raw_response
             context.policy_state[_FINALIZATION_STATE_KEY] = _FINALIZATION_COMPLETED
             context.status = RunStatus.RUNNING
             await self._save_checkpoint(context, deadline)
         else:
             if _FINALIZATION_OUTPUT_KEY not in context.policy_state:
-                raise RuntimeError("structured finalization response is missing")
-            output = self.output_codec.decode(
-                context.policy_state[_FINALIZATION_OUTPUT_KEY]
-            )
+                raise RuntimeError("finalization response is missing")
+            try:
+                output = self.output_codec.decode(
+                    context.policy_state[_FINALIZATION_OUTPUT_KEY]
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "stored finalization response validation failed"
+                ) from exc
 
         result = await self._finalize(
             context,
@@ -1040,13 +2044,7 @@ class AgentRuntime:
     ) -> AgentResult:
         if output is None and reason is FinishReason.COMPLETED and response is not None:
             output = self.output_codec.decode(response)
-        await self._within(
-            deadline,
-            lambda: self.conversation_store.append(
-                context.request.session_id, tuple(context.new_messages)
-            ),
-        )
-        context.new_messages.clear()
+        await self._persist_pending_messages(context, deadline)
         if self.checkpoint_store is not None:
             await self._within(
                 deadline,
@@ -1063,7 +2061,26 @@ class AgentRuntime:
         output: Any = None,
         error: str | None = None,
     ) -> AgentResult:
-        metadata = dict(context.metadata)
+        metadata = {
+            key: value
+            for key, value in context.metadata.items()
+            if not key.startswith("_moduagent_")
+            and key
+            not in {
+                "execution_state",
+                "validation",
+                "requires_step_result",
+            }
+        }
+        if isinstance(context.execution_state, ExecutionState):
+            state = context.execution_state
+            metadata["plan"] = state.plan.to_dict()
+            metadata["plan_usage"] = {
+                "phase": state.phase.value,
+                "committed_steps": len(state.committed_results),
+                "replans": state.replan_count,
+                "finalization_calls": state.finalization_count,
+            }
         if context.skill_state.catalog_digest:
             metadata["skill_usage"] = {
                 "catalog_digest": context.skill_state.catalog_digest,
@@ -1104,19 +2121,64 @@ class AgentRuntime:
         except Exception:
             pass
 
+    async def _persist_pending_messages(
+        self,
+        context: RunContext,
+        deadline: float,
+    ) -> None:
+        if not context.new_messages:
+            return
+        existing = await self._within(
+            deadline,
+            lambda: self.conversation_store.load(context.request.session_id),
+        )
+        existing_keys = {
+            key
+            for message in existing
+            if (key := self._message_idempotency_key(message)) is not None
+        }
+        additions: list[Message] = []
+        for message in context.new_messages:
+            key = self._message_idempotency_key(message)
+            if key is None or key not in existing_keys:
+                additions.append(message)
+                if key is not None:
+                    existing_keys.add(key)
+        if additions:
+            await self._within(
+                deadline,
+                lambda: self.conversation_store.append(
+                    context.request.session_id,
+                    tuple(additions),
+                ),
+            )
+        context.new_messages.clear()
+
     async def _persist_safely(self, context: RunContext) -> None:
         if not context.new_messages:
             return
         try:
-            await asyncio.wait_for(
-                self.conversation_store.append(
-                    context.request.session_id, tuple(context.new_messages)
-                ),
-                timeout=1.0,
+            deadline = asyncio.get_running_loop().time() + 1.0
+            await self._persist_pending_messages(
+                context,
+                deadline,
             )
-            context.new_messages.clear()
         except Exception:
             pass
+
+    @staticmethod
+    def _message_idempotency_key(
+        message: Message,
+    ) -> tuple[str, str, bool, bool] | None:
+        run_id = message.metadata.get(_RUN_ID_METADATA_KEY)
+        if not isinstance(run_id, str) or not run_id:
+            return None
+        return (
+            run_id,
+            message.role.value,
+            message.metadata.get(_PUBLIC_FINAL_METADATA_KEY) is True,
+            message.metadata.get("moduagent.public_input") is True,
+        )
 
     async def _publish(self, event: AgentEvent) -> None:
         try:

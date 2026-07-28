@@ -4,6 +4,7 @@ import json
 from collections.abc import Mapping
 from typing import Any, Generic, Protocol, TypeVar, runtime_checkable
 
+from moduagent.decision.planning import StepResult
 from moduagent.messages import Message
 
 
@@ -70,6 +71,13 @@ class PydanticOutputCodec(Generic[T]):
         return self.model_type.parse_raw(content)  # type: ignore[attr-defined, no-any-return]
 
 
+class StepResultCodec(PydanticOutputCodec[StepResult]):
+    """Strict internal codec for a Plan-and-Execute ACT result."""
+
+    def __init__(self) -> None:
+        super().__init__(StepResult)
+
+
 def _response_content(response: Any) -> Any:
     """Read ``ModelResponse.message.content`` while accepting test-friendly forms."""
 
@@ -92,4 +100,9 @@ def _response_content(response: Any) -> Any:
     return getattr(message, "content", None)
 
 
-__all__ = ["OutputCodec", "PydanticOutputCodec", "TextOutputCodec"]
+__all__ = [
+    "OutputCodec",
+    "PydanticOutputCodec",
+    "StepResultCodec",
+    "TextOutputCodec",
+]

@@ -182,7 +182,22 @@ def test_skill_applies_to_plan_act_and_finalize_with_tool() -> None:
                     assert request.tools == ()
                     return ModelResponse(
                         Message.assistant(
-                            '{"steps":[{"description":"calculate once"}]}'
+                            '{"steps":[{"step_id":"calculate",'
+                            '"objective":"calculate once",'
+                            '"completion_criteria":["the sum is verified"],'
+                            '"expected_output":"verified sum",'
+                            '"dependencies":[],"allowed_tools":["add"]}]}'
+                        )
+                    )
+                if request.output_schema and (
+                    request.output_schema.get("title") == "StepResult"
+                ):
+                    assert request.tools == ()
+                    return ModelResponse(
+                        Message.assistant(
+                            '{"step_id":"calculate","status":"completed",'
+                            '"facts":["add returned 5"],'
+                            '"completion_evidence":["the sum is verified"]}'
                         )
                     )
                 if request.output_schema is not None:
@@ -190,10 +205,8 @@ def test_skill_applies_to_plan_act_and_finalize_with_tool() -> None:
                     return ModelResponse(Message.assistant('{"answer":"5"}'))
                 assert [schema.name for schema in request.tools] == ["add"]
                 self.act_calls += 1
-                if self.act_calls == 1:
-                    call = ToolCall("add-1", "add", {"a": 2, "b": 3})
-                    return ModelResponse(Message.assistant(None, (call,)), (call,))
-                return ModelResponse(Message.assistant("Verified result is 5."))
+                call = ToolCall("add-1", "add", {"a": 2, "b": 3})
+                return ModelResponse(Message.assistant(None, (call,)), (call,))
 
             async def stream(self, request):
                 raise AssertionError("streaming is not expected")
@@ -216,6 +229,17 @@ def test_skill_applies_to_plan_act_and_finalize_with_tool() -> None:
 
         assert result.output == StructuredAnswer(answer="5")
         assert len(model.requests) == 4
+        plan_request, act_request, step_result_request, finalize_request = (
+            model.requests
+        )
+        assert plan_request.tools == ()
+        assert "steps" in plan_request.output_schema["properties"]
+        assert [schema.name for schema in act_request.tools] == ["add"]
+        assert act_request.output_schema is None
+        assert step_result_request.tools == ()
+        assert step_result_request.output_schema["title"] == "StepResult"
+        assert finalize_request.tools == ()
+        assert finalize_request.output_schema["title"] == "StructuredAnswer"
         assert all(
             not (request.tools and request.output_schema is not None)
             for request in model.requests

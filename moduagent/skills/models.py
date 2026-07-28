@@ -6,6 +6,10 @@ from types import MappingProxyType
 from typing import Any
 
 
+SKILL_PHASES = ("plan", "act", "finalize")
+_SKILL_PHASE_SET = frozenset(SKILL_PHASES)
+
+
 def freeze_mapping(value: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
     """Return a recursively immutable copy of a string-keyed mapping."""
 
@@ -24,6 +28,26 @@ def _freeze_value(value: Any) -> Any:
     if isinstance(value, (set, frozenset)):
         return frozenset(_freeze_value(item) for item in value)
     return value
+
+
+def _freeze_skill_phases(value: Any) -> frozenset[str]:
+    if isinstance(value, (str, bytes)):
+        raise TypeError("applies_to must be an iterable of Skill phases")
+    try:
+        phases = tuple(value)
+    except TypeError as exc:
+        raise TypeError("applies_to must be an iterable of Skill phases") from exc
+    if not phases:
+        raise ValueError("applies_to must contain at least one Skill phase")
+    if not all(isinstance(phase, str) for phase in phases):
+        raise TypeError("applies_to must contain Skill phase strings")
+    if len(set(phases)) != len(phases):
+        raise ValueError("applies_to cannot contain duplicate Skill phases")
+    unsupported = set(phases) - _SKILL_PHASE_SET
+    if unsupported:
+        expected = ", ".join(SKILL_PHASES)
+        raise ValueError(f"applies_to must contain only: {expected}")
+    return frozenset(phases)
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,10 +105,12 @@ class SkillDescriptor:
     compatibility: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
     allowed_tools: frozenset[str] = field(default_factory=frozenset)
+    applies_to: frozenset[str] = field(default_factory=lambda: _SKILL_PHASE_SET)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", freeze_mapping(self.metadata))
         object.__setattr__(self, "allowed_tools", frozenset(self.allowed_tools))
+        object.__setattr__(self, "applies_to", _freeze_skill_phases(self.applies_to))
 
     @property
     def ref(self) -> "SkillRef":
@@ -138,12 +164,14 @@ class SkillActivation:
     selected_by: str = "explicit"
     allowed_tools: frozenset[str] = field(default_factory=frozenset)
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    applies_to: frozenset[str] = field(default_factory=lambda: _SKILL_PHASE_SET)
 
     def __post_init__(self) -> None:
         if self.selected_by not in {"explicit", "model"}:
             raise ValueError("selected_by must be 'explicit' or 'model'")
         object.__setattr__(self, "allowed_tools", frozenset(self.allowed_tools))
         object.__setattr__(self, "metadata", freeze_mapping(self.metadata))
+        object.__setattr__(self, "applies_to", _freeze_skill_phases(self.applies_to))
 
     @property
     def name(self) -> str:

@@ -122,6 +122,7 @@ class Agent:
         resume_run_id: str | None = None,
         skills: Iterable[str] = (),
         skill_mode: str | None = None,
+        include_internal: bool | None = None,
     ) -> AsyncIterator[AgentEvent]:
         request = self._request(
             text,
@@ -131,7 +132,29 @@ class Agent:
             skills=skills,
             skill_mode=skill_mode,
         )
-        return self.runtime.stream(request)
+        return self.runtime.stream(request, include_internal=include_internal)
+
+    def stream_all(
+        self,
+        text: str,
+        *,
+        session_id: str | None = None,
+        user_context: Mapping[str, Any] | None = None,
+        resume_run_id: str | None = None,
+        skills: Iterable[str] = (),
+        skill_mode: str | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """Stream public and diagnostic internal events for one run."""
+
+        return self.stream(
+            text,
+            session_id=session_id,
+            user_context=user_context,
+            resume_run_id=resume_run_id,
+            skills=skills,
+            skill_mode=skill_mode,
+            include_internal=True,
+        )
 
     async def resume(self, run_id: str, *, session_id: str) -> AgentResult:
         return await self.run(

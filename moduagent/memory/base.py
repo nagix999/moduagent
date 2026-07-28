@@ -9,7 +9,10 @@ from moduagent.models import ModelRequest
 
 
 class MemoryPhase(str, Enum):
+    PLAN = "plan"
     ACT = "act"
+    STEP_RESULT = "step_result"
+    VERIFY = "verify"
     FINALIZE = "finalize"
 
 

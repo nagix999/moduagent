@@ -18,7 +18,7 @@ from moduagent.skills.errors import (
     SkillSelectionError,
     SkillValidationError,
 )
-from moduagent.skills.models import SkillArtifact, SkillLimits, SkillRef
+from moduagent.skills.models import SKILL_PHASES, SkillArtifact, SkillLimits, SkillRef
 from moduagent.skills.prompting import render_skill_messages
 from moduagent.skills.registry import SkillRegistry
 from moduagent.skills.selection import (
@@ -157,6 +157,11 @@ class SkillRuntime:
                     selected_by=activation.selected_by,
                     allowed_tools=tuple(sorted(activation.allowed_tools)),
                     metadata=dict(activation.metadata),
+                    applies_to=tuple(
+                        phase
+                        for phase in SKILL_PHASES
+                        if phase in activation.applies_to
+                    ),
                 )
             )
 
@@ -243,6 +248,10 @@ class SkillRuntime:
             if frozenset(activation.allowed_tools) != artifact.descriptor.allowed_tools:
                 raise SkillDigestMismatchError(
                     f"skill tool grant changed for {activation.name}"
+                )
+            if frozenset(activation.applies_to) != artifact.descriptor.applies_to:
+                raise SkillDigestMismatchError(
+                    f"skill phase scope changed for {activation.name}"
                 )
             artifact_tokens = _estimate_tokens(artifact.instructions)
             instruction_tokens += artifact_tokens
@@ -384,6 +393,7 @@ class SkillRuntime:
                 "digest": activation.digest,
                 "source_id": activation.source_id,
                 "selected_by": activation.selected_by,
+                "applies_to": list(activation.applies_to),
             }
             for activation in context.skill_state.active_skills
         ]

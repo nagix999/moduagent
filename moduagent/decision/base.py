@@ -13,8 +13,13 @@ if TYPE_CHECKING:
 
 
 class DecisionKind(str, Enum):
+    # CONTINUE is retained for policies written against ModuAgent 0.2.x.
     CONTINUE = "continue"
     CALL_TOOLS = "call_tools"
+    COMMIT_STEP = "commit_step"
+    RETRY_STEP = "retry_step"
+    REPLAN = "replan"
+    FINALIZE = "finalize"
     FINISH = "finish"
     FAIL = "fail"
 

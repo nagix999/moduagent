@@ -10,6 +10,7 @@ import yaml
 
 from moduagent.skills.errors import SkillValidationError
 from moduagent.skills.models import (
+    SKILL_PHASES,
     SkillArtifact,
     SkillDescriptor,
     SkillLimits,
@@ -24,9 +25,11 @@ _FRONTMATTER_KEYS = {
     "compatibility",
     "metadata",
     "allowed-tools",
+    "applies-to",
 }
 _PACKAGE_ROOTS = {"references", "assets", "scripts"}
 _DIGEST_DOMAIN = b"moduagent-skill-package-v1\0"
+_MISSING = object()
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -321,6 +324,7 @@ def _build_descriptor(
         compatibility=compatibility,
         metadata=metadata,
         allowed_tools=_parse_allowed_tools(value.get("allowed-tools")),
+        applies_to=_parse_applies_to(value.get("applies-to", _MISSING)),
     )
 
 
@@ -359,6 +363,24 @@ def _parse_allowed_tools(raw: Any) -> frozenset[str]:
             raise SkillValidationError("allowed-tools entries cannot contain controls")
         tools.add(tool)
     return frozenset(tools)
+
+
+def _parse_applies_to(raw: Any) -> frozenset[str]:
+    if raw is _MISSING:
+        return frozenset(SKILL_PHASES)
+    if not isinstance(raw, list):
+        raise SkillValidationError("applies-to must be a YAML list")
+    if not raw:
+        raise SkillValidationError("applies-to must contain at least one phase")
+    if not all(isinstance(phase, str) for phase in raw):
+        raise SkillValidationError("applies-to entries must be phase strings")
+    if len(set(raw)) != len(raw):
+        raise SkillValidationError("applies-to cannot contain duplicate phases")
+    unsupported = set(raw) - set(SKILL_PHASES)
+    if unsupported:
+        expected = ", ".join(SKILL_PHASES)
+        raise SkillValidationError(f"applies-to entries must be one of: {expected}")
+    return frozenset(raw)
 
 
 def _classify_paths(

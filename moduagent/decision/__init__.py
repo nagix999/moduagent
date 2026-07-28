@@ -4,24 +4,42 @@ from moduagent.decision.base import (
     ExecutionDecision,
 )
 from moduagent.decision.planning import (
+    ExecutionState,
+    LegacyPlanAndExecutePolicy,
     LLMPlanGenerator,
     Plan,
     PlanAndExecutePolicy,
     PlanGenerator,
     PlanStep,
     PlanStepStatus,
+    RunPhase,
+    StepResult,
+    StepStatus,
+    StepValidation,
+    StepValidator,
+    ValidationKind,
+    step_result_ref,
 )
 from moduagent.decision.standard import StandardDecisionPolicy
 
 __all__ = [
     "DecisionKind",
     "DecisionPolicy",
+    "ExecutionState",
     "ExecutionDecision",
+    "LegacyPlanAndExecutePolicy",
     "LLMPlanGenerator",
     "Plan",
     "PlanAndExecutePolicy",
     "PlanGenerator",
     "PlanStep",
     "PlanStepStatus",
+    "RunPhase",
     "StandardDecisionPolicy",
+    "StepResult",
+    "StepStatus",
+    "StepValidation",
+    "StepValidator",
+    "ValidationKind",
+    "step_result_ref",
 ]

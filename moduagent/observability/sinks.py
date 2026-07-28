@@ -12,7 +12,7 @@ from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
 from moduagent.messages import Usage
-from moduagent.runtime.events import AgentEvent, EventType
+from moduagent.runtime.events import AgentEvent, EventType, EventVisibility
 
 
 DEFAULT_SENSITIVE_KEYS = frozenset(
@@ -200,6 +200,32 @@ class MetricsEventSink:
                     labels={"tool": _tool_name(event.data)},
                 )
 
+            if event.type is EventType.PLAN_CREATED:
+                await self._increment(
+                    "plan.steps.created",
+                    int(event.data.get("step_count", 0)),
+                )
+            if event.type is EventType.STEP_COMMITTED:
+                await self._increment("plan.steps.committed")
+            if event.type is EventType.STEP_RETRY:
+                await self._increment("plan.steps.retried")
+            if event.type is EventType.PLAN_REVISED:
+                await self._increment("plan.replans")
+            if event.type is EventType.FINALIZATION_STARTED:
+                await self._increment("finalization.calls")
+            if event.type in (EventType.STEP_MODEL_DELTA, EventType.FINAL_DELTA):
+                delta = str(event.data.get("delta", ""))
+                token_estimate = max(0, (len(delta.encode("utf-8")) + 2) // 3)
+                visibility = (
+                    "public"
+                    if event.visibility is EventVisibility.PUBLIC
+                    else "internal"
+                )
+                await self._increment(
+                    f"stream.{visibility}_tokens",
+                    token_estimate,
+                )
+
             if event.type in (EventType.RUN_COMPLETED, EventType.RUN_FAILED):
                 status = (
                     "completed" if event.type is EventType.RUN_COMPLETED else "failed"
@@ -311,6 +337,7 @@ def event_to_dict(event: AgentEvent) -> dict[str, Any]:
         "type": _event_name(event),
         "run_id": event.run_id,
         "occurred_at": _utc_iso(event.occurred_at),
+        "visibility": event.visibility.value,
         "data": _json_safe(event.data),
     }
 

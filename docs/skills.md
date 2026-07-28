@@ -1,6 +1,6 @@
 # Agent Skills
 
-상태: ModuAgent 0.2.0에서 Agent Skills의 `SKILL.md` 핵심 형식, 로컬·InMemory source, 명시적·자동·혼합 선택, 제한된 resource 접근, digest 기반 checkpoint 복구를 지원한다. 0.2.0은 검토된 agent-scoped catalog를 신뢰 경계로 삼는 로컬 실행 프로필이다.
+상태: ModuAgent 0.3.0에서 Agent Skills의 `SKILL.md` 핵심 형식, 로컬·InMemory source, 명시적·자동·혼합 선택, phase-scoped 지침, 제한된 resource 접근, digest 기반 checkpoint 복구를 지원한다. 0.3.0은 검토된 agent-scoped catalog를 신뢰 경계로 삼는 로컬 실행 프로필이다.
 
 ## 개념
 
@@ -26,7 +26,7 @@ skills/
     │   └── policy.md
     ├── assets/                  # 선택: 필요할 때 읽는 텍스트 자산
     │   └── report-template.md
-    └── scripts/                 # 선택: 0.2.0에서는 실행·노출하지 않음
+    └── scripts/                 # 선택: 0.3.0에서는 실행·노출하지 않음
 ```
 
 동작 확인용 패키지는 [`examples/skills/invoice-review`](../examples/skills/invoice-review)에 있다.
@@ -38,10 +38,14 @@ skills/
 name: invoice-review
 description: 회사 정책에 따라 청구서를 검토한다. 청구 금액, 증빙, 승인 여부를 확인할 때 사용한다.
 license: MIT
-compatibility: ModuAgent 0.2.0
+compatibility: ModuAgent 0.3.0
 metadata:
   version: "1.0.0"
 allowed-tools: lookup_invoice
+applies-to:
+  - plan
+  - act
+  - finalize
 ---
 
 # Invoice review
@@ -61,10 +65,11 @@ allowed-tools: lookup_invoice
 | `compatibility` | 아니요 | 실행 환경 요구사항, 최대 500자 |
 | `metadata` | 아니요 | 문자열 key와 문자열 value로 구성된 mapping. `version`이 Skill 버전이 됨 |
 | `allowed-tools` | 아니요 | 공백으로 구분한 문자열 또는 YAML 문자열 목록 |
+| `applies-to` | 아니요 | `plan`, `act`, `finalize` 중 하나 이상을 담은 중복 없는 YAML 목록. 기본값은 세 단계 전체 |
 
 ModuAgent의 기본 strict 프로필은 다른 frontmatter 필드와 `references/`, `assets/`, `scripts/` 밖의 패키지 파일을 거부한다. 이는 추가 파일을 허용하는 Agent Skills 기본 형식보다 의도적으로 좁다. Skill 이름, YAML 중복 key, anchor/alias, 절대경로, `..`, 역슬래시, symlink도 거부한다.
 
-`compatibility`와 임의 `metadata`는 0.2.0에서 정보로 보존하지만 환경 의존성을 자동 설치하거나 호환성을 자동 판정하지 않는다. YAML 목록 형태의 `allowed-tools`는 ModuAgent 확장이고, 이식 가능한 Skill은 공식 형식인 공백 구분 문자열을 사용한다.
+`compatibility`와 임의 `metadata`는 0.3.0에서 정보로 보존하지만 환경 의존성을 자동 설치하거나 호환성을 자동 판정하지 않는다. YAML 목록 형태의 `allowed-tools`와 `applies-to`는 ModuAgent 확장이고, 이식 가능한 Skill은 공식 형식인 공백 구분 `allowed-tools`를 사용한다.
 
 기본 패키지 제한은 `SKILL.md` 64 KiB, 파일 256개, 전체 50 MiB다. 본문은 비어 있을 수 없다.
 
@@ -72,7 +77,7 @@ ModuAgent의 기본 strict 프로필은 다른 frontmatter 필드와 `references
 
 ## 기본 사용
 
-다음 예제는 실제 0.2.0 API와 source checkout에 포함된 예제 Skill을 사용한다. PyPI wheel 설치 환경에서는 같은 구조의 자체 catalog 경로를 지정한다.
+다음 예제는 실제 0.3.0 API와 source checkout에 포함된 예제 Skill을 사용한다. PyPI wheel 설치 환경에서는 같은 구조의 자체 catalog 경로를 지정한다.
 
 ```python
 import asyncio
@@ -117,7 +122,7 @@ async def main() -> None:
         config=AgentConfig(
             name="invoice-agent",
             instructions="근거가 확인된 내용만 답한다.",
-            # reference 한 번을 읽은 뒤 답하려면 ACT 단계가 최소 두 번 필요하다.
+            # StandardDecisionPolicy에서는 resource 왕복을 고려해 모델 turn에 여유를 둔다.
             limits=RunLimits(max_steps=6, max_tool_calls=4),
         ),
         model=model,
@@ -257,7 +262,8 @@ Agent system instruction
 ```
 
 - 자동 선택 단계에는 catalog metadata만 전달한다.
-- 선택된 `SKILL.md` 본문은 PLAN, ACT, FINALIZE에 적용한다.
+- 선택된 `SKILL.md` 본문은 `applies-to`에 선언된 PLAN, ACT, FINALIZE 요청에만 적용한다. 필드를 생략한 기존 Skill은 세 단계 모두에 적용한다.
+- VERIFY는 결정적인 런타임 검증 단계이므로 Skill 적용 대상이 아니다.
 - `references/`와 text `assets/` 내용은 모델이 요청할 때만 추가한다.
 - Skill system 메시지는 prompt 전용이며 대화 저장소, 결과 메시지, checkpoint에 원문으로 저장하지 않는다.
 - Skill instruction은 ConversationMemoryPolicy가 제거할 수 없는 보호 메시지이며 token budget에는 포함된다.
@@ -275,19 +281,23 @@ Agent system instruction
 
 Resource 결과는 ephemeral 메시지다. 실행 중 다음 모델 호출에는 제공되지만 `ConversationStore`와 최종 `AgentResult.messages`에는 남지 않는다. 이벤트에도 원문 대신 경로, digest, byte 수만 기록한다.
 
-실행 중이거나 실패한 run의 checkpoint에는 정확한 Tool Call protocol을 복구하기 위해 resource 결과가 임시로 포함될 수 있다. 운영 `CheckpointStore`는 resource 원문과 같은 민감도로 암호화·접근 제어하고 짧은 TTL을 적용한다. 정상 완료 시 해당 checkpoint는 삭제된다.
+실행 중이거나 실패한 run의 checkpoint에는 정확한 Tool Call protocol을 복구하기 위해 resource 결과가 임시로 포함될 수 있다. 운영 `CheckpointStore`는 resource 원문과 같은 민감도로 암호화·접근 제어하고 짧은 TTL을 적용한다. 일반 완료 checkpoint는 삭제되며, strict Plan-and-Execute의 terminal checkpoint는 FINALIZE 중복 억제를 위해 TTL까지 남을 수 있다.
 
-### `max_steps`와의 관계
+### 실행 제한과의 관계
 
-Resource Tool 호출은 business Tool용 `RunLimits.max_tool_calls`를 소비하지 않고 `SkillLimits.max_resource_reads`를 소비한다. 그러나 resource를 읽기로 결정하는 모델 호출은 하나의 ACT step이다. 읽은 결과로 답을 만들려면 다음 ACT step이 추가로 필요하다.
+Resource Tool 호출은 business Tool용 `RunLimits.max_tool_calls`를 소비하지 않고 `SkillLimits.max_resource_reads`를 소비한다.
+
+`StandardDecisionPolicy`에서 `RunLimits.max_steps`는 모델 판단 turn 한도다. Resource를 요청한 turn 뒤에는 결과를 사용하는 다음 turn이 필요하므로 resource 왕복 수를 고려해 여유 있게 설정한다.
+
+strict `PlanAndExecutePolicy`에서 `RunLimits.max_steps`는 모델 turn 수가 아니라 생성된 계획 단계 수다. Tool이 있는 한 단계는 provider 호환성을 위해 다음 두 요청으로 분리될 수 있지만 같은 계획 단계다.
 
 ```text
-ACT step 1: moduagent_skill_read 호출
-→ reference 결과
-ACT step 2: 결과를 사용해 답변 또는 business Tool 호출
+ACT_TOOL: resource 또는 business Tool schema만 전달
+→ Tool 결과
+STEP_RESULT: Tool 없이 내부 StepResult schema만 전달
 ```
 
-따라서 reference 한 번을 읽는 단순 요청도 `max_steps >= 2`가 필요하다. PLAN, 여러 페이지 읽기, 검색 후 읽기, business Tool 호출을 함께 사용하는 Skill은 여유 있게 설정한다. `max_resource_reads`를 높여도 `max_steps`는 자동으로 증가하지 않는다.
+따라서 resource 왕복 때문에 `max_steps`를 기계적으로 늘리지 않는다. 실제 업무가 더 많은 독립 단계를 요구할 때만 계획 단계 수를 늘리고, resource read 수, Tool 호출 수와 전체 `timeout_seconds`는 별도로 설정한다.
 
 ## `allowed-tools`와 권한
 
@@ -313,7 +323,7 @@ ACT step 2: 결과를 사용해 답변 또는 business Tool 호출
 
 ## Scripts
 
-`scripts/`는 공식 패키지 구조와 digest 고정을 위해 인식하지만 0.2.0에서는 다음 동작을 모두 하지 않는다.
+`scripts/`는 공식 패키지 구조와 digest 고정을 위해 인식하지만 0.3.0에서는 다음 동작을 모두 하지 않는다.
 
 - 자동 실행
 - subprocess 또는 shell 실행
@@ -382,7 +392,7 @@ failed = await agent.run(
 resumed = await agent.resume(failed.run_id, session_id="invoice-42")
 ```
 
-Resume 시 Registry 전체의 catalog digest나 활성 Skill의 digest·source·Tool 범위가 달라지면 실행을 최신 내용으로 조용히 바꾸지 않고 실패한다. 활성화하지 않은 다른 Skill의 변경도 catalog digest를 바꾸므로 진행 중 checkpoint가 있으면 배포 단위 전체를 고정해야 한다. 과거 checkpoint v1은 Skills가 비활성화된 상태로 읽는다.
+Resume 시 Registry 전체의 catalog digest나 활성 Skill의 digest·source·Tool 범위·`applies-to`가 달라지면 실행을 최신 내용으로 조용히 바꾸지 않고 실패한다. 활성화하지 않은 다른 Skill의 변경도 catalog digest를 바꾸므로 진행 중 checkpoint가 있으면 배포 단위 전체를 고정해야 한다. Checkpoint v3는 phase-scoped Skill과 strict Plan-and-Execute 실행 상태를 저장한다. 과거 v2 Skill 상태는 `applies-to`를 세 단계 전체로 복원하고, v1은 Skills가 비활성화된 상태로 읽는다.
 
 ## CLI
 
@@ -447,9 +457,9 @@ registry = SkillRegistry.from_paths(
 ## 운영 체크리스트
 
 - 자동 선택을 켜기 전에 사내 요청 세트로 Skill `description`의 선택 정확도를 평가한다.
-- 0.2.0 catalog에는 운영자가 검토한 로컬 Skill만 넣는다. 서로 신뢰하지 않는 tenant가 같은 Registry를 공유해야 한다면 tenant별 Registry 또는 body load 전 별도 접근 제어 계층을 둔다.
+- 0.3.0 catalog에는 운영자가 검토한 로컬 Skill만 넣는다. 서로 신뢰하지 않는 tenant가 같은 Registry를 공유해야 한다면 tenant별 Registry 또는 body load 전 별도 접근 제어 계층을 둔다.
 - 변경 Tool에는 명시적인 `ToolAuthorizer`를 설정한다.
-- `SkillLimits`와 `RunLimits.max_steps`를 함께 조정한다.
+- `SkillLimits`, Policy별 `RunLimits.max_steps` 의미, strict 실행의 `max_step_attempts`·`max_replans`와 전체 timeout을 함께 조정한다.
 - 배포할 Skill catalog와 `skills.lock.json`을 같은 release artifact로 고정한다.
 - 실행 중 checkpoint가 있으면 같은 catalog digest를 가진 artifact로 resume한다.
 - `scripts/`를 실행 파일 저장소로 간주하지 않는다.

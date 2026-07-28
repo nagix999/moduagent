@@ -8,6 +8,7 @@ from moduagent.messages import FinishReason, Message, MessageRole, Usage
 
 
 _SKILL_MODES = frozenset({"disabled", "explicit", "auto", "hybrid"})
+_SKILL_PHASES = ("plan", "act", "finalize")
 
 
 class RunStatus(str, Enum):
@@ -60,6 +61,7 @@ class SkillActivationState:
     selected_by: str = "explicit"
     allowed_tools: tuple[str, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    applies_to: tuple[str, ...] = _SKILL_PHASES
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
@@ -78,10 +80,27 @@ class SkillActivationState:
             raise ValueError("allowed_tools must contain non-empty strings")
         if len(set(allowed_tools)) != len(allowed_tools):
             raise ValueError("allowed_tools cannot contain duplicates")
+        if isinstance(self.applies_to, (str, bytes)):
+            raise TypeError("applies_to must be an array of Skill phases")
+        applies_to = tuple(self.applies_to)
+        if not applies_to:
+            raise ValueError("applies_to must contain at least one Skill phase")
+        if not all(isinstance(phase, str) for phase in applies_to):
+            raise TypeError("applies_to must contain Skill phase strings")
+        if len(set(applies_to)) != len(applies_to):
+            raise ValueError("applies_to cannot contain duplicate Skill phases")
+        if set(applies_to) - set(_SKILL_PHASES):
+            expected = ", ".join(_SKILL_PHASES)
+            raise ValueError(f"applies_to must contain only: {expected}")
         if not isinstance(self.metadata, Mapping):
             raise TypeError("skill metadata must be a mapping")
         object.__setattr__(self, "allowed_tools", allowed_tools)
         object.__setattr__(self, "metadata", dict(self.metadata))
+        object.__setattr__(
+            self,
+            "applies_to",
+            tuple(phase for phase in _SKILL_PHASES if phase in applies_to),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -92,6 +111,7 @@ class SkillActivationState:
             "selected_by": self.selected_by,
             "allowed_tools": list(self.allowed_tools),
             "metadata": dict(self.metadata),
+            "applies_to": list(self.applies_to),
         }
 
     @classmethod
@@ -106,6 +126,11 @@ class SkillActivationState:
         raw_metadata = value.get("metadata", {})
         if not isinstance(raw_metadata, Mapping):
             raise ValueError("skill metadata must be an object")
+        raw_applies_to = value.get("applies_to", _SKILL_PHASES)
+        if isinstance(raw_applies_to, (str, bytes)) or not isinstance(
+            raw_applies_to, (list, tuple)
+        ):
+            raise ValueError("skill applies_to must be an array")
         raw_version = value.get("version")
         return cls(
             name=str(value.get("name", "")),
@@ -115,6 +140,7 @@ class SkillActivationState:
             selected_by=str(value.get("selected_by", "explicit")),
             allowed_tools=tuple(str(tool) for tool in raw_allowed_tools),
             metadata=dict(raw_metadata),
+            applies_to=tuple(raw_applies_to),
         )
 
 
@@ -183,6 +209,10 @@ class RunContext:
     request: RunRequest
     messages: list[Message]
     new_messages: list[Message] = field(default_factory=list)
+    # Strict Plan-and-Execute keeps model/tool transcripts here so they can be
+    # checkpointed without becoming public conversation history.
+    internal_messages: list[Message] = field(default_factory=list, repr=False)
+    execution_state: Any = None
     step: int = 0
     tool_call_count: int = 0
     status: RunStatus = RunStatus.CREATED
@@ -200,6 +230,12 @@ class RunContext:
         self.messages.append(message)
         if persist and message.role is not MessageRole.SYSTEM:
             self.new_messages.append(message)
+
+    def add_internal_message(self, message: Message) -> None:
+        self.internal_messages.append(message)
+
+    def clear_internal_messages(self) -> None:
+        self.internal_messages.clear()
 
 
 @dataclass(frozen=True, slots=True)

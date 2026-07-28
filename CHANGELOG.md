@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.0
+
+- Made `PlanAndExecutePolicy` a strict PLAN → ACT_TOOL → STEP_RESULT → STEP_VALIDATE → VERIFY → FINALIZE state machine.
+- Added stable plan-step IDs, dependencies, completion criteria, allowed Tool scopes, attempt counters, and content-addressed result references.
+- Added strict `StepResult`, `StepValidator`, retry, partial replan, and explicit step commit contracts.
+- Separated Tool-only ACT requests from schema-only `StepResult` requests for provider and vLLM compatibility.
+- Applied the same one-time, Tool-free FINALIZE boundary to text and Pydantic outputs.
+- Kept ACT responses out of public conversation history and persisted only the validated FINALIZE response.
+- Added public/internal event visibility, `FINAL_DELTA`, strict step lifecycle events, and diagnostic `Agent.stream_all()`.
+- Added phase-scoped Skill instructions through the optional `applies-to` frontmatter extension.
+- Upgraded checkpoints to schema v3 with strict execution and finalization state; v1 and v2 payloads remain readable.
+- Added `LegacyPlanAndExecutePolicy` with a deprecation warning for temporary 0.2 behavior migration.
+- Added independent `max_step_attempts` and `max_replans` limits; strict `max_steps` now constrains plan length rather than model-turn count.
+- Added `AgentConfig.finalization_mode`; its `structured_only` default preserves 0.2 Standard-policy call counts, while `always` opts text and structured Standard runs into a separate finalizer. Strict Plan-and-Execute always finalizes and rejects `disabled`.
+- Persisted the generic finalizer's raw public assistant response to conversation history.
+- Documented the runtime's finalization duplicate-suppression boundary and the need for a durable outbox and Tool idempotency for end-to-end exactly-once behavior.
+
 ## 0.2.0
 
 - Added official `SKILL.md` compatible Agent Skills packages.

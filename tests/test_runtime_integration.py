@@ -113,6 +113,68 @@ def test_runtime_retries_model_without_emitted_tokens() -> None:
     asyncio.run(scenario())
 
 
+def test_standard_finalization_mode_always_adds_a_text_finalizer() -> None:
+    async def scenario() -> None:
+        conversations = InMemoryConversationStore()
+        model = ScriptedModel(
+            [
+                ModelResponse(Message.assistant("internal draft")),
+                ModelResponse(Message.assistant("public final")),
+            ]
+        )
+        agent = Agent(
+            config=AgentConfig(
+                "always-finalize",
+                "Answer accurately.",
+                finalization_mode="always",
+            ),
+            model=model,
+            conversation_store=conversations,
+        )
+
+        result = await agent.run("answer this", session_id="always-finalize")
+
+        assert result.output == "public final"
+        assert len(model.requests) == 2
+        assert model.requests[1].tools == ()
+        assert model.requests[1].output_schema is None
+        assert [
+            message.content for message in await conversations.load("always-finalize")
+        ] == ["answer this", "internal draft", "public final"]
+
+    asyncio.run(scenario())
+
+
+def test_standard_finalization_mode_disabled_skips_structured_staging() -> None:
+    async def scenario() -> None:
+        @function_tool
+        def unused() -> str:
+            return "unused"
+
+        model = ScriptedModel(
+            [ModelResponse(Message.assistant('{"answer":"direct","confidence":1.0}'))]
+        )
+        agent = Agent(
+            config=AgentConfig(
+                "disabled-finalize",
+                "Answer accurately.",
+                finalization_mode="disabled",
+            ),
+            model=model,
+            tools=[unused],
+            output_codec=PydanticOutputCodec(StructuredAnswer),
+        )
+
+        result = await agent.run("answer this")
+
+        assert result.output == StructuredAnswer(answer="direct", confidence=1.0)
+        assert len(model.requests) == 1
+        assert model.requests[0].tools
+        assert model.requests[0].output_schema["title"] == "StructuredAnswer"
+
+    asyncio.run(scenario())
+
+
 def test_recent_turns_policy_limits_model_view_but_preserves_full_history() -> None:
     async def scenario() -> None:
         conversations = InMemoryConversationStore()
@@ -350,7 +412,21 @@ def test_checkpoint_resumes_failed_run() -> None:
 
 class StaticPlanGenerator:
     async def create(self, context: Any) -> Plan:
-        return Plan([PlanStep("자료 조사"), PlanStep("최종 답변")])
+        return Plan(
+            [
+                PlanStep(
+                    step_id="research",
+                    objective="자료 조사",
+                    completion_criteria=["자료 조사 결과가 있다"],
+                ),
+                PlanStep(
+                    step_id="summarize",
+                    objective="조사 결과 정리",
+                    completion_criteria=["조사 결과가 정리됐다"],
+                    dependencies=["research"],
+                ),
+            ]
+        )
 
     async def revise(self, context: Any, plan: Plan, feedback: str) -> Plan:
         return plan
@@ -360,7 +436,20 @@ def test_plan_and_execute_policy_advances_all_steps() -> None:
     async def scenario() -> None:
         model = ScriptedModel(
             [
-                ModelResponse(Message.assistant("조사 완료")),
+                ModelResponse(
+                    Message.assistant(
+                        '{"step_id":"research","status":"completed",'
+                        '"facts":["자료를 찾았다"],'
+                        '"completion_evidence":["자료 조사 결과가 있다"]}'
+                    )
+                ),
+                ModelResponse(
+                    Message.assistant(
+                        '{"step_id":"summarize","status":"completed",'
+                        '"facts":["결과를 정리했다"],'
+                        '"completion_evidence":["조사 결과가 정리됐다"]}'
+                    )
+                ),
                 ModelResponse(Message.assistant("최종 결과")),
             ]
         )
@@ -373,8 +462,14 @@ def test_plan_and_execute_policy_advances_all_steps() -> None:
         result = await agent.run("두 단계로 처리해줘")
 
         assert result.output == "최종 결과"
-        assert len(model.requests) == 2
+        assert len(model.requests) == 3
+        assert all(request.tools == () for request in model.requests)
+        assert [
+            request.output_schema and request.output_schema.get("title")
+            for request in model.requests
+        ] == ["StepResult", "StepResult", None]
         assert result.metadata["plan"]["current_index"] == 2
+        assert result.metadata["plan_usage"]["committed_steps"] == 2
 
     asyncio.run(scenario())
 
@@ -429,7 +524,26 @@ def test_structured_plan_and_tool_requests_use_separate_model_phases() -> None:
                     assert request.tools == ()
                     return ModelResponse(
                         Message.assistant(
-                            '{"steps":[{"description":"add the numbers"}]}'
+                            '{"steps":[{"step_id":"calculate",'
+                            '"objective":"add the numbers",'
+                            '"completion_criteria":["the sum is verified"],'
+                            '"expected_output":"verified sum",'
+                            '"dependencies":[],"allowed_tools":["add"]}]}'
+                        )
+                    )
+
+                if request.output_schema is not None and (
+                    request.output_schema.get("title") == "StepResult"
+                ):
+                    assert request.tools == ()
+                    assert any(
+                        message.role.value == "tool" for message in request.messages
+                    )
+                    return ModelResponse(
+                        Message.assistant(
+                            '{"step_id":"calculate","status":"completed",'
+                            '"facts":["add returned 5"],'
+                            '"completion_evidence":["the sum is verified"]}'
                         )
                     )
 
@@ -437,25 +551,19 @@ def test_structured_plan_and_tool_requests_use_separate_model_phases() -> None:
                 if request.output_schema is not None:
                     assert request.output_schema["title"] == "StructuredAnswer"
                     assert request.tools == ()
-                    assert any(
-                        message.role.value == "tool" for message in request.messages
+                    assert all(
+                        message.role.value != "tool" for message in request.messages
                     )
-                    assert request.messages[-2].content == "The tool returned 5."
-                    assert request.messages[-1].role.value == "user"
-                    assert "response schema" in (request.messages[-1].content or "")
-                    assert "Do not call tools" in (request.messages[-1].content or "")
+                    assert "committed_results" in (request.messages[-1].content or "")
                     return ModelResponse(
                         Message.assistant('{"answer":"5","confidence":1.0}')
                     )
 
-                # ACT can call tools, but final structured output must not constrain it.
+                # ACT_TOOL can call tools, but no output schema constrains it.
                 assert request.tools
                 self.act_count += 1
-                if self.act_count == 1:
-                    call = ToolCall("call-add", "add", {"a": 2, "b": 3})
-                    return ModelResponse(Message.assistant(None, (call,)), (call,))
-                assert request.messages[-1].role.value == "tool"
-                return ModelResponse(Message.assistant("The tool returned 5."))
+                call = ToolCall("call-add", "add", {"a": 2, "b": 3})
+                return ModelResponse(Message.assistant(None, (call,)), (call,))
 
             async def stream(self, request: ModelRequest):
                 raise AssertionError("stream should not be called")
@@ -486,21 +594,24 @@ def test_structured_plan_and_tool_requests_use_separate_model_phases() -> None:
 
         assert result.output == StructuredAnswer(answer="5", confidence=1.0)
         assert result.messages[-1].role.value == "assistant"
-        assert result.messages[-1].content == "The tool returned 5."
+        assert result.messages[-1].content == '{"answer":"5","confidence":1.0}'
         assert result.metadata["plan"]["current_index"] == 1
         assert len(model.requests) == 4
-        plan_request, first_act, second_act, finalize_request = model.requests
+        plan_request, act_request, step_result_request, finalize_request = (
+            model.requests
+        )
         assert plan_request.tools == ()
         assert plan_request.output_schema is not None
         assert "steps" in plan_request.output_schema["properties"]
-        assert first_act.tools and first_act.output_schema is None
-        assert second_act.tools and second_act.output_schema is None
+        assert act_request.tools and act_request.output_schema is None
+        assert step_result_request.tools == ()
+        assert step_result_request.output_schema["title"] == "StepResult"
         assert finalize_request.tools == ()
         assert finalize_request.output_schema["title"] == "StructuredAnswer"
-        for request in (first_act, second_act, finalize_request):
+        for request in (act_request, step_result_request, finalize_request):
             contents = [message.content for message in request.messages]
             assert "obsolete question" not in contents
-            assert "latest question" in contents
+            assert "latest question" not in contents
         assert all(
             not (request.tools and request.output_schema is not None)
             for request in model.requests
@@ -509,13 +620,22 @@ def test_structured_plan_and_tool_requests_use_separate_model_phases() -> None:
     asyncio.run(scenario())
 
 
-def test_text_plan_and_tool_path_does_not_add_finalize_request() -> None:
+def test_text_plan_and_tool_path_extracts_step_result_then_finalizes() -> None:
     async def scenario() -> None:
         calls: list[tuple[int, int]] = []
 
         class OneStepPlanGenerator:
             async def create(self, context: Any) -> Plan:
-                return Plan([PlanStep("add the numbers")])
+                return Plan(
+                    [
+                        PlanStep(
+                            step_id="calculate",
+                            objective="add the numbers",
+                            completion_criteria=["the sum is verified"],
+                            allowed_tools=["add"],
+                        )
+                    ]
+                )
 
             async def revise(self, context: Any, plan: Plan, feedback: str) -> Plan:
                 return plan
@@ -529,6 +649,13 @@ def test_text_plan_and_tool_path_does_not_add_finalize_request() -> None:
         model = ScriptedModel(
             [
                 ModelResponse(Message.assistant(None, (call,)), (call,)),
+                ModelResponse(
+                    Message.assistant(
+                        '{"step_id":"calculate","status":"completed",'
+                        '"facts":["add returned 5"],'
+                        '"completion_evidence":["the sum is verified"]}'
+                    )
+                ),
                 ModelResponse(Message.assistant("The answer is 5.")),
             ]
         )
@@ -544,9 +671,17 @@ def test_text_plan_and_tool_path_does_not_add_finalize_request() -> None:
 
         assert result.output == "The answer is 5."
         assert calls == [(2, 3)]
-        assert len(model.requests) == 2
-        assert all(request.tools for request in model.requests)
-        assert all(request.output_schema is None for request in model.requests)
+        assert len(model.requests) == 3
+        act_request, step_result_request, finalize_request = model.requests
+        assert act_request.tools and act_request.output_schema is None
+        assert step_result_request.tools == ()
+        assert step_result_request.output_schema["title"] == "StepResult"
+        assert finalize_request.tools == ()
+        assert finalize_request.output_schema is None
+        assert all(
+            not (request.tools and request.output_schema is not None)
+            for request in model.requests
+        )
 
     asyncio.run(scenario())
 
@@ -594,7 +729,11 @@ def test_structured_finalization_resume_does_not_repeat_act() -> None:
         assert await checkpoints.load(failed.run_id) is None
         assert [
             message.content for message in await conversations.load("structured-resume")
-        ] == ["What is 2 + 3?", "Draft answer: 5"]
+        ] == [
+            "What is 2 + 3?",
+            "Draft answer: 5",
+            '{"answer":"5","confidence":1.0}',
+        ]
 
     asyncio.run(scenario())
 
@@ -628,7 +767,7 @@ def test_structured_finalizer_never_executes_returned_tool_calls() -> None:
         result = await agent.run("What is 2 + 3?")
 
         assert result.finish_reason == "error"
-        assert result.error == "structured finalization returned tool calls"
+        assert result.error == "finalization returned tool calls"
         assert executions == []
 
     asyncio.run(scenario())
@@ -801,6 +940,7 @@ def test_memory_policy_prepares_act_and_finalize_without_mutating_requests() -> 
             "old answer",
             "new question",
             "Draft answer",
+            '{"answer":"final","confidence":1.0}',
         ]
 
     asyncio.run(scenario())

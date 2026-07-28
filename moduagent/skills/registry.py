@@ -136,6 +136,7 @@ class SkillRegistry:
             selected_by=selected_by,
             allowed_tools=effective_tools,
             metadata={"description": descriptor.description},
+            applies_to=descriptor.applies_to,
         )
 
     def source_for(self, name: str) -> SkillSource:

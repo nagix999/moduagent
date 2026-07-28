@@ -25,9 +25,25 @@ class EventType(str, Enum):
     TOOL_STARTED = "tool_started"
     TOOL_COMPLETED = "tool_completed"
     POLICY_DECISION = "policy_decision"
+    PLAN_CREATED = "plan_created"
+    STEP_STARTED = "step_started"
+    STEP_MODEL_DELTA = "step_model_delta"
+    STEP_RESULT_CREATED = "step_result_created"
+    STEP_VALIDATED = "step_validated"
+    STEP_COMMITTED = "step_committed"
+    STEP_RETRY = "step_retry"
+    PLAN_REVISED = "plan_revised"
+    FINALIZATION_STARTED = "finalization_started"
+    FINAL_DELTA = "final_delta"
+    FINALIZATION_COMPLETED = "finalization_completed"
     RETRY = "retry"
     RUN_COMPLETED = "run_completed"
     RUN_FAILED = "run_failed"
+
+
+class EventVisibility(str, Enum):
+    INTERNAL = "internal"
+    PUBLIC = "public"
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,3 +52,4 @@ class AgentEvent:
     run_id: str
     data: Mapping[str, Any] = field(default_factory=dict)
     occurred_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    visibility: EventVisibility = EventVisibility.PUBLIC

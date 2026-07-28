@@ -18,8 +18,8 @@ from moduagent.runtime.context import (
 )
 
 
-_CHECKPOINT_VERSION = 2
-_SUPPORTED_CHECKPOINT_VERSIONS = frozenset({1, _CHECKPOINT_VERSION})
+_CHECKPOINT_VERSION = 3
+_SUPPORTED_CHECKPOINT_VERSIONS = frozenset({1, 2, _CHECKPOINT_VERSION})
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +34,8 @@ class RunCheckpoint:
     requested_skills: tuple[str, ...] = ()
     skill_mode: str = "disabled"
     new_messages: tuple[Message, ...] = ()
+    internal_messages: tuple[Message, ...] = ()
+    execution_state: Any = None
     step: int = 0
     tool_call_count: int = 0
     status: RunStatus = RunStatus.CREATED
@@ -56,11 +58,14 @@ class RunCheckpoint:
             object.__setattr__(self, "status", RunStatus(str(self.status)))
         object.__setattr__(self, "messages", tuple(self.messages))
         object.__setattr__(self, "new_messages", tuple(self.new_messages))
+        object.__setattr__(self, "internal_messages", tuple(self.internal_messages))
         object.__setattr__(self, "requested_skills", tuple(self.requested_skills))
         if not all(isinstance(message, Message) for message in self.messages):
             raise TypeError("messages must contain Message instances")
         if not all(isinstance(message, Message) for message in self.new_messages):
             raise TypeError("new_messages must contain Message instances")
+        if not all(isinstance(message, Message) for message in self.internal_messages):
+            raise TypeError("internal_messages must contain Message instances")
         if not isinstance(self.skill_state, SkillRunState):
             raise TypeError("skill_state must be a SkillRunState")
 
@@ -81,6 +86,8 @@ class RunCheckpoint:
             skill_mode=context.request.skill_mode,
             messages=tuple(context.messages),
             new_messages=tuple(context.new_messages),
+            internal_messages=tuple(context.internal_messages),
+            execution_state=_execution_state_to_dict(context.execution_state),
             step=context.step,
             tool_call_count=context.tool_call_count,
             status=context.status,
@@ -107,6 +114,8 @@ class RunCheckpoint:
             request=request,
             messages=list(self.messages),
             new_messages=list(self.new_messages),
+            internal_messages=list(self.internal_messages),
+            execution_state=_execution_state_from_value(self.execution_state),
             step=self.step,
             tool_call_count=self.tool_call_count,
             status=self.status,
@@ -128,6 +137,10 @@ class RunCheckpoint:
             "skill_mode": self.skill_mode,
             "messages": [message.to_dict() for message in self.messages],
             "new_messages": [message.to_dict() for message in self.new_messages],
+            "internal_messages": [
+                message.to_dict() for message in self.internal_messages
+            ],
+            "execution_state": _execution_state_to_dict(self.execution_state),
             "step": self.step,
             "tool_call_count": self.tool_call_count,
             "status": self.status.value,
@@ -179,6 +192,15 @@ class RunCheckpoint:
             ),
             new_messages=tuple(
                 Message.from_dict(message) for message in value.get("new_messages", ())
+            ),
+            internal_messages=tuple(
+                Message.from_dict(message)
+                for message in value.get("internal_messages", ())
+            ),
+            execution_state=(
+                _execution_state_from_value(value.get("execution_state"))
+                if version >= 3
+                else None
             ),
             step=int(value.get("step", 0)),
             tool_call_count=int(value.get("tool_call_count", 0)),
@@ -372,6 +394,33 @@ def _parse_datetime(value: Any) -> datetime:
         return datetime.now(timezone.utc)
     parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     return _as_utc(parsed)
+
+
+def _execution_state_to_dict(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        payload = to_dict()
+    elif isinstance(value, Mapping):
+        payload = value
+    else:
+        raise TypeError("execution_state must provide to_dict()")
+    if not isinstance(payload, Mapping):
+        raise TypeError("execution_state.to_dict() must return a mapping")
+    return dict(payload)
+
+
+def _execution_state_from_value(value: Any) -> Any:
+    if value is None:
+        return None
+    from moduagent.decision.planning import ExecutionState
+
+    if isinstance(value, ExecutionState):
+        return value
+    if not isinstance(value, Mapping):
+        raise ValueError("checkpoint execution_state must be an object")
+    return ExecutionState.from_dict(value)
 
 
 def _coerce_checkpoint(
