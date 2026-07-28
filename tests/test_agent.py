@@ -3,13 +3,17 @@ from __future__ import annotations
 import asyncio
 import time
 
+import pytest
+
 from moduagent import (
     Agent,
     AgentConfig,
     EventType,
+    InMemoryCheckpointStore,
     Message,
     ModelRequest,
     ModelResponse,
+    RunCheckpoint,
     ToolCall,
     RBACToolAuthorizer,
     RunLimits,
@@ -41,6 +45,12 @@ def test_run_limits_keeps_020_positional_argument_order() -> None:
     assert limits.max_parallel_tools == 2
     assert limits.max_step_attempts == 2
     assert limits.max_replans == 2
+
+
+def test_agent_config_validates_tool_trace_mode() -> None:
+    assert AgentConfig("agent", "instructions").tool_trace_mode == "summary"
+    with pytest.raises(ValueError, match="tool_trace_mode"):
+        AgentConfig("agent", "instructions", tool_trace_mode="raw")
 
 
 def test_agent_returns_final_model_message() -> None:
@@ -87,6 +97,179 @@ def test_agent_executes_function_tool() -> None:
         tool_message = model.requests[1].messages[-1]
         assert tool_message.role == "tool"
         assert '"value": 5' in (tool_message.content or "")
+        trace = result.metadata["tool_trace"]
+        assert len(trace) == 1
+        assert trace[0] == {
+            "step_id": None,
+            "call_id": "call-1",
+            "tool_name": "add",
+            "success": True,
+            "attempts": 1,
+            "duration_seconds": trace[0]["duration_seconds"],
+            "error": None,
+        }
+        assert trace[0]["duration_seconds"] >= 0
+        assert "arguments" not in trace[0]
+
+    asyncio.run(scenario())
+
+
+def test_tool_trace_arguments_are_redacted_and_can_be_disabled() -> None:
+    async def run_with_mode(mode: str):
+        @function_tool
+        def lookup(customer_id: int, api_key: str) -> dict[str, int]:
+            return {"customer_id": customer_id}
+
+        call = ToolCall(
+            "lookup-1",
+            "lookup",
+            {"customer_id": "7", "api_key": "must-not-leak"},
+        )
+        model = ScriptedModel(
+            [
+                ModelResponse(Message("assistant", None, (call,)), (call,)),
+                response("조회 완료"),
+            ]
+        )
+        agent = Agent(
+            config=AgentConfig(
+                "lookup-agent",
+                "조회 도구를 사용한다.",
+                tool_trace_mode=mode,
+            ),
+            model=model,
+            tools=[lookup],
+        )
+        return await agent.run("조회")
+
+    arguments_result = asyncio.run(run_with_mode("arguments"))
+    trace = arguments_result.metadata["tool_trace"]
+    assert trace[0]["arguments"] == {
+        "customer_id": 7,
+        "api_key": "[REDACTED]",
+    }
+    assert trace[0]["arguments_source"] == "validated"
+    assert "must-not-leak" not in repr(arguments_result.metadata)
+
+    off_result = asyncio.run(run_with_mode("off"))
+    assert "tool_trace" not in off_result.metadata
+
+
+def test_tool_trace_reserved_metadata_cannot_forge_public_trace() -> None:
+    async def scenario() -> None:
+        agent = Agent(
+            config=AgentConfig(
+                "safe-trace-agent",
+                "답한다.",
+                tool_trace_mode="arguments",
+                metadata={
+                    "tool_trace": [
+                        {
+                            "tool_name": "public-forged",
+                            "arguments": {"password": "must-not-leak"},
+                        }
+                    ],
+                    "_moduagent_tool_trace": [
+                        {
+                            "tool_name": "forged",
+                            "arguments": {"password": "must-not-leak"},
+                        }
+                    ],
+                },
+            ),
+            model=ScriptedModel([response("완료")]),
+        )
+
+        result = await agent.run("실행")
+
+        assert "tool_trace" not in result.metadata
+        assert "must-not-leak" not in repr(result.metadata)
+
+    asyncio.run(scenario())
+
+
+def test_resumed_tool_trace_is_redacted_reprojected_and_bounded() -> None:
+    async def scenario() -> None:
+        checkpoints = InMemoryCheckpointStore()
+        user_message = Message.user("계속")
+        forged_entries = [
+            {
+                "step_id": "step",
+                "call_id": f"call-{index}",
+                "tool_name": "lookup",
+                "success": True,
+                "attempts": 1,
+                "duration_seconds": 0.1,
+                "error": None,
+                "arguments": {"password": f"secret-{index}", "value": index},
+                "arguments_source": "validated",
+            }
+            for index in range(5)
+        ]
+        checkpoint = RunCheckpoint(
+            run_id="trace-resume",
+            session_id="trace-session",
+            input="계속",
+            messages=(Message.system("답한다."), user_message),
+            new_messages=(user_message,),
+            current_run_start=1,
+            metadata={"_moduagent_tool_trace": forged_entries},
+        )
+        await checkpoints.save(checkpoint)
+        agent = Agent(
+            config=AgentConfig(
+                "safe-resume-agent",
+                "답한다.",
+                limits=RunLimits(max_tool_calls=2),
+                tool_trace_mode="arguments",
+            ),
+            model=ScriptedModel([response("완료")]),
+            checkpoint_store=checkpoints,
+        )
+
+        result = await agent.resume(
+            checkpoint.run_id,
+            session_id=checkpoint.session_id,
+        )
+
+        trace = result.metadata["tool_trace"]
+        assert len(trace) == 2
+        assert trace[0]["arguments"] == {
+            "password": "[REDACTED]",
+            "value": 0,
+        }
+        assert "secret-" not in repr(result.metadata)
+
+        summary_checkpoint = RunCheckpoint(
+            run_id="trace-resume-summary",
+            session_id="trace-session-summary",
+            input="계속",
+            messages=(Message.system("답한다."), user_message),
+            new_messages=(user_message,),
+            current_run_start=1,
+            metadata={"_moduagent_tool_trace": forged_entries},
+        )
+        await checkpoints.save(summary_checkpoint)
+        summary_agent = Agent(
+            config=AgentConfig(
+                "safe-summary-agent",
+                "답한다.",
+                limits=RunLimits(max_tool_calls=2),
+                tool_trace_mode="summary",
+            ),
+            model=ScriptedModel([response("완료")]),
+            checkpoint_store=checkpoints,
+        )
+
+        summary_result = await summary_agent.resume(
+            summary_checkpoint.run_id,
+            session_id=summary_checkpoint.session_id,
+        )
+
+        assert len(summary_result.metadata["tool_trace"]) == 2
+        assert all(
+            "arguments" not in entry for entry in summary_result.metadata["tool_trace"]
+        )
 
     asyncio.run(scenario())
 

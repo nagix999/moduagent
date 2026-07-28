@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import replace
 from typing import Any, TypeVar
 
@@ -19,7 +20,7 @@ from moduagent.memory import (
 )
 from moduagent.messages import FinishReason, Message
 from moduagent.models import ModelClient, ModelRequest, ModelResponse
-from moduagent.observability import EventSink
+from moduagent.observability import EventSink, mask_sensitive
 from moduagent.output import OutputCodec
 from moduagent.persistence import (
     CheckpointStore,
@@ -76,6 +77,10 @@ _STRICT_FINALIZER_PROMPT = (
 )
 _RUN_ID_METADATA_KEY = "moduagent.run_id"
 _PUBLIC_FINAL_METADATA_KEY = "moduagent.public_final"
+_TOOL_TRACE_METADATA_KEY = "_moduagent_tool_trace"
+_PUBLIC_TOOL_TRACE_KEY = "tool_trace"
+_TOOL_TRACE_ARGUMENT_BYTES = 4096
+_TOOL_TRACE_TEXT_CHARS = 256
 
 
 class _StrictToolCallLimitError(RuntimeError):
@@ -181,12 +186,17 @@ class AgentRuntime:
                 else None
             ),
         )
+        initial_metadata = {"agent": self.config.name, **dict(self.config.metadata)}
+        # This key is runtime-owned. AgentConfig.metadata must not be able to
+        # forge persisted Tool audit entries.
+        initial_metadata.pop(_TOOL_TRACE_METADATA_KEY, None)
+        initial_metadata.pop(_PUBLIC_TOOL_TRACE_KEY, None)
         context = RunContext(
             run_id=run_id,
             request=request,
             messages=[Message.system(self.config.instructions), user_message],
             new_messages=[user_message],
-            metadata={"agent": self.config.name, **dict(self.config.metadata)},
+            metadata=initial_metadata,
             current_run_start=1,
         )
         last_response: ModelResponse | None = None
@@ -216,6 +226,7 @@ class AgentRuntime:
                 if checkpoint.session_id != request.session_id:
                     raise ValueError("checkpoint session_id does not match the request")
                 context = checkpoint.to_context()
+                self._normalize_context_tool_trace(context)
                 event = AgentEvent(
                     EventType.CHECKPOINT_LOADED,
                     context.run_id,
@@ -493,6 +504,15 @@ class AgentRuntime:
                     > self.config.limits.max_tool_calls
                 ):
                     for call in business_calls:
+                        rejected = ToolResult.failed(
+                            call_id=call.id,
+                            tool_name=call.name,
+                            error=ToolError(
+                                ToolErrorType.EXECUTION_ERROR,
+                                "tool call limit exceeded",
+                            ),
+                        )
+                        self._record_tool_trace(context, call, rejected)
                         context.add_message(
                             Message.tool(
                                 self._json(
@@ -582,6 +602,19 @@ class AgentRuntime:
                     )
                     for call in calls:
                         is_skill_resource = call.name in SKILL_RESOURCE_TOOL_NAMES
+                        rejected = ToolResult.failed(
+                            call_id=call.id,
+                            tool_name=call.name,
+                            error=ToolError(
+                                (
+                                    ToolErrorType.TIMEOUT
+                                    if isinstance(exc, asyncio.TimeoutError)
+                                    else ToolErrorType.EXECUTION_ERROR
+                                ),
+                                error_message,
+                            ),
+                        )
+                        self._record_tool_trace(context, call, rejected)
                         context.add_message(
                             Message.tool(
                                 self._json({"success": False, "error": error_message}),
@@ -656,6 +689,7 @@ class AgentRuntime:
                                 resource_tokens=next_resource_tokens,
                             )
                     effective_results.append(result)
+                    self._record_tool_trace(context, call, result)
                     context.add_message(
                         Message.tool(
                             self._tool_result_content(result),
@@ -801,7 +835,7 @@ class AgentRuntime:
             if not isinstance(state, ExecutionState):
                 raise RuntimeError("strict Plan-and-Execute state was lost")
             if len(state.plan.steps) > self.config.limits.max_steps:
-                state.phase = RunPhase.FAILED
+                state.fail_current_step()
                 state.validation_error = (
                     f"plan exceeds RunLimits.max_steps ({self.config.limits.max_steps})"
                 )
@@ -1007,7 +1041,7 @@ class AgentRuntime:
                     ):
                         yield tool_event
                 except _StrictToolCallLimitError:
-                    state.phase = RunPhase.FAILED
+                    state.fail_current_step()
                     state.validation_error = "tool call limit exceeded"
                     self._sync_execution_state(context, state)
                     await self._persist_pending_messages(context, deadline)
@@ -1345,6 +1379,7 @@ class AgentRuntime:
                         resource_tokens=next_resource_tokens,
                     )
             effective.append(result)
+            self._record_tool_trace(context, call, result)
             context.add_internal_message(
                 Message.tool(
                     self._tool_result_content(result),
@@ -1592,6 +1627,7 @@ class AgentRuntime:
                     error_message,
                 ),
             )
+            self._record_tool_trace(context, call, result)
             context.add_internal_message(
                 Message.tool(
                     self._tool_result_content(result),
@@ -1600,6 +1636,175 @@ class AgentRuntime:
                     metadata={"moduagent.ephemeral": True},
                 )
             )
+
+    def _record_tool_trace(
+        self,
+        context: RunContext,
+        call: Any,
+        result: ToolResult,
+    ) -> None:
+        """Persist a bounded, sanitized business-Tool audit summary."""
+
+        if (
+            self.config.tool_trace_mode == "off"
+            or call.name in SKILL_RESOURCE_TOOL_NAMES
+        ):
+            return
+
+        trace = self._normalized_tool_trace(
+            context.metadata.get(_TOOL_TRACE_METADATA_KEY)
+        )
+        # Successful business calls are already bounded by max_tool_calls. Keep
+        # the same bound for terminal protocol rejections as well.
+        if len(trace) >= self._tool_trace_limit:
+            context.metadata[_TOOL_TRACE_METADATA_KEY] = trace
+            return
+
+        state = context.execution_state
+        step_id = state.current_step_id if isinstance(state, ExecutionState) else None
+        error = result.error
+        entry: dict[str, Any] = {
+            "step_id": step_id,
+            "call_id": str(call.id),
+            "tool_name": str(call.name),
+            "success": bool(result.success),
+            "attempts": int(result.attempts),
+            "duration_seconds": float(result.duration_seconds),
+            "error": (
+                None
+                if error is None
+                else {
+                    "type": error.type.value,
+                    "retryable": bool(error.retryable),
+                }
+            ),
+        }
+        if self.config.tool_trace_mode == "arguments":
+            invocation_arguments = getattr(result, "invocation_arguments", None)
+            entry["arguments"] = (
+                invocation_arguments
+                if isinstance(invocation_arguments, Mapping)
+                else call.arguments
+            )
+            entry["arguments_source"] = (
+                "validated"
+                if isinstance(invocation_arguments, Mapping)
+                else "requested"
+            )
+        sanitized = self._sanitize_tool_trace_entry(entry)
+        if sanitized is not None:
+            trace.append(sanitized)
+        context.metadata[_TOOL_TRACE_METADATA_KEY] = trace
+
+    @property
+    def _tool_trace_limit(self) -> int:
+        return max(1, self.config.limits.max_tool_calls)
+
+    @staticmethod
+    def _tool_trace_text(value: Any) -> str:
+        try:
+            text = str(value)
+        except Exception:
+            text = type(value).__name__
+        if len(text) <= _TOOL_TRACE_TEXT_CHARS:
+            return text
+        return f"{text[: _TOOL_TRACE_TEXT_CHARS - 3]}..."
+
+    def _sanitize_tool_trace_arguments(
+        self,
+        arguments: Mapping[str, Any],
+    ) -> Any:
+        try:
+            masked = mask_sensitive(dict(arguments))
+            serialized = json.dumps(
+                masked,
+                ensure_ascii=False,
+                default=str,
+                separators=(",", ":"),
+            )
+        except Exception:
+            return {"_unavailable": True}
+        size_bytes = len(serialized.encode("utf-8"))
+        if size_bytes > _TOOL_TRACE_ARGUMENT_BYTES:
+            return {
+                "_truncated": True,
+                "size_bytes": size_bytes,
+            }
+        return json.loads(serialized)
+
+    def _sanitize_tool_trace_entry(
+        self,
+        raw_entry: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        if self.config.tool_trace_mode == "off":
+            return None
+        try:
+            attempts = int(raw_entry.get("attempts", 0))
+        except (TypeError, ValueError, OverflowError):
+            attempts = 0
+        attempts = min(max(attempts, 0), 1_000_000)
+        try:
+            duration = float(raw_entry.get("duration_seconds", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            duration = 0.0
+        if not math.isfinite(duration) or duration < 0:
+            duration = 0.0
+
+        raw_error = raw_entry.get("error")
+        error = None
+        if isinstance(raw_error, Mapping):
+            error = {
+                "type": self._tool_trace_text(
+                    raw_error.get("type", ToolErrorType.EXECUTION_ERROR.value)
+                ),
+                "retryable": bool(raw_error.get("retryable", False)),
+            }
+        raw_step_id = raw_entry.get("step_id")
+        entry: dict[str, Any] = {
+            "step_id": (
+                None if raw_step_id is None else self._tool_trace_text(raw_step_id)
+            ),
+            "call_id": self._tool_trace_text(raw_entry.get("call_id", "")),
+            "tool_name": self._tool_trace_text(raw_entry.get("tool_name", "")),
+            "success": bool(raw_entry.get("success", False)),
+            "attempts": attempts,
+            "duration_seconds": duration,
+            "error": error,
+        }
+        if self.config.tool_trace_mode == "arguments":
+            raw_arguments = raw_entry.get("arguments")
+            if isinstance(raw_arguments, Mapping):
+                entry["arguments"] = self._sanitize_tool_trace_arguments(raw_arguments)
+                entry["arguments_source"] = (
+                    "validated"
+                    if raw_entry.get("arguments_source") == "validated"
+                    else "requested"
+                )
+        return entry
+
+    def _normalized_tool_trace(self, raw_trace: Any) -> list[dict[str, Any]]:
+        if self.config.tool_trace_mode == "off" or not isinstance(raw_trace, list):
+            return []
+        normalized: list[dict[str, Any]] = []
+        for raw_entry in raw_trace:
+            if len(normalized) >= self._tool_trace_limit:
+                break
+            if not isinstance(raw_entry, Mapping):
+                continue
+            entry = self._sanitize_tool_trace_entry(raw_entry)
+            if entry is not None:
+                normalized.append(entry)
+        return normalized
+
+    def _normalize_context_tool_trace(self, context: RunContext) -> None:
+        context.metadata.pop(_PUBLIC_TOOL_TRACE_KEY, None)
+        trace = self._normalized_tool_trace(
+            context.metadata.get(_TOOL_TRACE_METADATA_KEY)
+        )
+        if trace:
+            context.metadata[_TOOL_TRACE_METADATA_KEY] = trace
+        else:
+            context.metadata.pop(_TOOL_TRACE_METADATA_KEY, None)
 
     @staticmethod
     def _sync_execution_state(
@@ -2070,6 +2275,7 @@ class AgentRuntime:
                 "execution_state",
                 "validation",
                 "requires_step_result",
+                _PUBLIC_TOOL_TRACE_KEY,
             }
         }
         if isinstance(context.execution_state, ExecutionState):
@@ -2081,6 +2287,11 @@ class AgentRuntime:
                 "replans": state.replan_count,
                 "finalization_calls": state.finalization_count,
             }
+        tool_trace = self._normalized_tool_trace(
+            context.metadata.get(_TOOL_TRACE_METADATA_KEY)
+        )
+        if tool_trace:
+            metadata[_PUBLIC_TOOL_TRACE_KEY] = tool_trace
         if context.skill_state.catalog_digest:
             metadata["skill_usage"] = {
                 "catalog_digest": context.skill_state.catalog_digest,
@@ -2243,6 +2454,7 @@ class AgentRuntime:
                 ),
             )
             results.append(result)
+            self._record_tool_trace(context, call, result)
             context.add_message(
                 Message.tool(
                     self._tool_result_content(result),

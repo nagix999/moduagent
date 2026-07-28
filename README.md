@@ -409,7 +409,7 @@ if failed.error and await checkpoints.load(failed.run_id) is not None:
 
 ## Plan-and-Execute
 
-복수 단계 작업은 `LLMPlanGenerator`와 strict `PlanAndExecutePolicy`를 조합합니다. 0.3.0의 `PlanAndExecutePolicy`는 일반 ACT 응답을 단계 완료로 간주하지 않고, strict `StepResult`의 검증과 명시적 커밋을 요구합니다.
+복수 단계 작업은 `LLMPlanGenerator`와 strict `PlanAndExecutePolicy`를 조합합니다. 0.3.1의 `PlanAndExecutePolicy`는 일반 ACT 응답을 단계 완료로 간주하지 않고, strict `StepResult`의 검증과 명시적 커밋을 요구합니다.
 
 ```python
 from moduagent import (
@@ -452,6 +452,33 @@ PLAN → ACT_TOOL → STEP_RESULT → STEP_VALIDATE/COMMIT → VERIFY → FINALI
 - `FINALIZE`: Tool 없이 텍스트 또는 공개 Pydantic schema로 응답합니다.
 
 vLLM에도 Tool과 출력 schema를 한 요청에 함께 전달하지 않습니다. `RunLimits.max_steps`는 strict 정책에서 모델 호출 수가 아니라 계획 단계 수이며, `max_step_attempts`와 `max_replans`가 재시도와 재계획을 별도로 제한합니다. 모든 호출과 저장 작업은 하나의 `timeout_seconds`를 공유합니다.
+
+`result.metadata["plan"]["steps"][].allowed_tools`는 해당 단계에서 호출할 수 있었던 Tool 목록이며 실제 호출 이력이 아닙니다. 0.3.1부터 실제 호출 시도는 순서가 보존된 `result.metadata["tool_trace"]`에서 확인할 수 있습니다. 기본 `tool_trace_mode="summary"`는 단계·call ID·Tool 이름·성공 여부·시도 횟수·실행 시간과 정제된 오류 분류만 남깁니다. `off`는 trace를 만들지 않고, `arguments`는 민감한 키를 재귀적으로 마스킹한 호출 인자를 추가합니다. 실행된 Tool은 validation·형 변환·기본값 적용 후 실제 인자를 `arguments_source="validated"`로 기록하고, 실행 전에 거부된 호출은 요청 인자를 `requested`로 기록합니다.
+
+```python
+planning_agent = Agent(
+    config=AgentConfig(
+        name="research-agent",
+        instructions="검증된 단계 결과만 사용해 간결하게 답한다.",
+        tool_trace_mode="arguments",
+    ),
+    model=model,
+    tools=[add],
+    decision_policy=PlanAndExecutePolicy(LLMPlanGenerator(model=model)),
+)
+
+result = await planning_agent.run("요청")
+for call in result.metadata.get("tool_trace", []):
+    print(call["step_id"], call["tool_name"], call.get("arguments"))
+```
+
+이 trace는 크기가 제한되고 Tool 결과 값이나 원본 오류 메시지를 포함하지 않는 운영 감사용 요약입니다. strict checkpoint에도 내부 실행 metadata로 저장되어 resume 후 이어지며 checkpoint schema는 계속 v3입니다. 인자를 저장해야 할 명확한 운영 목적이 없다면 기본 `summary`를 사용하세요.
+
+Tool이 pandas `DataFrame` 같은 표 형식 값을 반환하면 런타임은 이를 모델이 읽을 수 있는 JSON-safe record 구조로 정규화합니다. 직접 Tool을 구현할 때도 가능한 한 문자열·숫자·불리언·`None`·list·dict로 구성된 값을 반환하고, 대용량 조회는 Tool에서 행과 열을 제한하는 것이 좋습니다.
+
+검증 재시도, Tool 실패 복구 또는 재계획 한도를 소진해 Policy가 terminal 실패를 결정하면 현재 단계는 `failed`로 확정됩니다. 일시적인 transport 오류나 전체 run timeout처럼 checkpoint에서 재개할 수 있는 중단은 `in_progress`로 남을 수 있습니다.
+
+`pd.read_sql` 같은 동기 Tool은 worker thread에서 실행되므로 timeout 결과가 반환되어도 Python이 실행 중인 DB 호출을 강제로 중단하지는 못합니다. Tool timeout과 별도로 DB driver의 query/connection timeout 및 서버 측 statement timeout을 설정하세요.
 
 0.2의 암묵적 단계 완료 동작이 잠시 필요하면 `LegacyPlanAndExecutePolicy`를 명시적으로 사용해야 하며 생성 시 `DeprecationWarning`이 발생합니다. 신규 코드는 strict 정책을 사용하세요. 상태, 스트림, vLLM 분리, checkpoint v3와 마이그레이션 내용은 [Plan-and-Execute 문서](https://github.com/nagix999/moduagent/blob/main/docs/plan-and-execute.md)에 정리했습니다.
 

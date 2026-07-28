@@ -3,11 +3,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
+from datetime import date, datetime, time
+from decimal import Decimal
 from enum import Enum
 from threading import Event, Thread
 from typing import Any, Protocol, TypeVar, runtime_checkable
+from uuid import UUID
 
 from pydantic import BaseModel
 
@@ -141,6 +145,10 @@ class ToolResult:
     error: ToolError | None = None
     attempts: int = 0
     duration_seconds: float = 0.0
+    # The validated/default-expanded arguments that reached invoke_validated().
+    # Deliberately omitted from to_dict()/model_content() to avoid widening the
+    # public Tool result and model-visible payload with potentially sensitive data.
+    invocation_arguments: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.success and self.error is not None:
@@ -151,6 +159,14 @@ class ToolResult:
             raise ValueError("attempts cannot be negative")
         if self.duration_seconds < 0:
             raise ValueError("duration_seconds cannot be negative")
+        if self.invocation_arguments is not None:
+            if not isinstance(self.invocation_arguments, Mapping):
+                raise TypeError("invocation_arguments must be a mapping")
+            object.__setattr__(
+                self,
+                "invocation_arguments",
+                dict(self.invocation_arguments),
+            )
 
     @classmethod
     def succeeded(
@@ -161,6 +177,7 @@ class ToolResult:
         value: Any,
         attempts: int = 1,
         duration_seconds: float = 0.0,
+        invocation_arguments: Mapping[str, Any] | None = None,
     ) -> "ToolResult":
         return cls(
             call_id=call_id,
@@ -169,6 +186,7 @@ class ToolResult:
             value=value,
             attempts=attempts,
             duration_seconds=duration_seconds,
+            invocation_arguments=invocation_arguments,
         )
 
     @classmethod
@@ -180,6 +198,7 @@ class ToolResult:
         error: ToolError,
         attempts: int = 0,
         duration_seconds: float = 0.0,
+        invocation_arguments: Mapping[str, Any] | None = None,
     ) -> "ToolResult":
         return cls(
             call_id=call_id,
@@ -188,6 +207,7 @@ class ToolResult:
             error=error,
             attempts=attempts,
             duration_seconds=duration_seconds,
+            invocation_arguments=invocation_arguments,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -243,22 +263,142 @@ def _json_default(value: Any) -> Any:
         return value.model_dump(mode="json")
     if isinstance(value, Enum):
         return value.value
+    if _is_pandas_missing(value):
+        return None
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, (Decimal, UUID)):
+        return str(value)
     if is_dataclass(value) and not isinstance(value, type):
         return asdict(value)
     if isinstance(value, bytes):
         return {"base64": base64.b64encode(value).decode("ascii")}
     if isinstance(value, (set, frozenset, tuple)):
         return list(value)
+    if _is_dataframe_like(value):
+        return value.to_dict(orient="records")
+    if _is_numpy_value(value):
+        converter = value.tolist if hasattr(value, "tolist") else value.item
+        return converter()
     if hasattr(value, "to_dict") and callable(value.to_dict):
         return value.to_dict()
     raise TypeError(f"{type(value).__name__} is not JSON serializable")
 
 
-def _json_safe(value: Any) -> Any:
-    """Return JSON-native data, falling back to a bounded textual value."""
+def _is_dataframe_like(value: Any) -> bool:
+    """Recognize pandas-compatible tabular frames without importing pandas."""
 
     try:
-        return json.loads(json.dumps(value, ensure_ascii=False, default=_json_default))
+        return (
+            getattr(value, "ndim", None) == 2
+            and hasattr(value, "columns")
+            and hasattr(value, "index")
+            and callable(getattr(value, "to_dict", None))
+        )
+    except Exception:
+        return False
+
+
+def _is_numpy_value(value: Any) -> bool:
+    module = type(value).__module__
+    return module == "numpy" or module.startswith("numpy.")
+
+
+def _is_pandas_missing(value: Any) -> bool:
+    module = type(value).__module__
+    return module.startswith("pandas.") and type(value).__name__ in {
+        "NAType",
+        "NaTType",
+    }
+
+
+def _json_key(value: Any, seen: set[int]) -> str:
+    normalized = _normalize_json(value, seen)
+    if isinstance(normalized, str):
+        return normalized
+    if normalized is None:
+        return "null"
+    if normalized is True:
+        return "true"
+    if normalized is False:
+        return "false"
+    if isinstance(normalized, (int, float)):
+        return str(normalized)
+    return repr(normalized)
+
+
+def _normalize_json(value: Any, seen: set[int]) -> Any:
+    """Recursively normalize common tool values to JSON-native structures."""
+
+    if isinstance(value, Enum):
+        return _normalize_json(value.value, seen)
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if _is_pandas_missing(value):
+        return None
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, (Decimal, UUID)):
+        return str(value)
+    if isinstance(value, bytes):
+        return {"base64": base64.b64encode(value).decode("ascii")}
+
+    value_id = id(value)
+    if value_id in seen:
+        return "<recursive reference>"
+    seen.add(value_id)
+    try:
+        if isinstance(value, BaseModel):
+            return _normalize_json(value.model_dump(mode="json"), seen)
+        if is_dataclass(value) and not isinstance(value, type):
+            return _normalize_json(asdict(value), seen)
+        if isinstance(value, Mapping):
+            return {
+                _json_key(key, seen): _normalize_json(item, seen)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return [_normalize_json(item, seen) for item in value]
+
+        if _is_dataframe_like(value):
+            try:
+                records = value.to_dict(orient="records")
+            except Exception:
+                return repr(value)
+            return _normalize_json(records, seen)
+
+        if _is_numpy_value(value):
+            try:
+                if hasattr(value, "tolist") and callable(value.tolist):
+                    converted = value.tolist()
+                elif hasattr(value, "item") and callable(value.item):
+                    converted = value.item()
+                else:
+                    return repr(value)
+            except Exception:
+                return repr(value)
+            return _normalize_json(converted, seen)
+
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            try:
+                converted = to_dict()
+            except Exception:
+                return repr(value)
+            return _normalize_json(converted, seen)
+        return repr(value)
+    finally:
+        seen.remove(value_id)
+
+
+def _json_safe(value: Any) -> Any:
+    """Return recursively normalized JSON-native tool data."""
+
+    try:
+        normalized = _normalize_json(value, set())
+        return json.loads(json.dumps(normalized, ensure_ascii=False, allow_nan=False))
     except (TypeError, ValueError, OverflowError):
         return repr(value)
 

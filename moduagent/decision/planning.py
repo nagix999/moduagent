@@ -526,9 +526,34 @@ class ExecutionState:
         self.awaiting_step_result = True
 
     def set_pending_result(self, result: StepResult) -> None:
+        step = self.current_step
+        if step is None:
+            raise RuntimeError("there is no current step for the pending result")
+        if result.step_id != step.step_id:
+            raise ValueError(
+                f"step result id {result.step_id!r} does not match {step.step_id!r}"
+            )
         self.pending_step_result = result
         self.validation_error = None
         self.phase = RunPhase.STEP_VALIDATE
+
+    def fail_current_step(self) -> PlanStep | None:
+        """Make the active step and execution state terminally failed.
+
+        A strict execution failure must not leave an active step looking as if
+        it is still running. Completed and skipped steps are immutable here;
+        they may be present when a corrupted or incomplete checkpoint is
+        rejected.
+        """
+
+        step = self.current_step
+        if step is not None and step.status not in {
+            PlanStepStatus.COMPLETED,
+            PlanStepStatus.SKIPPED,
+        }:
+            step.status = PlanStepStatus.FAILED
+        self.phase = RunPhase.FAILED
+        return step
 
     def commit_pending(self) -> PlanStep:
         result = self.pending_step_result
@@ -1113,7 +1138,7 @@ class PlanAndExecutePolicy:
         tool_calls = response.tool_calls or response.message.tool_calls
         if tool_calls:
             if state.awaiting_step_result:
-                state.phase = RunPhase.FAILED
+                state.fail_current_step()
                 state.validation_error = (
                     "tools are forbidden during StepResult extraction"
                 )
@@ -1162,6 +1187,24 @@ class PlanAndExecutePolicy:
         except (TypeError, ValueError) as exc:
             return self._retry_invalid_result(context, state, str(exc))
 
+        step = state.current_step
+        if step is None or result.step_id != step.step_id:
+            state.pending_step_result = None
+            state.validation_error = (
+                "pending step validation state is incomplete"
+                if step is None
+                else (
+                    f"step result id {result.step_id!r} does not match {step.step_id!r}"
+                )
+            )
+            state.fail_current_step()
+            self._sync(context, state)
+            return ExecutionDecision(
+                DecisionKind.FAIL,
+                error_message="Step validation failed",
+                metadata=self._metadata(state),
+            )
+
         state.set_pending_result(result)
         return await self.validate_pending(context)
 
@@ -1175,7 +1218,7 @@ class PlanAndExecutePolicy:
         result = state.pending_step_result
         step = state.current_step
         if state.phase is not RunPhase.STEP_VALIDATE or result is None or step is None:
-            state.phase = RunPhase.FAILED
+            state.fail_current_step()
             state.validation_error = "pending step validation state is incomplete"
             self._sync(context, state)
             return ExecutionDecision(
@@ -1191,7 +1234,7 @@ class PlanAndExecutePolicy:
             if not isinstance(validation, StepValidation):
                 raise TypeError("step validator must return a StepValidation instance")
         except Exception as exc:
-            state.phase = RunPhase.FAILED
+            state.fail_current_step()
             state.validation_error = f"step validator failed ({type(exc).__name__})"
             self._sync(context, state)
             return ExecutionDecision(
@@ -1218,7 +1261,7 @@ class PlanAndExecutePolicy:
         if validation.kind is ValidationKind.REPLAN:
             return await self._replan(context, state, validation.reason)
 
-        state.phase = RunPhase.FAILED
+        state.fail_current_step()
         state.validation_error = validation.reason
         self._sync(context, state)
         return ExecutionDecision(
@@ -1233,7 +1276,7 @@ class PlanAndExecutePolicy:
     async def observe(self, context: RunContext, results: Sequence[ToolResult]) -> None:
         failures = [result for result in results if not result.success]
         state = self._state(context)
-        if not failures or not self.revise_on_tool_failure:
+        if not failures:
             # A tool round-trip never consumes a step attempt. The next turn is
             # the schema-only StepResult extraction established by decide().
             state.awaiting_step_result = True
@@ -1243,9 +1286,14 @@ class PlanAndExecutePolicy:
             result.error.message if result.error else "tool failed"
             for result in failures
         )
+        if not self.revise_on_tool_failure:
+            state.validation_error = "tool execution failed"
+            state.fail_current_step()
+            self._sync(context, state)
+            return
         if state.replan_count >= self.max_replans:
             state.validation_error = feedback
-            state.phase = RunPhase.FAILED
+            state.fail_current_step()
             self._sync(context, state)
             return
         await self._apply_replan(context, state, feedback)
@@ -1298,7 +1346,7 @@ class PlanAndExecutePolicy:
     ) -> ExecutionDecision:
         step = state.current_step
         if step is None:
-            state.phase = RunPhase.FAILED
+            state.fail_current_step()
             self._sync(context, state)
             return ExecutionDecision(
                 DecisionKind.FAIL,
@@ -1309,7 +1357,7 @@ class PlanAndExecutePolicy:
         state.validation_error = reason
         state.pending_step_result = None
         if step.attempt_count >= self.max_step_attempts:
-            state.phase = RunPhase.FAILED
+            state.fail_current_step()
             kind = DecisionKind.FAIL
         else:
             state.phase = RunPhase.ACT
@@ -1339,7 +1387,7 @@ class PlanAndExecutePolicy:
     ) -> ExecutionDecision:
         step = state.current_step
         if step is None:
-            state.phase = RunPhase.FAILED
+            state.fail_current_step()
             self._sync(context, state)
             return ExecutionDecision(
                 DecisionKind.FAIL,
@@ -1349,7 +1397,7 @@ class PlanAndExecutePolicy:
         state.validation_error = validation.reason
         state.pending_step_result = None
         if step.attempt_count >= self.max_step_attempts:
-            state.phase = RunPhase.FAILED
+            state.fail_current_step()
             kind = DecisionKind.FAIL
         else:
             state.phase = RunPhase.ACT
@@ -1378,7 +1426,7 @@ class PlanAndExecutePolicy:
         feedback: str,
     ) -> ExecutionDecision:
         if state.replan_count >= self.max_replans:
-            state.phase = RunPhase.FAILED
+            state.fail_current_step()
             state.validation_error = "maximum replans exceeded"
             self._sync(context, state)
             return ExecutionDecision(
@@ -1411,7 +1459,7 @@ class PlanAndExecutePolicy:
             # A failed revision cannot leave a checkpoint that looks resumable
             # from ACT/STEP_VALIDATE, where stale tool output or a pending
             # StepResult might otherwise be committed after recovery.
-            state.phase = RunPhase.FAILED
+            state.fail_current_step()
             state.validation_error = "plan revision failed"
             state.pending_step_result = None
             state.awaiting_step_result = False
