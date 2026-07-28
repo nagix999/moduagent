@@ -361,6 +361,7 @@ def test_tool_structured_phases_are_separate_private_and_fit_one_plan_step() -> 
                 yield
 
         conversations = InMemoryConversationStore()
+        checkpoints = InMemoryCheckpointStore()
         model = PhaseModel()
         agent = Agent(
             config=AgentConfig(
@@ -373,6 +374,7 @@ def test_tool_structured_phases_are_separate_private_and_fit_one_plan_step() -> 
             decision_policy=PlanAndExecutePolicy(LLMPlanGenerator(model, max_steps=1)),
             output_codec=PydanticOutputCodec(StructuredAnswer),
             conversation_store=conversations,
+            checkpoint_store=checkpoints,
         )
 
         result = await agent.run(
@@ -384,6 +386,17 @@ def test_tool_structured_phases_are_separate_private_and_fit_one_plan_step() -> 
         assert result.output == StructuredAnswer(answer="5", confidence=1.0)
         assert calls == [(2, 3)]
         assert result.metadata["plan_usage"]["committed_steps"] == 1
+        trace = result.metadata["tool_trace"]
+        assert len(trace) == 1
+        assert trace[0]["step_id"] == "calculate"
+        assert trace[0]["call_id"] == "add-1"
+        assert trace[0]["tool_name"] == "add"
+        assert trace[0]["success"] is True
+        assert trace[0]["error"] is None
+        assert "arguments" not in trace[0]
+        checkpoint = await checkpoints.load(result.run_id)
+        assert checkpoint is not None
+        assert checkpoint.metadata["_moduagent_tool_trace"] == trace
         assert len(model.requests) == 4
         plan_request, act_tool_request, step_result_request, finalize_request = (
             model.requests
@@ -633,7 +646,65 @@ def test_replan_cannot_expand_past_max_steps() -> None:
 
         assert result.finish_reason is FinishReason.MAX_STEPS
         assert result.error == "plan exceeds RunLimits.max_steps (1)"
+        assert [step["status"] for step in result.metadata["plan"]["steps"]] == [
+            "failed",
+            "pending",
+        ]
         assert len(model.requests) == 1
+
+    asyncio.run(scenario())
+
+
+def test_tool_call_limit_marks_current_step_failed() -> None:
+    async def scenario() -> None:
+        calls = 0
+
+        @function_tool
+        def lookup(query: str) -> str:
+            nonlocal calls
+            calls += 1
+            return query
+
+        call = ToolCall("lookup-1", "lookup", {"query": "value"})
+        model = CompleteScriptedModel(
+            [ModelResponse(Message.assistant(None, (call,)), (call,))]
+        )
+        checkpoints = InMemoryCheckpointStore()
+        agent = Agent(
+            config=AgentConfig(
+                "bounded-tools",
+                "Respect the Tool call limit.",
+                limits=RunLimits(max_steps=1, max_tool_calls=0),
+            ),
+            model=model,
+            tools=[lookup],
+            decision_policy=PlanAndExecutePolicy(
+                StaticPlanGenerator(
+                    [
+                        PlanStep(
+                            step_id="lookup",
+                            objective="look up the value",
+                            completion_criteria=["the value is available"],
+                            allowed_tools=["lookup"],
+                        )
+                    ]
+                )
+            ),
+            checkpoint_store=checkpoints,
+        )
+
+        result = await agent.run("look it up", session_id="bounded-tools")
+
+        assert result.finish_reason is FinishReason.MAX_TOOL_CALLS
+        assert result.metadata["plan"]["steps"][0]["status"] == "failed"
+        assert result.metadata["plan_usage"]["phase"] == "failed"
+        assert result.metadata["tool_trace"][0]["success"] is False
+        assert calls == 0
+        checkpoint = await checkpoints.load(result.run_id)
+        assert checkpoint is not None
+        assert checkpoint.to_context().execution_state.plan.steps[0].status.value == (
+            "failed"
+        )
 
     asyncio.run(scenario())
 

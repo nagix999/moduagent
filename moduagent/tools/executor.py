@@ -175,6 +175,7 @@ class ToolExecutor:
                             ),
                             attempts=attempt,
                             duration_seconds=time.monotonic() - started,
+                            invocation_arguments=arguments,
                         )
                 return ToolResult.succeeded(
                     call_id=call.id,
@@ -182,6 +183,7 @@ class ToolExecutor:
                     value=value,
                     attempts=attempt,
                     duration_seconds=time.monotonic() - started,
+                    invocation_arguments=arguments,
                 )
             except asyncio.TimeoutError:
                 error = ToolError(
@@ -209,6 +211,7 @@ class ToolExecutor:
                 error=error,
                 attempts=attempt,
                 duration_seconds=time.monotonic() - started,
+                invocation_arguments=arguments,
             )
 
         raise AssertionError("tool execution loop ended unexpectedly")

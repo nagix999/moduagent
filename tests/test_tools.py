@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 from pydantic import BaseModel
@@ -16,6 +21,7 @@ from moduagent.tools import (
     ToolExecutionContext,
     ToolExecutor,
     ToolRegistry,
+    ToolResult,
     function_tool,
 )
 
@@ -199,6 +205,155 @@ def test_result_size_limit_is_enforced() -> None:
     assert result.error is not None
     assert result.error.type is ToolErrorType.RESULT_TOO_LARGE
     assert result.error.details["actual_bytes"] > 20
+
+
+def test_tool_result_normalizes_dataframe_like_records_without_pandas() -> None:
+    class FakeDataFrame:
+        ndim = 2
+        columns = ("amount", "created_at")
+        index = (0,)
+
+        def __init__(self) -> None:
+            self.orient = None
+
+        def to_dict(self, orient=None):
+            self.orient = orient
+            return [
+                {
+                    "amount": Decimal("123.45"),
+                    "created_at": datetime(2026, 7, 28, 9, 30, tzinfo=timezone.utc),
+                }
+            ]
+
+    frame = FakeDataFrame()
+    result = ToolResult.succeeded(
+        call_id="frame-1",
+        tool_name="query",
+        value=frame,
+    )
+
+    payload = json.loads(result.model_content())
+
+    assert frame.orient == "records"
+    assert payload["value"] == [
+        {
+            "amount": "123.45",
+            "created_at": "2026-07-28T09:30:00+00:00",
+        }
+    ]
+    assert result.to_dict()["value"] == payload["value"]
+
+
+def test_tool_result_normalizes_real_pandas_dataframe() -> None:
+    pd = pytest.importorskip("pandas")
+    np = pytest.importorskip("numpy")
+    frame = pd.DataFrame(
+        {
+            "customer_id": [np.int64(7)],
+            "queried_at": [pd.Timestamp("2026-07-28T09:30:00+09:00")],
+            "optional_note": [pd.NA],
+            "not_available_at": [pd.NaT],
+        }
+    )
+    result = ToolResult.succeeded(
+        call_id="sql-1",
+        tool_name="read_sql",
+        value=frame,
+    )
+
+    payload = json.loads(result.model_content())
+
+    assert payload["value"] == [
+        {
+            "customer_id": 7,
+            "queried_at": "2026-07-28T09:30:00+09:00",
+            "optional_note": None,
+            "not_available_at": None,
+        }
+    ]
+
+
+def test_tool_result_normalizes_series_numpy_and_common_scalars() -> None:
+    class FakeSeries:
+        ndim = 1
+
+        def to_dict(self):
+            return {"count": FakeNumpyInteger(3)}
+
+    class FakeNumpyInteger:
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+        def item(self) -> int:
+            return self.value
+
+    FakeNumpyInteger.__module__ = "numpy"
+
+    result = ToolResult.succeeded(
+        call_id="series-1",
+        tool_name="query",
+        value={
+            "series": FakeSeries(),
+            "identifier": UUID("12345678-1234-5678-1234-567812345678"),
+            "missing": float("nan"),
+        },
+    )
+
+    payload = json.loads(result.model_content())
+
+    assert payload["value"] == {
+        "series": {"count": 3},
+        "identifier": "12345678-1234-5678-1234-567812345678",
+        "missing": None,
+    }
+
+
+def test_tool_result_preserves_supported_object_converters() -> None:
+    class OutputModel(BaseModel):
+        value: Decimal
+
+    @dataclass
+    class DataclassOutput:
+        value: Decimal
+
+    class DictOutput:
+        def to_dict(self):
+            return {"value": Decimal("1.25")}
+
+    result = ToolResult.succeeded(
+        call_id="objects-1",
+        tool_name="query",
+        value={
+            "pydantic": OutputModel(value=Decimal("2.5")),
+            "dataclass": DataclassOutput(value=Decimal("3.5")),
+            "to_dict": DictOutput(),
+        },
+    )
+
+    assert json.loads(result.model_content())["value"] == {
+        "pydantic": {"value": "2.5"},
+        "dataclass": {"value": "3.5"},
+        "to_dict": {"value": "1.25"},
+    }
+
+
+def test_unknown_nested_tool_value_falls_back_locally_to_repr() -> None:
+    class Unknown:
+        def __repr__(self) -> str:
+            return "<unknown-result>"
+
+    result = ToolResult.succeeded(
+        call_id="unknown-1",
+        tool_name="query",
+        value={"rows": [{"known": 1, "unknown": Unknown()}], "row_count": 1},
+    )
+
+    payload = json.loads(result.model_content())
+
+    assert payload["value"] == {
+        "rows": [{"known": 1, "unknown": "<unknown-result>"}],
+        "row_count": 1,
+    }
 
 
 def test_parallel_execution_is_bounded_and_preserves_order() -> None:

@@ -1,6 +1,6 @@
 # Plan-and-Execute
 
-상태: ModuAgent 0.3.0의 `PlanAndExecutePolicy`는 검증된 단계 결과와 공개 최종 응답을 분리하는 strict 상태 머신이다. `Agent`의 기본 Policy는 계속 `StandardDecisionPolicy`이며, Plan-and-Execute가 필요한 Agent에 명시적으로 설정한다.
+상태: ModuAgent 0.3.1의 `PlanAndExecutePolicy`는 검증된 단계 결과와 공개 최종 응답을 분리하는 strict 상태 머신이다. `Agent`의 기본 Policy는 계속 `StandardDecisionPolicy`이며, Plan-and-Execute가 필요한 Agent에 명시적으로 설정한다.
 
 ## 핵심 계약
 
@@ -136,6 +136,43 @@ ACT의 내부 출력은 다음 `StepResult` 필드만 허용한다.
 
 `extra="forbid"`가 적용되므로 `final_answer` 같은 단계 밖의 필드를 넣으면 커밋되지 않는다. 커밋된 결과는 canonical JSON의 SHA-256 `result_ref`와 함께 저장된다. 재계획은 기존 완료 단계의 ID, 상태, 결과 참조와 `committed_results`를 보존한다.
 
+검증 재시도, Tool 실패 복구 또는 재계획 한도를 소진해 Policy가 terminal 실패를 결정하면 현재 `PlanStep.status`도 `failed`로 전이한다. 다음 단계는 실행되지 않았으므로 `pending`으로 남는다. 일시적인 transport 오류나 전체 run timeout처럼 checkpoint에서 재개 가능한 중단은 `in_progress`로 남을 수 있지만, 이는 동기 DB 조회나 Tool 함수가 백그라운드에서 계속 실행 중이라는 뜻이 아니다.
+
+## 허용 Tool과 실제 Tool 호출
+
+`PlanStep.allowed_tools`는 Planner가 단계별로 정한 허용 범위다. 목록에 Tool이 있다는 사실은 해당 Tool이 실제로 호출됐다는 뜻이 아니다. 실제 호출의 운영 감사 요약은 완료 또는 실패 결과의 `AgentResult.metadata["tool_trace"]`에 순서대로 기록된다.
+
+`AgentConfig.tool_trace_mode`는 다음 세 가지 모드를 지원한다.
+
+| 값 | 저장 내용 |
+|---|---|
+| `off` | `tool_trace`를 만들지 않음 |
+| `summary` | 기본값. `step_id`, `call_id`, `tool_name`, `success`, `attempts`, `duration_seconds`, 정제된 `error`만 저장 |
+| `arguments` | `summary`에 민감한 키를 재귀적으로 마스킹한 `arguments`와 `arguments_source`를 추가 |
+
+`arguments_source="validated"`는 validation·형 변환·기본값 적용 후 Tool에 실제 전달된 인자이고, `"requested"`는 validation 또는 실행 전에 거부된 호출의 모델 요청 인자다. `error`는 원본 메시지 대신 `type`과 `retryable`만 가진다. trace 전체 크기도 제한되며 Tool 결과 값은 어떤 모드에도 넣지 않는다. 같은 trace는 strict checkpoint의 내부 실행 metadata에 저장되므로 resume 전후의 호출 이력을 함께 확인할 수 있고 checkpoint schema는 v3를 유지한다.
+
+```python
+agent = Agent(
+    config=AgentConfig(
+        name="audited-agent",
+        instructions="검증된 결과만 사용한다.",
+        tool_trace_mode="arguments",
+    ),
+    model=model,
+    tools=tools,
+    decision_policy=PlanAndExecutePolicy(LLMPlanGenerator(model)),
+)
+
+result = await agent.run("조회해줘")
+for call in result.metadata.get("tool_trace", []):
+    print(call["step_id"], call["tool_name"], call.get("arguments"))
+```
+
+인자도 업무 데이터가 될 수 있으므로 일반 운영은 기본 `summary`를 권장한다. 원문 Tool 결과와 내부 model message가 필요한 일시적인 진단은 접근이 통제된 환경에서 `stream_all()`을 사용한다.
+
+Tool이 pandas `DataFrame` 또는 그 밖의 표 형식 값을 반환하면 런타임은 JSON-safe record 구조로 정규화한 뒤 모델과 진단 경계에 전달한다. 이 변환은 `Timestamp`, NumPy scalar, 결측값처럼 일반 JSON encoder가 직접 처리하기 어려운 셀도 JSON 호환 값으로 바꾼다. 다만 전체 DataFrame을 반환하면 prompt가 매우 커질 수 있으므로 조회 Tool 자체에서 필요한 열과 행을 제한하는 것이 좋다.
+
 ## vLLM과 출력 schema
 
 vLLM을 포함한 일부 OpenAI 호환 서버는 한 요청에 Tool Calling과 구조화 출력 schema를 함께 보내면 Tool을 호출하지 않거나 요청을 거부한다. 0.3.0은 두 계약을 요청 수준에서 분리한다.
@@ -234,13 +271,16 @@ Checkpoint schema v3는 다음 strict 상태를 저장한다.
 - phase, 계획 버전, 현재 단계
 - 커밋된 `StepResult`와 결과 참조
 - 단계별 시도 횟수와 재계획 횟수
+- 크기와 민감 정보가 정제된 실제 `tool_trace`
 - pending 결과와 내부 Tool protocol 메시지
 - FINALIZE 원문, 저장 여부, 공개 방출 여부와 호출 횟수
 - phase-scoped Skill 활성화 상태
 
 v3 checkpoint를 재개하면 완료 단계는 다시 실행하지 않고 현재 ACT 또는 FINALIZE 경계에서 계속한다. v1과 v2 payload도 읽을 수 있지만 strict `ExecutionState`가 없으므로 진행 중인 0.2 Plan-and-Execute를 단계 단위로 그대로 이어 주는 마이그레이션은 제공하지 않는다. 배포 전 진행 중인 run을 끝내거나, 재실행이 안전한 요청만 새 strict 계획으로 시작해야 한다.
 
-실패한 checkpoint에는 Tool 결과나 Skill resource 원문이 일시적으로 포함될 수 있다. 운영 저장소는 암호화, 접근 제어와 짧은 TTL을 적용해야 한다.
+`tool_trace`는 정제되지만 실패한 checkpoint의 pending Tool protocol에는 모델이 만든 원본 Tool 인자, Tool 결과나 Skill resource 원문이 일시적으로 포함될 수 있다. 운영 저장소는 암호화, 접근 제어와 짧은 TTL을 적용해야 한다.
+
+동기 Tool은 event loop를 막지 않도록 worker thread에서 실행된다. Python thread는 강제로 안전하게 취소할 수 없으므로 `pd.read_sql` 같은 blocking 호출은 Tool 또는 run timeout 결과가 반환된 뒤에도 해당 worker에서 끝날 때까지 계속될 수 있다. `PlanStep.status`는 이 thread의 생존 여부를 나타내지 않는다. DB driver의 query timeout, connection timeout과 서버 측 statement timeout도 함께 설정해야 한다.
 
 새 strict run의 Planner는 같은 session에 저장된 최근 공개 대화를 함께 보므로 “그 결과를 요약해줘” 같은 후속 요청은 이전 FINALIZE 응답을 참조할 수 있다. `LLMPlanGenerator(history_limit=8)`의 기본값은 최근 8개 메시지이며 `0`으로 끌 수 있다. ACT에는 과거 대화 전체를 다시 전달하지 않고 Planner가 만든 현재 단계와 필요한 선행 결과만 전달한다.
 

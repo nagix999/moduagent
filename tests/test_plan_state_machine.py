@@ -27,7 +27,7 @@ from moduagent.decision import (
 from moduagent.messages import Message, ToolCall
 from moduagent.models import ModelCapabilities, ModelRequest, ModelResponse
 from moduagent.output import StepResultCodec, TextOutputCodec
-from moduagent.persistence import InMemoryConversationStore
+from moduagent.persistence import InMemoryCheckpointStore, InMemoryConversationStore
 from moduagent.runtime import EventType
 from moduagent.runtime.context import RunContext, RunRequest
 from moduagent.tools import (
@@ -399,6 +399,7 @@ def test_strict_policy_requires_schema_only_result_after_tool_turn() -> None:
         assert committed.kind is DecisionKind.COMMIT_STEP
         assert context.execution_state.phase is RunPhase.VERIFY
         assert context.execution_state.current_step_id is None
+        assert context.execution_state.plan.steps[0].status is PlanStepStatus.COMPLETED
 
     asyncio.run(scenario())
 
@@ -500,7 +501,149 @@ def test_validator_exception_transitions_execution_to_failed() -> None:
         assert "sensitive validator detail" not in decision.error_message
         assert "sensitive validator detail" not in state.validation_error
         assert state.pending_step_result is not None
+        assert state.plan.steps[0].status is PlanStepStatus.FAILED
         assert context.policy_state["execution_state"]["phase"] == "failed"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "step_result",
+    [
+        ('{"step_id":"S1","status":"failed","completion_evidence":[]}'),
+        ('{"step_id":"OTHER","status":"completed","completion_evidence":["evidence"]}'),
+    ],
+    ids=["executor-failed", "step-id-mismatch"],
+)
+def test_terminal_step_validation_marks_current_step_failed(
+    step_result: str,
+) -> None:
+    async def scenario() -> None:
+        context = _context()
+        policy = PlanAndExecutePolicy(StaticPlanGenerator(Plan([_step()])))
+        await policy.begin(context)
+        policy.prepare_step(context, has_tools=False)
+
+        decision = await policy.decide(
+            context,
+            ModelResponse(Message.assistant(step_result), finish_reason="stop"),
+        )
+
+        state = context.execution_state
+        assert decision.kind is DecisionKind.FAIL
+        assert state.phase is RunPhase.FAILED
+        assert state.plan.steps[0].status is PlanStepStatus.FAILED
+        assert decision.metadata["plan"]["steps"][0]["status"] == "failed"
+        if '"OTHER"' in step_result:
+            assert state.pending_step_result is None
+            checkpoints = InMemoryCheckpointStore()
+            await checkpoints.save(context.run_id, context)
+            checkpoint = await checkpoints.load(context.run_id)
+            assert checkpoint is not None
+            restored = checkpoint.to_context().execution_state
+            assert restored.phase is RunPhase.FAILED
+            assert restored.plan.steps[0].status is PlanStepStatus.FAILED
+
+    asyncio.run(scenario())
+
+
+def test_incomplete_validation_state_marks_current_step_failed() -> None:
+    async def scenario() -> None:
+        context = _context()
+        policy = PlanAndExecutePolicy(StaticPlanGenerator(Plan([_step()])))
+        await policy.begin(context)
+        policy.prepare_step(context, has_tools=False)
+
+        decision = await policy.validate_pending(context)
+
+        state = context.execution_state
+        assert decision.kind is DecisionKind.FAIL
+        assert state.phase is RunPhase.FAILED
+        assert state.plan.steps[0].status is PlanStepStatus.FAILED
+
+    asyncio.run(scenario())
+
+
+def test_validation_retry_keeps_step_active_until_attempts_are_exhausted() -> None:
+    async def scenario() -> None:
+        context = _context()
+        policy = PlanAndExecutePolicy(
+            StaticPlanGenerator(Plan([_step()])),
+            max_step_attempts=2,
+        )
+        await policy.begin(context)
+        policy.prepare_step(context, has_tools=False)
+        response = ModelResponse(
+            Message.assistant(
+                '{"step_id":"S1","status":"completed","completion_evidence":[]}'
+            ),
+            finish_reason="stop",
+        )
+
+        retry = await policy.decide(context, response)
+
+        assert retry.kind is DecisionKind.RETRY_STEP
+        assert context.execution_state.phase is RunPhase.ACT
+        assert (
+            context.execution_state.plan.steps[0].status is PlanStepStatus.IN_PROGRESS
+        )
+
+        exhausted = await policy.decide(context, response)
+
+        assert exhausted.kind is DecisionKind.FAIL
+        assert context.execution_state.phase is RunPhase.FAILED
+        assert context.execution_state.plan.steps[0].status is PlanStepStatus.FAILED
+
+    asyncio.run(scenario())
+
+
+def test_invalid_step_result_retry_exhaustion_marks_current_step_failed() -> None:
+    async def scenario() -> None:
+        context = _context()
+        policy = PlanAndExecutePolicy(
+            StaticPlanGenerator(Plan([_step()])),
+            max_step_attempts=1,
+        )
+        await policy.begin(context)
+        policy.prepare_step(context, has_tools=False)
+
+        decision = await policy.decide(
+            context,
+            ModelResponse(Message.assistant("not-json"), finish_reason="stop"),
+        )
+
+        assert decision.kind is DecisionKind.FAIL
+        assert context.execution_state.phase is RunPhase.FAILED
+        assert context.execution_state.plan.steps[0].status is PlanStepStatus.FAILED
+
+    asyncio.run(scenario())
+
+
+def test_replan_exhaustion_marks_current_step_failed() -> None:
+    async def scenario() -> None:
+        context = _context()
+        policy = PlanAndExecutePolicy(
+            StaticPlanGenerator(Plan([_step()])),
+            max_replans=0,
+        )
+        await policy.begin(context)
+        policy.prepare_step(context, has_tools=False)
+
+        decision = await policy.decide(
+            context,
+            ModelResponse(
+                Message.assistant(
+                    '{"step_id":"S1","status":"blocked",'
+                    '"missing_inputs":["new source"],'
+                    '"completion_evidence":[]}'
+                ),
+                finish_reason="stop",
+            ),
+        )
+
+        assert decision.kind is DecisionKind.FAIL
+        assert context.execution_state.validation_error == "maximum replans exceeded"
+        assert context.execution_state.plan.steps[0].status is PlanStepStatus.FAILED
 
     asyncio.run(scenario())
 
@@ -613,6 +756,7 @@ def test_replan_exception_fails_closed_and_clears_pending_result() -> None:
         assert state.validation_error == "plan revision failed"
         assert state.pending_step_result is None
         assert state.awaiting_step_result is False
+        assert state.plan.steps[0].status is PlanStepStatus.FAILED
         assert context.policy_state["execution_state"]["phase"] == "failed"
 
     asyncio.run(scenario())
@@ -645,6 +789,44 @@ def test_tool_failure_replan_exception_fails_closed() -> None:
         assert state.phase is RunPhase.FAILED
         assert state.validation_error == "plan revision failed"
         assert state.awaiting_step_result is False
+        assert state.plan.steps[0].status is PlanStepStatus.FAILED
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("revise_on_tool_failure", "max_replans"),
+    [(False, 2), (True, 0)],
+    ids=["revision-disabled", "replans-exhausted"],
+)
+def test_terminal_tool_failure_marks_current_step_failed(
+    revise_on_tool_failure: bool,
+    max_replans: int,
+) -> None:
+    async def scenario() -> None:
+        context = _context()
+        policy = PlanAndExecutePolicy(
+            StaticPlanGenerator(Plan([_step()])),
+            revise_on_tool_failure=revise_on_tool_failure,
+            max_replans=max_replans,
+        )
+        await policy.begin(context)
+        policy.prepare_step(context, has_tools=True)
+        failure = ToolResult.failed(
+            call_id="call-1",
+            tool_name="lookup",
+            error=ToolError(
+                ToolErrorType.EXECUTION_ERROR,
+                "database query failed",
+            ),
+        )
+
+        await policy.observe(context, [failure])
+
+        state = context.execution_state
+        assert state.phase is RunPhase.FAILED
+        assert state.plan.steps[0].status is PlanStepStatus.FAILED
+        assert context.policy_state["plan"]["steps"][0]["status"] == "failed"
 
     asyncio.run(scenario())
 

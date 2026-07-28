@@ -63,6 +63,7 @@ class AgentConfig:
         "structured_only"
     )
     stream_visibility: Literal["public_only", "all"] = "public_only"
+    tool_trace_mode: Literal["off", "summary", "arguments"] = "summary"
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -79,3 +80,5 @@ class AgentConfig:
             )
         if self.stream_visibility not in {"public_only", "all"}:
             raise ValueError("stream_visibility must be 'public_only' or 'all'")
+        if self.tool_trace_mode not in {"off", "summary", "arguments"}:
+            raise ValueError("tool_trace_mode must be 'off', 'summary', or 'arguments'")

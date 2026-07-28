@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1
+
+- Updated strict Plan-and-Execute terminal policy transitions so exhausted validation, Tool recovery, or replanning marks the current step `failed` instead of leaving it `in_progress`.
+- Added configurable, bounded, sanitized `AgentResult.metadata["tool_trace"]` audit summaries with validated invocation arguments, reserved-key protection, and strict checkpoint persistence so operators can identify the Tool actually used without treating `allowed_tools` as execution history.
+- Normalized pandas `DataFrame` and other tabular Tool results into JSON-safe records before they are passed to the model or retained by runtime diagnostics.
+
 ## 0.3.0
 
 - Made `PlanAndExecutePolicy` a strict PLAN → ACT_TOOL → STEP_RESULT → STEP_VALIDATE → VERIFY → FINALIZE state machine.
