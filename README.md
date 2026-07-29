@@ -10,7 +10,7 @@ Start with a normal model or Tool-calling loop. Add bounded conversation
 memory, validated Pydantic output, strict Plan-and-Execute, checkpoint recovery,
 Skills, and observability only when your application needs them.
 
-> Current version: **0.4.0 (Alpha)** · Python **3.10+** · **MIT License**
+> Current version: **0.4.2 (Alpha)** · Python **3.10+** · **MIT License**
 
 New to ModuAgent? Complete Steps 1 and 2 first. Then add memory, structured
 output, or Plan-and-Execute only when your use case needs them.
@@ -31,7 +31,7 @@ Agent ──► Execution profile ──► Model
   ├── Output codec
   ├── Checkpoint store
   ├── Skills and authorization
-  └── Events and metrics
+  └── Events, diagnostics, and metrics
 ```
 
 - `AgentConfig` defines instructions, retry behavior, and run limits.
@@ -66,10 +66,10 @@ server; ModuAgent does not host a model itself.
 Install the package:
 
 ```bash
-python -m pip install "moduagent==0.4.0"
+python -m pip install "moduagent==0.4.2"
 ```
 
-If your package index does not contain `0.4.0` yet and you already have a 0.4
+If your package index does not contain `0.4.2` yet and you already have a 0.4
 source checkout, install it from the repository root:
 
 ```bash
@@ -88,6 +88,7 @@ Optional integrations are installed separately:
 ```bash
 python -m pip install redis       # Redis conversation/checkpoint stores
 python -m pip install matplotlib  # report automation example
+python -m pip install "psycopg[binary]>=3.2,<4"  # PostgreSQL report example
 ```
 
 ## Step 1: run your first Agent
@@ -231,6 +232,20 @@ can be called.
 does not create a transaction or exactly-once guarantee. For write Tools, your
 application still needs an idempotency key and duplicate protection.
 
+Blocking functions such as `pandas.read_sql()` run outside the event loop.
+For production, share a bounded scheduler across synchronous Tools so timed-out
+calls cannot create an unlimited number of background threads:
+
+```python
+from moduagent import SyncToolScheduler, function_tool
+
+blocking_tools = SyncToolScheduler(max_workers=8, max_queue=32)
+
+@function_tool(sync_scheduler=blocking_tools, timeout_seconds=10)
+def query_db(sql: str) -> list[dict]:
+    return run_read_only_query(sql)
+```
+
 Raw assistant Tool calls and raw Tool results are internal protocol messages.
 They are available to the model during the run but are not added to
 `ConversationStore` or `AgentResult.messages`. The default public Tool trace is
@@ -294,6 +309,9 @@ single-process development and tests.
 
 For strict token limits and automatic summarization, see the
 [Conversation Memory guide](https://github.com/nagix999/moduagent/blob/main/docs/conversation-memory-policy.md).
+If exact vLLM tokenization is used repeatedly, wrap `VLLMTokenCounter` with
+`CachingTokenCounter`; it stores only a bounded keyed digest and successful
+token count.
 
 ## Step 4: return validated structured output
 
@@ -426,7 +444,8 @@ short workflows.
 
 The repository includes a complete Plan-and-Execute Agent with only two Tools:
 
-- `query_db`: runs a bounded, read-only SQLite query.
+- `query_db`: runs a bounded, read-only query against SQLite (default) or
+  PostgreSQL.
 - `plot_graph`: reads the run-scoped query artifact and creates a PNG chart.
 
 See
@@ -438,6 +457,20 @@ export VLLM_BASE_URL="http://localhost:8000/v1"
 export VLLM_MODEL="your-tool-capable-model"
 python examples/report_automation_agent.py
 ```
+
+To run the same example against PostgreSQL, keep the model variables above and
+add:
+
+```bash
+python -m pip install "psycopg[binary]>=3.2,<4"
+export REPORT_DB_BACKEND="postgresql"
+export REPORT_DATABASE_URL="postgresql://report_reader@localhost:5432/reporting"
+python examples/report_automation_agent.py
+```
+
+Use a dedicated database role with only `CONNECT`, schema `USAGE`, and `SELECT`
+privileges. The example also starts a read-only transaction and applies
+statement and lock timeouts.
 
 ## After the five steps
 
@@ -474,6 +507,84 @@ staged finalization, including Plan-and-Execute, uses `FINAL_DELTA`.
 `stream_all()` also exposes diagnostic internal events and intermediate model
 deltas. Use it only in an access-controlled diagnostic path, not as a direct
 user-facing stream.
+
+## Inspecting steps and failures
+
+Use an `EventSink` or `stream_all()` for the execution timeline. Add a
+`DiagnosticSink` when developers also need the sanitized cause of an exception:
+
+```python
+from moduagent import InMemoryDiagnosticSink, LoggingEventSink
+
+diagnostics = InMemoryDiagnosticSink(max_records=1_000)
+
+observable_agent = Agent(
+    config=AgentConfig(
+        name="observable-agent",
+        instructions="Complete the request using the available Tools.",
+    ),
+    model=create_model(),
+    tools=[add],
+    event_sink=LoggingEventSink(),
+    diagnostic_sink=diagnostics,
+    diagnostic_timeout_seconds=0.25,
+    diagnostic_max_pending_deliveries=1_024,
+)
+
+result = await observable_agent.run("Use add for 20 + 22.")
+
+if result.failure_id is not None:
+    failure = diagnostics.get(result.failure_id)
+    if failure is not None:
+        print(failure.to_dict())
+
+for failure in diagnostics.for_run(result.run_id):
+    print(failure.failure_id, failure.component, failure.operation)
+```
+
+`result.metadata["tool_trace"]` shows executed Tools and their correlation IDs.
+`result.failure_id` identifies the root failure of a terminal run. Its Tool
+record can have `terminal=False` because that flag means “recoverable when
+captured”; the Plan policy may decide to stop afterward. Recovered Tool
+failures may appear only in the Tool trace and `diagnostics.for_run()`.
+
+Diagnostics are off by default; omitting `diagnostic_sink` or using
+`NoopDiagnosticSink` preserves the 0.4 behavior. Delivery is best effort and
+bounded by `diagnostic_timeout_seconds` and
+`diagnostic_max_pending_deliveries`. Standard-library logging uses a bounded
+daemon worker pool; a synchronous handler already in flight cannot be
+force-cancelled. Custom async sinks must honor cancellation.
+
+Diagnostic fields are bounded and omit raw exception messages, SQL, prompts,
+Tool arguments or results, provider bodies, source lines, and local variables.
+Real `OSError.errno` and eager allowlisted attributes can be retained;
+Pydantic dynamic keys are hidden and truncated tracebacks keep their innermost
+frames. Built-in event logs omit payloads and free-form reasons and hash
+step/Tool correlation IDs.
+
+Strict Plan validation exposes framework-owned `validation_code`,
+`validation_location`, and optional `validation_cause_code`; inspect them
+instead of parsing a reason string. Custom Engine authors must treat
+`EngineOutcome.error` as public, trusted text.
+`AgentResult.metadata["error_summary"]` is runtime-owned and cannot be
+overridden through Engine metadata. See the
+[diagnostics guide](https://github.com/nagix999/moduagent/blob/main/docs/diagnostics.md)
+for logging, custom durable sinks, and security guidance.
+
+## Performance metrics
+
+`MetricsEventSink` records `model.calls` and phase-aware model duration, plus
+memory preparation, Tool, checkpoint, run, and same-session queue timings.
+Noop observability skips its queue and copy path completely. Event handoff
+queues are bounded, so a slow sink applies backpressure instead of retaining
+unlimited payloads.
+
+Run the source-tree microbenchmark after changing execution or persistence
+code:
+
+```bash
+python benchmarks/performance_v042.py --pretty
+```
 
 ## Checkpoints and safe resume
 
@@ -630,8 +741,9 @@ compatibility metadata. API keys and tokens are redacted.
   for conversations, checkpoints, events, and generated artifacts.
 - Record `agent.inspect()` with the deployment and test resume behavior before
   upgrading a live Agent.
-- Send public streams to users and internal events to protected diagnostic
-  sinks.
+- Send public streams to users and internal events to protected `EventSink`
+  implementations. Store failure diagnostics in a separately access-controlled
+  `DiagnosticSink`.
 
 ModuAgent does not provide a distributed lock, worker queue, scheduler,
 durable outbox, or end-to-end exactly-once Tool execution. Add these through
@@ -674,13 +786,14 @@ Use Redis or a durable custom store for multi-process or restart-safe systems.
 | Keep conversations | `ConversationStore`, `RecentTurnsConversationMemoryPolicy` |
 | Resume work | `CheckpointStore`, `Agent.resume()` |
 | Add domain procedures | `SkillRegistry`, `SkillSelector` |
-| Observe runs | `Agent.stream()`, `EventSink`, metrics and audit sinks |
+| Observe runs | `Agent.stream_all()`, `EventSink`, `DiagnosticSink`, `failure_id` |
 | Inspect configuration | `Agent.inspect()`, `AgentSpec` |
 
 ## Examples
 
 - [Report automation Agent](https://github.com/nagix999/moduagent/blob/main/examples/report_automation_agent.py):
-  strict Plan-and-Execute using only `query_db` and `plot_graph`.
+  strict Plan-and-Execute using only `query_db` and `plot_graph`, with SQLite
+  and PostgreSQL query backends.
 - [Invoice review Skill](https://github.com/nagix999/moduagent/tree/main/examples/skills/invoice-review):
   Skill instructions, references, and assets.
 
@@ -700,6 +813,8 @@ The detailed guides are currently written in Korean.
   reusable procedures and resource access.
 - [Operations](https://github.com/nagix999/moduagent/blob/main/docs/operations.md):
   security, timeouts, stores, events, and deployment.
+- [Diagnostics](https://github.com/nagix999/moduagent/blob/main/docs/diagnostics.md):
+  step timelines, failure correlation, sanitized details, and custom sinks.
 - [0.4 migration](https://github.com/nagix999/moduagent/blob/main/docs/migration-0.4.md):
   source compatibility and checkpoint migration.
 - [Changelog](https://github.com/nagix999/moduagent/blob/main/CHANGELOG.md)

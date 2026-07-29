@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import inspect
 import json
 import time
 from collections.abc import Callable, Mapping
@@ -11,12 +10,15 @@ from datetime import datetime, timezone
 from typing import Any, Protocol, runtime_checkable
 
 from moduagent.messages import Message, Usage
+from moduagent.persistence._sync import call_maybe_async
 from moduagent.persistence.migration import (
     StateMigrationError,
+    _sanitize_runtime_metadata,
     flatten_plan_engine_state,
     migrate_checkpoint_payload,
 )
 from moduagent.persistence.snapshot import (
+    CommonRunState,
     EngineSnapshot,
     FinalizationMarkers,
     RunSnapshot,
@@ -33,6 +35,18 @@ from moduagent.runtime.context import (
 _LEGACY_CHECKPOINT_VERSION = 3
 _STANDARD_FINALIZATION_STATE_KEY = "_moduagent_structured_finalization"
 _STANDARD_FINALIZATION_OUTPUT_KEY = "_moduagent_structured_output"
+_RUNTIME_SNAPSHOT_METADATA_KEYS = frozenset(
+    {
+        "_moduagent_agent_fingerprint",
+        "_moduagent_engine",
+        "_moduagent_engine_id",
+        "_moduagent_engine_state_version",
+        "_moduagent_event_sequence",
+        "_moduagent_resume_safety",
+        "_moduagent_runtime_version",
+        "_moduagent_terminal_reason",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -534,6 +548,117 @@ class RunCheckpoint:
         }
 
 
+def _build_run_snapshot(
+    context: RunContext,
+    engine: EngineSnapshot,
+    *,
+    compatibility_policy_state: Mapping[str, Any],
+    agent_fingerprint: str | None = None,
+    updated_at: datetime | None = None,
+) -> RunSnapshot:
+    """Build a current v4 snapshot without round-tripping through legacy v3.
+
+    The legacy :class:`RunCheckpoint` facade remains authoritative for old
+    ``CheckpointStore.save()`` adapters and v1-v3 reads. SnapshotStore writes
+    already have an explicit EngineSnapshot, so rebuilding that state through
+    the legacy Plan facade only adds copies and validation work.
+    """
+
+    if not isinstance(context, RunContext):
+        raise TypeError("context must be a RunContext")
+    if not isinstance(engine, EngineSnapshot):
+        raise TypeError("engine must be an EngineSnapshot")
+    if not isinstance(compatibility_policy_state, Mapping):
+        raise TypeError("compatibility_policy_state must be a mapping")
+
+    compatibility_state = dict(compatibility_policy_state)
+    messages = tuple(
+        message.to_dict()
+        for message in context.messages
+        if not _ephemeral_protocol_message(message)
+    )
+    new_messages = tuple(
+        message.to_dict()
+        for message in context.new_messages
+        if not _ephemeral_protocol_message(message)
+    )
+    internal_messages = tuple(
+        message.to_dict()
+        for message in context.internal_messages
+        if not _ephemeral_protocol_message(message)
+    )
+    current_run_start = sum(
+        not _ephemeral_protocol_message(message)
+        for message in context.messages[: context.current_run_start]
+    )
+    terminal_reason = context.metadata.get("_moduagent_terminal_reason")
+    raw_metadata = {
+        key: value
+        for key, value in context.metadata.items()
+        if key not in _RUNTIME_SNAPSHOT_METADATA_KEYS
+    }
+    markers = _compatibility_markers(
+        None,
+        compatibility_state,
+        engine_state=engine.state,
+    )
+    common_state = CommonRunState(
+        request={
+            "input": context.request.input,
+            "user_context": dict(context.request.user_context),
+            "requested_skills": list(context.request.requested_skills),
+            "skill_mode": context.request.skill_mode,
+        },
+        messages=messages,
+        new_messages=new_messages,
+        internal_messages=internal_messages,
+        status=context.status.value,
+        step=context.step,
+        tool_call_count=context.tool_call_count,
+        usage={
+            "input_tokens": context.usage.input_tokens,
+            "output_tokens": context.usage.output_tokens,
+            "total_tokens": context.usage.total_tokens,
+            "provider": dict(context.usage.provider),
+        },
+        current_run_start=current_run_start,
+        compatibility_policy_state=compatibility_state,
+        terminal_reason=(None if terminal_reason is None else str(terminal_reason)),
+        resume_safety=str(
+            context.metadata.get("_moduagent_resume_safety", "resumable")
+        ),
+        event_sequence=int(context.metadata.get("_moduagent_event_sequence", 0)),
+    )
+    resolved_fingerprint = (
+        agent_fingerprint
+        if isinstance(agent_fingerprint, str) and agent_fingerprint
+        else str(
+            context.metadata.get(
+                "_moduagent_agent_fingerprint",
+                "legacy-unbound",
+            )
+        )
+    )
+    return RunSnapshot(
+        runtime_version=str(
+            context.metadata.get(
+                "_moduagent_runtime_version",
+                current_runtime_version(),
+            )
+        ),
+        run_id=context.run_id,
+        session_id=context.request.session_id,
+        agent_fingerprint=resolved_fingerprint,
+        engine=engine,
+        common_state=common_state,
+        finalization_markers=markers,
+        skill_state=context.skill_state.to_dict(),
+        sanitized_runtime_metadata=_sanitize_runtime_metadata(raw_metadata),
+        created_at=context.created_at,
+        updated_at=updated_at or datetime.now(timezone.utc),
+    )
+
+
 @runtime_checkable
 class CheckpointStore(Protocol):
     async def load(self, run_id: str) -> RunCheckpoint | None: ...
@@ -785,10 +910,7 @@ async def _redis_set(
 
 
 async def _call(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    result = function(*args, **kwargs)
-    if inspect.isawaitable(result):
-        return await result
-    return result
+    return await call_maybe_async(function, *args, **kwargs)
 
 
 def _coerce_snapshot(

@@ -1,3 +1,13 @@
+from moduagent.observability.diagnostics import (
+    CompositeDiagnosticSink,
+    DiagnosticFrame,
+    DiagnosticReporter,
+    DiagnosticSink,
+    FailureDiagnostic,
+    InMemoryDiagnosticSink,
+    LoggingDiagnosticSink,
+    NoopDiagnosticSink,
+)
 from moduagent.observability.sinks import (
     AuditEventSink,
     CompositeEventSink,
@@ -14,13 +24,21 @@ from moduagent.observability.sinks import (
 
 __all__ = [
     "AuditEventSink",
+    "CompositeDiagnosticSink",
     "CompositeEventSink",
     "DEFAULT_SENSITIVE_KEYS",
+    "DiagnosticFrame",
+    "DiagnosticReporter",
+    "DiagnosticSink",
     "EventSink",
+    "FailureDiagnostic",
+    "InMemoryDiagnosticSink",
     "InMemoryMetricRecorder",
+    "LoggingDiagnosticSink",
     "LoggingEventSink",
     "MetricRecorder",
     "MetricsEventSink",
+    "NoopDiagnosticSink",
     "NoopEventSink",
     "event_to_dict",
     "mask_sensitive",

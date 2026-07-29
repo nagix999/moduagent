@@ -118,6 +118,7 @@ def test_failure_classifier_maps_to_legacy_result_and_safe_outcome() -> None:
     assert result.error.message == "Revise the filter expression."
     assert outcome.failure_count == 1
     assert outcome.failures[0].diagnostic_ref == "RuntimeError"
+    assert outcome.failures[0].failure_id is None
     assert outcome.sanitized_failure_views[0].message == "Revise the filter expression."
     assert secret not in str(outcome.sanitized_failure_views[0].to_dict())
 
@@ -151,6 +152,7 @@ def test_failure_projector_bounds_data_and_drops_internal_diagnostics() -> None:
     assert "\x00" not in str(payload)
     assert "\n" not in str(payload)
     assert "PRIVATE-DIAGNOSTIC" not in str(payload)
+    assert failure.failure_id is None
 
 
 def test_failure_classification_requires_machine_readable_reason() -> None:

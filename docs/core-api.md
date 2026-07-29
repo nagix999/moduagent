@@ -5,7 +5,7 @@
 ## 설치
 
 ```bash
-python -m pip install moduagent==0.4.0
+python -m pip install moduagent==0.4.2
 ```
 
 Python 3.10 이상이 필요합니다. Redis adapter를 사용하면 `redis` 패키지도 설치합니다.
@@ -58,6 +58,9 @@ asyncio.run(main())
 ```
 
 `execution_profile`을 생략해도 Standard가 기본값입니다. Standard의 일반 호출 수와 최종화 규칙은 0.3.2 동작을 유지합니다.
+`pd.read_sql`처럼 blocking I/O를 수행하는 동기 Tool은 운영 환경에서
+`SyncToolScheduler`를 공유하도록 설정하세요. 자세한 구성은
+[Operations](operations.md)를 참고합니다.
 
 ## Plan-and-Execute Agent
 
@@ -174,6 +177,8 @@ agent = Agent(
 ```
 
 `Agent.stream()`은 공개 이벤트만 전달합니다. strict Plan의 내부 단계와 진단 이벤트가 필요할 때만 `Agent.stream_all()`을 사용하세요. Memory 정책은 모델에 전달하는 view만 제한하며 저장된 대화 원문을 수정하지 않습니다.
+정확한 원격 tokenizer를 반복 호출하면 `CachingTokenCounter`로
+`VLLMTokenCounter`를 감싸 bounded TTL/LRU cache를 적용할 수 있습니다.
 
 ## 다음 문서
 

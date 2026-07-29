@@ -30,6 +30,24 @@ config = AgentConfig(
 
 `pd.read_sql` 같은 동기 함수는 worker thread에서 실행됩니다. 프레임워크 timeout이 발생해도 이미 실행 중인 Python thread나 DB query를 강제로 중단할 수 없습니다.
 
+동기 도구가 여러 개라면 bounded scheduler를 공유합니다.
+
+```python
+from moduagent import SyncToolScheduler, function_tool
+
+db_workers = SyncToolScheduler(max_workers=8, max_queue=32)
+
+@function_tool(sync_scheduler=db_workers, timeout_seconds=10)
+def query_db(sql: str) -> list[dict]:
+    return run_read_only_query(sql)
+```
+
+대기열이 가득 차면 `SyncToolSchedulerOverloaded`로 빠르게 실패합니다.
+취소되거나 timeout된 작업도 실제 함수가 반환할 때까지 worker capacity를
+차지하므로 DB 자체 timeout이 반드시 필요합니다. 동기 Redis/DB persistence
+adapter도 0.4.2부터 공용 bounded worker에서 실행되어 event loop를 막지
+않습니다.
+
 - DB driver의 query/connection timeout을 설정합니다.
 - 서버 측 statement timeout과 query resource limit을 설정합니다.
 - 쓰기 Tool에는 application idempotency key와 중복 방어를 구현합니다.
@@ -110,9 +128,30 @@ events = CompositeEventSink(
 
 이벤트 sink 실패는 run을 실패시키지 않습니다. 각 이벤트는 run 안에서 단조 증가하는 sequence와 event/session/Engine 식별자를 가지므로 소비자는 `(run_id, sequence)` 또는 `event_id`로 중복을 방어할 수 있습니다.
 
+0.4.2의 내장 metric은 다음 성능 구간을 분리합니다.
+
+| metric | 의미 |
+|---|---|
+| `moduagent.model.calls{phase}` | PLAN/ACT/STEP_RESULT/FINALIZE 등의 모델 호출 수 |
+| `moduagent.model.duration_seconds{phase}` | 성공한 모델 호출 시간 |
+| `moduagent.memory.prepare_seconds{phase}` | compact된 요청의 토큰 계산·요약 시간 |
+| `moduagent.tool.duration_seconds{tool}` | 도구 실행 시간 |
+| `moduagent.checkpoint.duration_seconds` | durable snapshot 저장 시간 |
+| `moduagent.run.queue_wait_seconds` | 같은 세션 직렬화 대기 시간 |
+| `moduagent.run.duration_seconds{status}` | 전체 run 시간 |
+
+Noop sink는 queue와 deepcopy를 만들지 않습니다. 다른 sink의 전달 queue와
+Runtime 내부 이벤트 handoff는 bounded이며, 가득 차면 메모리를 계속 늘리는
+대신 실행에 backpressure를 적용합니다.
+
 기본 public stream에는 사용자에게 필요한 token과 terminal result만 전달됩니다. Plan phase, Tool, recovery, checkpoint 진단은 `stream_all()` 또는 내부 sink에서 확인합니다. `stream_all()` 역시 JSON-safe 최소 projection이며 원본 exception, Tool 결과, provider metadata를 제공하지 않습니다.
 
 `RUN_FAILED`만 보인다면 terminal result의 안전한 오류와 내부 sink의 직전 이벤트를 함께 확인합니다. `RUN_STARTED` 다음 즉시 실패하면 구성 capability, checkpoint 호환성, 첫 모델 요청 전 Memory overflow를 우선 점검합니다.
+
+0.4.1부터는 선택적인 `DiagnosticSink`를 설정하여 terminal
+`result.failure_id`나 도구 추적의 `failure_id`로 정제된 예외 원인을 연결할 수
+있습니다. 원본 예외, SQL, 프롬프트, 도구 입출력은 수집하지 않습니다. 구성과
+운영 보안 지침은 [진단 가이드](diagnostics.md)를 참고하세요.
 
 ## Tool trace와 민감정보
 
@@ -143,6 +182,7 @@ events = CompositeEventSink(
 - Conversation·checkpoint TTL, backup, 암호화, tenant 격리 확인
 - v3 fixture의 v4 migration과 resume 테스트
 - public/internal event 분리와 sink 장애 격리 테스트
+- `python benchmarks/performance_v042.py --pretty` 기준 결과 보관 및 비교
 - 쓰기 Tool idempotency key와 downstream 중복 방어 확인
 - 프로세스 내부 session lock에 의존하지 않는 분산 동시성 제어
 

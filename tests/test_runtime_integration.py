@@ -1000,6 +1000,8 @@ def test_same_session_is_serialized_but_different_sessions_can_overlap() -> None
             "answer:first",
             "second",
         ]
+        assert agent.runtime._session_locks == {}
+        assert agent.runtime._session_lock_users == {}
 
         model.max_active = 0
         await asyncio.gather(
@@ -1007,6 +1009,8 @@ def test_same_session_is_serialized_but_different_sessions_can_overlap() -> None
             agent.run("b", session_id="session-b"),
         )
         assert model.max_active == 2
+        assert agent.runtime._session_locks == {}
+        assert agent.runtime._session_lock_users == {}
 
     asyncio.run(scenario())
 

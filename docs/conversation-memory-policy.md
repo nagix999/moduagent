@@ -181,6 +181,31 @@ class TokenCounter(Protocol):
 
 운영 환경에서는 실제 모델 tokenizer를 사용한다. 제공되는 `VLLMTokenCounter`는 vLLM의 chat 메시지와 Tool을 받는 `/tokenize` API를 사용한다. 로컬 휴리스틱은 `ApproximateTokenCounter`로 명확히 이름 붙이고 큰 safety margin을 적용한다.
 
+동일한 요청이 여러 실행 단계에서 반복되면 exact tokenizer 호출도 재사용할 수
+있다. `CachingTokenCounter`는 delegate의 계산 방식을 바꾸지 않으며, 성공한
+결과만 bounded LRU에 저장하고 동시에 들어온 동일 요청은 하나의 호출로
+합친다.
+
+```python
+from moduagent.memory import CachingTokenCounter, VLLMTokenCounter
+
+token_counter = CachingTokenCounter(
+    VLLMTokenCounter(model),
+    max_entries=2_048,
+    ttl_seconds=300,
+)
+```
+
+cache key에는 전체 `ModelRequest`의 메시지, Tool schema, output schema,
+options, provider options가 포함된다. 프로세스별 keyed digest만 저장하므로
+원문 prompt나 Tool 인자는 cache에 남지 않는다. 실패나 취소 결과는 저장하지
+않으며 `max_entries`를 넘으면 가장 오래 사용하지 않은 항목부터 제거한다.
+vLLM의 exact count 의미는 delegate가 그대로 결정한다.
+
+`TokenBudgetConversationMemoryPolicy`도 한 번의 `prepare()` 안에서 이미 계산한
+동일 요청을 임시로 재사용한다. 이 request-local memo는 `prepare()`가 끝나면
+폐기되며, 최종 선택 view가 이미 검증된 경우 같은 요청을 다시 계산하지 않는다.
+
 - vLLM context limit: <https://docs.vllm.ai/en/stable/features/context_extension/>
 - vLLM tokenizer API: <https://docs.vllm.ai/en/stable/serving/openai_compatible_server/>
 

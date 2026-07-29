@@ -12,6 +12,8 @@ from moduagent.decision.planning import (
     ExecutionState,
     PlanAndExecutePolicy,
     PlanStep,
+    _STEP_VALIDATION_CODES,
+    _STEP_VALIDATION_LOCATIONS,
 )
 from moduagent.execution.base import (
     CodecBackedEngine,
@@ -307,7 +309,6 @@ class PlanExecutionEngine(CodecBackedEngine[PlanEngineState]):
                     DurableBoundary.REPAIR_SCHEDULED,
                 )
                 state.phase = PlanExecutionPhase.ACT_TOOL
-                self._sync_legacy(context, state)
                 continue
 
             if state.phase is PlanExecutionPhase.VERIFY:
@@ -315,12 +316,10 @@ class PlanExecutionEngine(CodecBackedEngine[PlanEngineState]):
                 self._sync_legacy(context, state)
                 self.policy.begin_finalization(context.run)
                 state = self._pull_state(context, state)
-                await self._checkpoint(
-                    context,
-                    state,
-                    services,
-                    DurableBoundary.FINALIZATION_STARTED,
-                )
+                # _finalize() owns the FINALIZATION_STARTED barrier for both
+                # fresh and resumed FINALIZE states. There is no await or public
+                # emission before that barrier, so saving it here as well only
+                # writes the same state twice.
                 continue
 
             if state.phase is PlanExecutionPhase.FINALIZE:
@@ -441,6 +440,11 @@ class PlanExecutionEngine(CodecBackedEngine[PlanEngineState]):
                 continue
 
             if decision.kind is DecisionKind.RETRY_STEP:
+                validation_failure = self._validation_failure(
+                    decision.metadata,
+                    state,
+                    step,
+                )
                 event = AgentEvent(
                     EventType.STEP_RETRY,
                     context.run.run_id,
@@ -451,6 +455,23 @@ class PlanExecutionEngine(CodecBackedEngine[PlanEngineState]):
                         "count_attempt": decision.metadata.get(
                             "count_attempt",
                             True,
+                        ),
+                        **(
+                            {}
+                            if validation_failure is None
+                            else {
+                                "validation_code": validation_failure["code"],
+                                "validation_location": validation_failure["location"],
+                                **(
+                                    {
+                                        "validation_cause_code": (
+                                            validation_failure["cause_code"]
+                                        )
+                                    }
+                                    if "cause_code" in validation_failure
+                                    else {}
+                                ),
+                            }
                         ),
                     },
                     visibility=EventVisibility.INTERNAL,
@@ -538,11 +559,50 @@ class PlanExecutionEngine(CodecBackedEngine[PlanEngineState]):
                 continue
 
             if decision.kind is DecisionKind.FAIL:
+                validation_failure = self._validation_failure(
+                    decision.metadata,
+                    state,
+                    step,
+                )
+                yield await self._publish(
+                    context,
+                    services,
+                    AgentEvent(
+                        EventType.STEP_FAILED,
+                        context.run.run_id,
+                        {
+                            "step_id": step.step_id,
+                            "attempt": state.step_execution.step_attempt_count,
+                            "reason": decision.metadata.get("reason"),
+                            **(
+                                {}
+                                if validation_failure is None
+                                else {
+                                    "validation_code": validation_failure["code"],
+                                    "validation_location": (
+                                        validation_failure["location"]
+                                    ),
+                                    **(
+                                        {
+                                            "validation_cause_code": (
+                                                validation_failure["cause_code"]
+                                            )
+                                        }
+                                        if "cause_code" in validation_failure
+                                        else {}
+                                    ),
+                                }
+                            ),
+                        },
+                        visibility=EventVisibility.INTERNAL,
+                    ),
+                )
                 yield EngineEmission(
                     outcome=self._outcome(
                         state,
                         FinishReason.ERROR,
                         error=(decision.error_message or self._failure_message(state)),
+                        validation_failure=validation_failure,
                     )
                 )
                 return
@@ -813,6 +873,11 @@ class PlanExecutionEngine(CodecBackedEngine[PlanEngineState]):
         if (
             observed is not None and observed.kind is DecisionKind.FAIL
         ) or state.phase is PlanExecutionPhase.FAILED:
+            validation_failure = (
+                None
+                if observed is None
+                else self._validation_failure(observed.metadata, state, step)
+            )
             event = AgentEvent(
                 EventType.STEP_FAILED,
                 context.run.run_id,
@@ -820,6 +885,23 @@ class PlanExecutionEngine(CodecBackedEngine[PlanEngineState]):
                     "step_id": step.step_id,
                     "reason": (
                         None if observed is None else observed.metadata.get("reason")
+                    ),
+                    **(
+                        {}
+                        if validation_failure is None
+                        else {
+                            "validation_code": validation_failure["code"],
+                            "validation_location": validation_failure["location"],
+                            **(
+                                {
+                                    "validation_cause_code": (
+                                        validation_failure["cause_code"]
+                                    )
+                                }
+                                if "cause_code" in validation_failure
+                                else {}
+                            ),
+                        }
                     ),
                 },
                 visibility=EventVisibility.INTERNAL,
@@ -834,6 +916,7 @@ class PlanExecutionEngine(CodecBackedEngine[PlanEngineState]):
                         if observed is not None
                         else self._failure_message(state)
                     ),
+                    validation_failure=validation_failure,
                 )
             )
             return
@@ -1349,12 +1432,46 @@ class PlanExecutionEngine(CodecBackedEngine[PlanEngineState]):
         )
 
     @staticmethod
+    def _validation_failure(
+        metadata: Mapping[str, Any],
+        state: PlanEngineState,
+        step: PlanStep,
+    ) -> dict[str, Any] | None:
+        """Project only framework-owned validation codes across the Engine boundary."""
+
+        code = metadata.get("validation_code")
+        location = metadata.get("validation_location")
+        if (
+            not isinstance(code, str)
+            or code not in _STEP_VALIDATION_CODES
+            or not isinstance(location, str)
+            or location not in _STEP_VALIDATION_LOCATIONS
+        ):
+            return None
+        projected: dict[str, Any] = {
+            "code": code,
+            "location": location,
+            "phase": state.phase.value,
+            "step_id": step.step_id,
+            "attempt": max(1, state.step_execution.step_attempt_count),
+        }
+        cause_code = metadata.get("validation_cause_code")
+        if (
+            isinstance(cause_code, str)
+            and cause_code in _STEP_VALIDATION_CODES
+            and cause_code != code
+        ):
+            projected["cause_code"] = cause_code
+        return projected
+
+    @staticmethod
     def _outcome(
         state: PlanEngineState,
         reason: FinishReason,
         *,
         output: Any = None,
         error: str | None = None,
+        validation_failure: Mapping[str, Any] | None = None,
     ) -> EngineOutcome:
         if reason is not FinishReason.COMPLETED:
             state.terminal_finish_reason = reason
@@ -1372,6 +1489,8 @@ class PlanExecutionEngine(CodecBackedEngine[PlanEngineState]):
             metadata["plan_usage"]["tool_repairs"] = state.tool_recovery.total_repairs
         if state.tool_recovery.terminal_failure is not None:
             metadata["failure"] = dict(state.tool_recovery.terminal_failure)
+        if validation_failure is not None:
+            metadata["validation_failure"] = dict(validation_failure)
         return EngineOutcome(
             reason,
             output=output,

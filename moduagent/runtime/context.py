@@ -234,6 +234,12 @@ class RunContext:
         default_factory=lambda: datetime.now(timezone.utc),
         repr=False,
     )
+    # Diagnostics are operational observers, not durable execution state.
+    # Appended after all 0.4.0 fields to preserve positional construction.
+    # They are deliberately absent from checkpoint serializers.
+    diagnostic_reporter: Any | None = field(default=None, repr=False)
+    primary_failure: Mapping[str, Any] | None = field(default=None, repr=False)
+    tool_failure_ids: dict[str, str] = field(default_factory=dict, repr=False)
 
     def add_message(self, message: Message, *, persist: bool = True) -> None:
         self.messages.append(message)
@@ -256,3 +262,13 @@ class AgentResult:
     finish_reason: FinishReason
     error: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def failure_id(self) -> str | None:
+        """Return the terminal failure correlation ID when diagnostics are enabled."""
+
+        summary = self.metadata.get("error_summary")
+        if not isinstance(summary, Mapping):
+            return None
+        value = summary.get("failure_id")
+        return value if isinstance(value, str) and value else None

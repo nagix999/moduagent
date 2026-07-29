@@ -18,6 +18,8 @@ from moduagent.messages import ToolCall
 from moduagent.tools import (
     AgentTool,
     RBACToolAuthorizer,
+    SyncToolScheduler,
+    SyncToolSchedulerOverloaded,
     ToolError,
     ToolErrorType,
     ToolExecutionContext,
@@ -723,6 +725,83 @@ def test_parallel_execution_is_bounded_and_preserves_order() -> None:
 
     assert peak == 2
     assert [result.value for result in results] == list(range(5))
+
+
+def test_sync_tool_scheduler_is_bounded_and_reports_health() -> None:
+    async def scenario() -> None:
+        started = Event()
+        release = Event()
+        scheduler = SyncToolScheduler(max_workers=1, max_queue=0)
+
+        def blocking() -> str:
+            started.set()
+            release.wait(timeout=1)
+            return "done"
+
+        first = asyncio.create_task(scheduler.run(blocking))
+        while not started.is_set():
+            await asyncio.sleep(0)
+
+        with pytest.raises(SyncToolSchedulerOverloaded, match="capacity"):
+            await scheduler.run(lambda: "rejected")
+
+        release.set()
+        assert await first == "done"
+        stats = scheduler.stats()
+        assert stats.workers == 1
+        assert stats.running == 0
+        assert stats.queued == 0
+        assert stats.submitted == 1
+        assert stats.completed == 1
+        assert stats.rejected == 1
+
+    run(scenario())
+
+
+def test_zero_queue_scheduler_accepts_each_worker_slot() -> None:
+    async def scenario() -> None:
+        all_started = Event()
+        release = Event()
+        started: list[int] = []
+        scheduler = SyncToolScheduler(max_workers=2, max_queue=0)
+
+        def blocking(value: int) -> int:
+            started.append(value)
+            if len(started) == 2:
+                all_started.set()
+            release.wait(timeout=1)
+            return value
+
+        first = asyncio.create_task(scheduler.run(lambda: blocking(1)))
+        second = asyncio.create_task(scheduler.run(lambda: blocking(2)))
+        while not all_started.is_set():
+            await asyncio.sleep(0)
+
+        with pytest.raises(SyncToolSchedulerOverloaded, match="capacity"):
+            await scheduler.run(lambda: 3)
+
+        release.set()
+        assert sorted(await asyncio.gather(first, second)) == [1, 2]
+
+    run(scenario())
+
+
+def test_function_tool_can_use_bounded_sync_scheduler() -> None:
+    scheduler = SyncToolScheduler(max_workers=1, max_queue=1)
+
+    @function_tool(sync_scheduler=scheduler)
+    def scheduled_add(a: int, b: int) -> int:
+        return a + b
+
+    result = run(
+        ToolExecutor([scheduled_add]).execute(
+            ToolCall("scheduled-1", "scheduled_add", {"a": 2, "b": 3})
+        )
+    )
+
+    assert result.success is True
+    assert result.value == 5
+    assert scheduler.stats().completed == 1
 
 
 def test_registry_rejects_duplicates_and_unknown_tool_is_structured() -> None:

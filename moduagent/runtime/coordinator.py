@@ -9,7 +9,7 @@ import re
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from contextlib import suppress
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -22,6 +22,7 @@ from moduagent.errors import (
     MemoryError as FrameworkMemoryError,
     ModelInvocationError,
     ModuAgentError,
+    OutputValidationError,
     PersistenceError,
     SkillError as FrameworkSkillError,
     StateMigrationError,
@@ -45,6 +46,11 @@ from moduagent.memory import (
     MemoryIntegrityError,
 )
 from moduagent.models import ModelCapabilities
+from moduagent.observability._background import run_in_daemon_thread
+from moduagent.observability.sinks import (
+    _event_sink_is_noop,
+    _event_sink_requires_coordinator_copy,
+)
 from moduagent.persistence import RunCheckpoint, RunSnapshot
 from moduagent.runtime.context import (
     AgentResult,
@@ -68,6 +74,25 @@ _RUN_ID_METADATA_KEY = "moduagent.run_id"
 _ENGINE_SNAPSHOT_POLICY_KEY = "_moduagent_engine_snapshot"
 _ENGINE_INITIALIZED_POLICY_KEY = "_moduagent_engine_initialized"
 _TERMINAL_EVENT_TYPES = frozenset({EventType.RUN_COMPLETED, EventType.RUN_FAILED})
+_ENGINE_OUTCOME_RUNTIME_METADATA_KEYS = frozenset(
+    {"failure", "plan", "plan_usage", "validation_failure"}
+)
+_STEP_VALIDATION_CODES = frozenset(
+    {
+        "step_result_incomplete",
+        "step_result_tool_call_forbidden",
+        "step_result_tool_call_invalid",
+        "step_result_required",
+        "step_result_schema_invalid",
+        "step_result_id_mismatch",
+        "step_result_max_attempts_exceeded",
+        "step_validation_state_incomplete",
+        "step_validator_failed",
+        "step_validation_rejected",
+        "step_validation_max_attempts_exceeded",
+    }
+)
+_STEP_VALIDATION_LOCATIONS = frozenset({"act", "step_result", "step_validator"})
 _PUBLIC_STREAM_EVENT_TYPES = frozenset(
     {
         EventType.MODEL_DELTA,
@@ -78,6 +103,7 @@ _PUBLIC_STREAM_EVENT_TYPES = frozenset(
 _EVENT_SINK_TIMEOUT_SECONDS = 0.25
 _EVENT_SINK_MIN_DRAIN_SECONDS = 1.0
 _EVENT_SINK_MAX_DRAIN_SECONDS = 15.0
+_EVENT_SINK_QUEUE_MAX_SIZE = 1_024
 _DESCRIPTOR_SENSITIVE_KEYS = frozenset(
     {
         "api_key",
@@ -111,6 +137,56 @@ _DESCRIPTOR_SENSITIVE_SUFFIXES = (
     "_token",
 )
 _DESCRIPTOR_HEADER_KEYS = frozenset({"header", "headers", "http_headers"})
+
+
+def _consume_task_result(task: asyncio.Task[Any]) -> None:
+    """Retrieve a detached observability task result without surfacing it."""
+
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except BaseException:
+        pass
+
+
+@dataclass(frozen=True, slots=True)
+class _PublishedEventStamp:
+    """Small compatibility record that never retains an event payload."""
+
+    event_schema_version: int
+    visibility: EventVisibility
+    session_id: str | None
+    engine_id: str | None
+    sequence: int
+
+    @classmethod
+    def from_event(cls, event: AgentEvent) -> "_PublishedEventStamp":
+        return cls(
+            event_schema_version=event.event_schema_version,
+            visibility=event.visibility,
+            session_id=event.session_id,
+            engine_id=event.engine_id,
+            sequence=event.sequence,
+        )
+
+    def apply(self, event: AgentEvent) -> AgentEvent:
+        if (
+            event.event_schema_version == self.event_schema_version
+            and event.visibility is self.visibility
+            and event.session_id == self.session_id
+            and event.engine_id == self.engine_id
+            and event.sequence == self.sequence
+        ):
+            return event
+        return replace(
+            event,
+            event_schema_version=self.event_schema_version,
+            visibility=self.visibility,
+            session_id=self.session_id,
+            engine_id=self.engine_id,
+            sequence=self.sequence,
+        )
 
 
 def _normalize_descriptor_key(value: str) -> str:
@@ -220,7 +296,7 @@ class RunCoordinator(AgentRuntime):
         # counters or event identity.
         self._event_publishers: dict[str, EventPublisher] = {}
         self._coordinator_contexts: dict[str, RunContext] = {}
-        self._published_events: dict[tuple[str, str], AgentEvent] = {}
+        self._published_events: dict[tuple[str, str], _PublishedEventStamp] = {}
         self._reserved_events: dict[tuple[str, str], AgentEvent] = {}
         self._sink_queues: dict[str, asyncio.Queue[AgentEvent]] = {}
         self._sink_workers: dict[str, asyncio.Task[None]] = {}
@@ -287,36 +363,39 @@ class RunCoordinator(AgentRuntime):
         )
         self._event_publishers[run_id] = publisher
         self._coordinator_contexts[run_id] = context
+        context.diagnostic_reporter = self.diagnostic_reporter
         context.metadata["_moduagent_engine_id"] = self.engine.engine_id
         context.metadata["_moduagent_engine_state_version"] = self.engine.state_version
         context.metadata["_moduagent_event_sequence"] = initial_sequence
         self._attach_agent_fingerprint(context)
 
-        started = await self._publish(
-            AgentEvent(
-                EventType.RUN_STARTED,
-                run_id,
-                {
-                    "agent": self.config.name,
-                    "session_id": request.session_id,
-                    "user_context": dict(request.user_context),
-                },
-            )
-        )
-        yield started
-
-        engine_context = EngineContext(
-            run=context,
-            config=self.config,
-            stream_model=stream_model,
-            resolved_spec=self._engine_spec(),
-            model_capabilities=self._model_capabilities(),
-        )
         services = RuntimeServices(self, deadline)
-        services.bind(engine_context)
+        engine_context: EngineContext | None = None
         state: Any = None
 
         try:
+            started = await self._publish(
+                AgentEvent(
+                    EventType.RUN_STARTED,
+                    run_id,
+                    {
+                        "agent": self.config.name,
+                        "session_id": request.session_id,
+                        "user_context": dict(request.user_context),
+                        "queue_wait_seconds": self._session_queue_wait_seconds(),
+                    },
+                )
+            )
+            yield started
+
+            engine_context = EngineContext(
+                run=context,
+                config=self.config,
+                stream_model=stream_model,
+                resolved_spec=self._engine_spec(),
+                model_capabilities=self._model_capabilities(),
+            )
+            services.bind(engine_context)
             if setup_error is not None:
                 raise setup_error
 
@@ -434,11 +513,11 @@ class RunCoordinator(AgentRuntime):
                             raise ExecutionInvariantError(
                                 "ExecutionEngine emitted an event for another run"
                             )
-                        published = self._published_events.get(
-                            (run_id, emission.event.event_id)
-                        )
-                        if published is None:
+                        published_key = (run_id, emission.event.event_id)
+                        if published_key not in self._published_events:
                             published = await self._publish(emission.event)
+                        else:
+                            published = self._published_event(emission.event)
                         yield published
                         for pending in services.drain_after_events():
                             yield pending
@@ -479,6 +558,7 @@ class RunCoordinator(AgentRuntime):
                 outcome,
                 deadline,
             )
+            await self._flush_diagnostics_safely(run_id)
             terminal = await self._publish_terminal(
                 AgentEvent(event_type, run_id, {"result": result})
             )
@@ -497,13 +577,14 @@ class RunCoordinator(AgentRuntime):
             self._normalize_skill_resource_messages(context)
             if cleanup_writes_allowed:
                 await asyncio.shield(self._persist_safely(context))
-                await asyncio.shield(
-                    self._checkpoint_state_safely(
-                        engine_context,
-                        services,
-                        state,
+                if engine_context is not None:
+                    await asyncio.shield(
+                        self._checkpoint_state_safely(
+                            engine_context,
+                            services,
+                            state,
+                        )
                     )
-                )
             raise
         except asyncio.CancelledError:
             context.status = RunStatus.CANCELLED
@@ -513,45 +594,48 @@ class RunCoordinator(AgentRuntime):
             self._normalize_skill_resource_messages(context)
             if cleanup_writes_allowed:
                 await self._persist_safely(context)
-                await self._checkpoint_state_safely(
-                    engine_context,
-                    services,
-                    state,
-                )
+                if engine_context is not None:
+                    await self._checkpoint_state_safely(
+                        engine_context,
+                        services,
+                        state,
+                    )
             raise
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             context.status = RunStatus.FAILED
             context.metadata["_moduagent_terminal_reason"] = FinishReason.TIMEOUT.value
+            diagnostic = await self._capture_terminal_failure(context, exc)
             self._normalize_skill_resource_messages(context)
             if cleanup_writes_allowed:
                 await self._persist_safely(context)
-                await self._checkpoint_state_safely(
-                    engine_context,
-                    services,
-                    state,
-                )
+                if engine_context is not None:
+                    await self._checkpoint_state_safely(
+                        engine_context,
+                        services,
+                        state,
+                    )
             result = self._result(
                 context,
                 FinishReason.TIMEOUT,
                 error="run timed out",
             )
-            result = self._with_error_summary(
-                result,
-                {
-                    "category": "timeout",
-                    "code": "run_timeout",
-                    "retryable": True,
-                    "resumable": self._is_safely_resumable(context),
-                },
-            )
+            summary = {
+                "category": "timeout",
+                "code": "run_timeout",
+                "retryable": True,
+                "resumable": self._is_safely_resumable(context),
+            }
+            summary.update(diagnostic)
+            result = self._with_error_summary(result, summary)
             for pending in services.drain_events():
                 yield pending
             for pending in services.drain_after_events():
                 yield pending
+            await self._flush_diagnostics_safely(run_id)
             terminal = await self._publish_terminal(
                 AgentEvent(EventType.RUN_FAILED, run_id, {"result": result})
             )
-            if cleanup_writes_allowed:
+            if cleanup_writes_allowed and engine_context is not None:
                 await self._checkpoint_state_safely(
                     engine_context,
                     services,
@@ -561,31 +645,33 @@ class RunCoordinator(AgentRuntime):
         except Exception as exc:
             context.status = RunStatus.FAILED
             context.metadata["_moduagent_terminal_reason"] = FinishReason.ERROR.value
+            diagnostic = await self._capture_terminal_failure(context, exc)
             self._normalize_skill_resource_messages(context)
             if cleanup_writes_allowed:
                 await self._persist_safely(context)
-                await self._checkpoint_state_safely(
-                    engine_context,
-                    services,
-                    state,
-                )
+                if engine_context is not None:
+                    await self._checkpoint_state_safely(
+                        engine_context,
+                        services,
+                        state,
+                    )
             result = self._result(
                 context,
                 FinishReason.ERROR,
                 error=self._public_error(exc),
             )
-            result = self._with_error_summary(
-                result,
-                self._error_summary(exc, context=context),
-            )
+            summary = dict(self._error_summary(exc, context=context))
+            summary.update(diagnostic)
+            result = self._with_error_summary(result, summary)
             for pending in services.drain_events():
                 yield pending
             for pending in services.drain_after_events():
                 yield pending
+            await self._flush_diagnostics_safely(run_id)
             terminal = await self._publish_terminal(
                 AgentEvent(EventType.RUN_FAILED, run_id, {"result": result})
             )
-            if cleanup_writes_allowed:
+            if cleanup_writes_allowed and engine_context is not None:
                 await self._checkpoint_state_safely(
                     engine_context,
                     services,
@@ -594,6 +680,19 @@ class RunCoordinator(AgentRuntime):
             yield terminal
         finally:
             await self._close_sink_worker(run_id)
+            await self._flush_diagnostics_safely(run_id)
+            clear_diagnostics = getattr(
+                self.diagnostic_reporter,
+                "clear_run",
+                None,
+            )
+            if callable(clear_diagnostics):
+                try:
+                    cleared = clear_diagnostics(run_id)
+                    if inspect.isawaitable(cleared):
+                        await cleared
+                except Exception:
+                    pass
             self._event_publishers.pop(run_id, None)
             self._coordinator_contexts.pop(run_id, None)
             stale = [key for key in self._published_events if key[0] == run_id]
@@ -602,6 +701,21 @@ class RunCoordinator(AgentRuntime):
             stale_reserved = [key for key in self._reserved_events if key[0] == run_id]
             for key in stale_reserved:
                 self._reserved_events.pop(key, None)
+
+    async def _flush_diagnostics_safely(self, run_id: str) -> None:
+        flush_diagnostics = getattr(
+            self.diagnostic_reporter,
+            "flush_run",
+            None,
+        )
+        if not callable(flush_diagnostics):
+            return
+        try:
+            flushed = flush_diagnostics(run_id)
+            if inspect.isawaitable(flushed):
+                await flushed
+        except Exception:
+            pass
 
     async def _load_resume(
         self,
@@ -703,6 +817,10 @@ class RunCoordinator(AgentRuntime):
         outcome: EngineOutcome,
         deadline: float,
     ) -> tuple[AgentResult, EventType]:
+        outcome = replace(
+            outcome,
+            metadata=self._project_outcome_metadata(outcome.metadata),
+        )
         failed = outcome.finish_reason in {
             FinishReason.ERROR,
             FinishReason.TIMEOUT,
@@ -745,10 +863,32 @@ class RunCoordinator(AgentRuntime):
         metadata = dict(base.metadata)
         metadata.update(dict(outcome.metadata))
         if failed:
-            metadata.setdefault(
-                "error_summary",
-                self._outcome_error_summary(outcome, context=context.run),
-            )
+            summary = dict(self._outcome_error_summary(outcome, context=context.run))
+            primary_failure = context.run.primary_failure
+            if isinstance(primary_failure, Mapping):
+                summary.update(dict(primary_failure))
+            else:
+                tool_failure = outcome.metadata.get("failure")
+                if isinstance(tool_failure, Mapping):
+                    call_id = tool_failure.get("call_id")
+                    failure_id = (
+                        context.run.tool_failure_ids.get(call_id)
+                        if isinstance(call_id, str)
+                        else None
+                    )
+                    if failure_id:
+                        phase, step_id, attempt = self._diagnostic_location(context.run)
+                        summary.update(
+                            {
+                                "failure_id": failure_id,
+                                "component": "tool",
+                                "operation": "invoke",
+                                **({} if phase is None else {"phase": phase}),
+                                **({} if step_id is None else {"step_id": step_id}),
+                                **({} if attempt is None else {"attempt": attempt}),
+                            }
+                        )
+            metadata["error_summary"] = summary
         result = (
             base
             if metadata == dict(base.metadata)
@@ -758,6 +898,71 @@ class RunCoordinator(AgentRuntime):
             result,
             EventType.RUN_FAILED if failed else EventType.RUN_COMPLETED,
         )
+
+    @staticmethod
+    def _project_outcome_metadata(
+        metadata: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        projected: dict[str, Any] = {}
+        for key, value in metadata.items():
+            if not isinstance(key, str):
+                continue
+            if (
+                is_runtime_owned_metadata_key(key)
+                and key not in _ENGINE_OUTCOME_RUNTIME_METADATA_KEYS
+            ):
+                continue
+            if key == "validation_failure":
+                safe_validation = RunCoordinator._project_validation_failure(value)
+                if safe_validation is not None:
+                    projected[key] = safe_validation
+                continue
+            projected[key] = value
+        return projected
+
+    @staticmethod
+    def _project_validation_failure(value: Any) -> Mapping[str, Any] | None:
+        if not isinstance(value, Mapping):
+            return None
+        code = value.get("code")
+        location = value.get("location")
+        if (
+            not isinstance(code, str)
+            or code not in _STEP_VALIDATION_CODES
+            or not isinstance(location, str)
+            or location not in _STEP_VALIDATION_LOCATIONS
+        ):
+            return None
+        projected: dict[str, Any] = {
+            "code": code,
+            "location": location,
+        }
+        cause_code = value.get("cause_code")
+        if (
+            isinstance(cause_code, str)
+            and cause_code in _STEP_VALIDATION_CODES
+            and cause_code != code
+        ):
+            projected["cause_code"] = cause_code
+        phase = value.get("phase")
+        if isinstance(phase, str) and phase in {
+            "act_tool",
+            "failed",
+            "step_result",
+            "step_validate",
+        }:
+            projected["phase"] = phase
+        step_id = value.get("step_id")
+        if (
+            isinstance(step_id, str)
+            and 0 < len(step_id) <= 256
+            and all(character.isprintable() for character in step_id)
+        ):
+            projected["step_id"] = step_id
+        attempt = value.get("attempt")
+        if type(attempt) is int and 0 <= attempt <= 1_000_000:
+            projected["attempt"] = attempt
+        return projected
 
     async def _checkpoint_state_safely(
         self,
@@ -816,6 +1021,9 @@ class RunCoordinator(AgentRuntime):
         )
         metadata = {
             "agent": self.config.name,
+            "_moduagent_session_queue_wait_seconds": (
+                self._session_queue_wait_seconds()
+            ),
             **{
                 key: value
                 for key, value in self.config.metadata.items()
@@ -908,6 +1116,10 @@ class RunCoordinator(AgentRuntime):
             return "checkpoint not found"
         if isinstance(error, PersistenceError):
             return "persistence operation failed"
+        if isinstance(error, OutputValidationError):
+            # Keep the 0.4.0 public string stable; structured diagnostics carry
+            # the more precise output-validation classification.
+            return "run failed"
         if isinstance(error, FrameworkMemoryError) and not isinstance(
             error,
             (ConversationMemoryOverflowError, MemoryIntegrityError),
@@ -943,6 +1155,8 @@ class RunCoordinator(AgentRuntime):
         elif isinstance(error, ModelInvocationError):
             category, code = "model_invocation", "model_invocation_failed"
             retryable = True
+        elif isinstance(error, OutputValidationError):
+            category, code = "output_validation", "output_validation_failed"
         elif isinstance(error, ToolAuthorizationError):
             category, code = "tool_authorization", "tool_authorization_failed"
         elif isinstance(error, ToolValidationError):
@@ -974,6 +1188,153 @@ class RunCoordinator(AgentRuntime):
             "resumable": resumable,
         }
 
+    async def _capture_terminal_failure(
+        self,
+        context: RunContext,
+        error: BaseException,
+    ) -> Mapping[str, Any]:
+        existing = context.primary_failure
+        if (
+            isinstance(existing, Mapping)
+            and isinstance(existing.get("failure_id"), str)
+            and existing["failure_id"]
+        ):
+            return dict(existing)
+
+        reporter = self.diagnostic_reporter
+        capture = getattr(reporter, "capture_exception", None)
+        if not callable(capture):
+            return {}
+
+        component, operation = self._diagnostic_operation(error)
+        phase, step_id, attempt = self._diagnostic_location(context)
+        summary = dict(self._error_summary_for_diagnostic(error, context))
+        capture_options: dict[str, Any] = {}
+        if isinstance(error, OutputValidationError):
+            validation_fields = self._output_validation_fields()
+            if validation_fields:
+                capture_options["validation_fields"] = validation_fields
+        try:
+            failure_id = await capture(
+                exception=error,
+                run_id=context.run_id,
+                component=component,
+                operation=operation,
+                phase=phase,
+                step_id=step_id,
+                attempt=attempt,
+                category=str(summary["category"]),
+                code=str(summary["code"]),
+                retryable=bool(summary["retryable"]),
+                terminal=True,
+                **capture_options,
+            )
+        except Exception:
+            return {}
+        if not isinstance(failure_id, str) or not failure_id:
+            return {}
+
+        return {
+            "failure_id": failure_id,
+            "component": component,
+            "operation": operation,
+            **({} if phase is None else {"phase": phase}),
+            **({} if step_id is None else {"step_id": step_id}),
+            **({} if attempt is None else {"attempt": attempt}),
+        }
+
+    def _output_validation_fields(self) -> frozenset[str]:
+        try:
+            schema = self.output_codec.schema()
+        except Exception:
+            return frozenset()
+        if not isinstance(schema, Mapping):
+            return frozenset()
+
+        fields: set[str] = set()
+        pending: list[Any] = [schema]
+        seen: set[int] = set()
+        while pending and len(seen) < 1024 and len(fields) < 1024:
+            value = pending.pop()
+            identity = id(value)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if isinstance(value, Mapping):
+                properties = value.get("properties")
+                if isinstance(properties, Mapping):
+                    fields.update(
+                        str(name)[:256] for name in properties if isinstance(name, str)
+                    )
+                pending.extend(value.values())
+            elif isinstance(value, (list, tuple)):
+                pending.extend(value)
+        return frozenset(fields)
+
+    def _error_summary_for_diagnostic(
+        self,
+        error: BaseException,
+        context: RunContext,
+    ) -> Mapping[str, Any]:
+        if isinstance(error, asyncio.TimeoutError):
+            return {
+                "category": "timeout",
+                "code": "run_timeout",
+                "retryable": True,
+            }
+        if isinstance(error, Exception):
+            return self._error_summary(error, context=context)
+        return {
+            "category": "execution",
+            "code": "run_failed",
+            "retryable": False,
+        }
+
+    @staticmethod
+    def _diagnostic_operation(error: BaseException) -> tuple[str, str]:
+        if isinstance(error, ModelInvocationError):
+            return "model", "invoke"
+        if isinstance(error, OutputValidationError):
+            return "output", "decode"
+        if isinstance(
+            error,
+            (ToolInvocationError, ToolValidationError, ToolAuthorizationError),
+        ):
+            return "tool", "invoke"
+        if isinstance(error, PersistenceError):
+            return "persistence", "operation"
+        if isinstance(error, FrameworkMemoryError):
+            return "memory", "prepare"
+        if isinstance(error, FrameworkSkillError):
+            return "skill", "activate"
+        if isinstance(error, ConfigurationError):
+            return "configuration", "validate"
+        if isinstance(error, asyncio.TimeoutError):
+            return "runtime", "deadline"
+        return "runtime", "execute"
+
+    @staticmethod
+    def _diagnostic_location(
+        context: RunContext,
+    ) -> tuple[str | None, str | None, int | None]:
+        state = context.execution_state
+        phase_value = getattr(state, "phase", None)
+        phase = getattr(phase_value, "value", phase_value)
+        if not isinstance(phase, str) or not phase:
+            phase = None
+
+        step_id = getattr(state, "current_step_id", None)
+        attempt = None
+        step_execution = getattr(state, "step_execution", None)
+        if step_execution is not None:
+            step_id = getattr(step_execution, "current_step_id", step_id)
+            attempt = getattr(step_execution, "step_attempt_count", None)
+        if not isinstance(step_id, str) or not step_id:
+            step_id = None
+        if type(attempt) is not int or attempt < 1:
+            attempt = None
+        return phase, step_id, attempt
+
     def _outcome_error_summary(
         self,
         outcome: EngineOutcome,
@@ -995,6 +1356,39 @@ class RunCoordinator(AgentRuntime):
             outcome.finish_reason,
             ("execution", "execution_failed", False),
         )
+        validation_failure = outcome.metadata.get("validation_failure")
+        if isinstance(validation_failure, Mapping):
+            validation_code = validation_failure.get("code")
+            validation_location = validation_failure.get("location")
+            if (
+                isinstance(validation_code, str)
+                and validation_code in _STEP_VALIDATION_CODES
+                and isinstance(validation_location, str)
+                and validation_location in _STEP_VALIDATION_LOCATIONS
+            ):
+                summary: dict[str, Any] = {
+                    "category": "step_validation",
+                    "code": validation_code,
+                    "component": "policy",
+                    "operation": validation_location,
+                    "retryable": False,
+                    "resumable": self._is_safely_resumable(context),
+                }
+                phase = validation_failure.get("phase")
+                if isinstance(phase, str) and phase in {
+                    "act_tool",
+                    "failed",
+                    "step_result",
+                    "step_validate",
+                }:
+                    summary["phase"] = phase
+                step_id = validation_failure.get("step_id")
+                if isinstance(step_id, str) and 0 < len(step_id) <= 256:
+                    summary["step_id"] = step_id
+                attempt = validation_failure.get("attempt")
+                if type(attempt) is int and 0 <= attempt <= 1_000_000:
+                    summary["attempt"] = attempt
+                return summary
         failure = outcome.metadata.get("failure")
         if isinstance(failure, Mapping):
             category = "tool_recovery"
@@ -1133,14 +1527,20 @@ class RunCoordinator(AgentRuntime):
         if reserved is None or reserved != event:
             raise ExecutionInvariantError("event was not reserved by this Coordinator")
         queue = self._sink_queues.get(event.run_id)
+        self._published_events[key] = _PublishedEventStamp.from_event(event)
+        if _event_sink_is_noop(self.event_sink):
+            return event
         if queue is None:
-            queue = asyncio.Queue()
+            queue = asyncio.Queue(maxsize=_EVENT_SINK_QUEUE_MAX_SIZE)
             self._sink_queues[event.run_id] = queue
             self._sink_workers[event.run_id] = asyncio.create_task(
                 self._sink_worker(queue)
             )
-        queue.put_nowait(event)
-        self._published_events[key] = event
+        # A bounded queue prevents a slow external sink from retaining an
+        # unlimited number of large terminal/delta payloads. Backpressure is
+        # charged only after a full 1,024-event burst; Noop sinks never enter
+        # this path.
+        await queue.put(event)
         # Start the ordered worker without charging sink latency to the run.
         await asyncio.sleep(0)
         if event.type in _TERMINAL_EVENT_TYPES:
@@ -1168,18 +1568,27 @@ class RunCoordinator(AgentRuntime):
         timed_out = False
         while True:
             event = await queue.get()
+            invocation: asyncio.Task[None] | None = None
             try:
                 if not timed_out:
-                    await asyncio.wait_for(
-                        self._invoke_event_sink(event),
+                    invocation = asyncio.create_task(self._invoke_event_sink(event))
+                    completed, _ = await asyncio.wait(
+                        (invocation,),
                         timeout=_EVENT_SINK_TIMEOUT_SECONDS,
                     )
-            except asyncio.TimeoutError:
-                # One hung sink opens a run-scoped circuit breaker. Remaining
-                # events are acknowledged without invoking the failed sink so
-                # terminal delivery cannot stall execution.
-                timed_out = True
+                    if not completed:
+                        # ``wait_for`` waits indefinitely when an adapter
+                        # suppresses cancellation. Detach after opening the
+                        # run-scoped circuit instead.
+                        timed_out = True
+                        invocation.cancel()
+                        invocation.add_done_callback(_consume_task_result)
+                    else:
+                        await invocation
             except asyncio.CancelledError:
+                if invocation is not None and not invocation.done():
+                    invocation.cancel()
+                    invocation.add_done_callback(_consume_task_result)
                 raise
             except Exception:
                 # Observability cannot alter execution, including cancellation
@@ -1202,22 +1611,24 @@ class RunCoordinator(AgentRuntime):
     async def _invoke_event_sink(self, event: AgentEvent) -> None:
         # Sinks are untrusted observability adapters. Give them an isolated
         # object graph so mutation cannot alter the stream or terminal result.
-        sink_event = copy.deepcopy(event)
+        sink_event = (
+            copy.deepcopy(event)
+            if _event_sink_requires_coordinator_copy(self.event_sink)
+            else event
+        )
         publisher = self.event_sink.publish
         if inspect.iscoroutinefunction(publisher):
             await publisher(sink_event)
             return
-        result = await asyncio.to_thread(publisher, sink_event)
+        result = await run_in_daemon_thread(publisher, sink_event)
         if inspect.isawaitable(result):
             await result
 
     def _published_event(self, event: AgentEvent) -> AgentEvent:
         """Resolve events emitted by inherited compatibility helpers."""
 
-        return self._published_events.get(
-            (event.run_id, event.event_id),
-            event,
-        )
+        stamp = self._published_events.get((event.run_id, event.event_id))
+        return event if stamp is None else stamp.apply(event)
 
 
 __all__ = ["RunCoordinator"]

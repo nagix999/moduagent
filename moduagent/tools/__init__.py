@@ -39,6 +39,11 @@ from moduagent.tools.runtime import (
     ToolRepairConstraint,
     ToolRuntime,
 )
+from moduagent.tools.scheduler import (
+    SyncToolScheduler,
+    SyncToolSchedulerOverloaded,
+    SyncToolSchedulerStats,
+)
 
 __all__ = [
     "AgentTool",
@@ -50,6 +55,9 @@ __all__ = [
     "InternalToolFailure",
     "RBACToolAuthorizer",
     "SafeToolFailureView",
+    "SyncToolScheduler",
+    "SyncToolSchedulerOverloaded",
+    "SyncToolSchedulerStats",
     "Tool",
     "ToolAuthorizer",
     "ToolBatchOutcome",

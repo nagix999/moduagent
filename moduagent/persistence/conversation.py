@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import inspect
 import json
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
 from moduagent.messages import Message
+from moduagent.persistence._sync import call_maybe_async
 
 
 _SERIALIZATION_VERSION = 1
@@ -181,6 +181,7 @@ class RedisConversationStore:
         ):
             raise TypeError("Redis client must provide get/set or lrange/rpush")
         self._fallback_locks: dict[str, asyncio.Lock] = {}
+        self._fallback_lock_users: dict[str, int] = {}
         self.supports_idempotent_append = bool(
             self._use_lists and callable(getattr(client, "eval", None))
         )
@@ -209,15 +210,25 @@ class RedisConversationStore:
         # The fallback is serialized per store instance. Production Redis clients
         # should expose list operations to preserve cross-process append atomicity.
         lock = self._fallback_locks.setdefault(key, asyncio.Lock())
-        async with lock:
-            current = deserialize_messages(await _call(self._client.get, key))
-            current.extend(additions)
-            await _redis_set(
-                self._client,
-                key,
-                serialize_messages(current),
-                self._ttl_seconds,
-            )
+        self._fallback_lock_users[key] = self._fallback_lock_users.get(key, 0) + 1
+        try:
+            async with lock:
+                current = deserialize_messages(await _call(self._client.get, key))
+                current.extend(additions)
+                await _redis_set(
+                    self._client,
+                    key,
+                    serialize_messages(current),
+                    self._ttl_seconds,
+                )
+        finally:
+            users = self._fallback_lock_users.get(key, 1) - 1
+            if users <= 0:
+                self._fallback_lock_users.pop(key, None)
+                if self._fallback_locks.get(key) is lock:
+                    self._fallback_locks.pop(key, None)
+            else:
+                self._fallback_lock_users[key] = users
 
     async def append_once(
         self,
@@ -258,6 +269,7 @@ class RedisConversationStore:
         await _call(self._client.delete, key)
         await _call(self._client.delete, f"{key}:idempotency")
         self._fallback_locks.pop(key, None)
+        self._fallback_lock_users.pop(key, None)
 
     def _key(self, session_id: str) -> str:
         _validate_identifier(session_id, "session_id")
@@ -394,10 +406,7 @@ async def _redis_set(
 
 
 async def _call(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    result = function(*args, **kwargs)
-    if inspect.isawaitable(result):
-        return await result
-    return result
+    return await call_maybe_async(function, *args, **kwargs)
 
 
 def _validate_identifier(value: str, name: str) -> None:

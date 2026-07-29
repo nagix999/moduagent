@@ -6,6 +6,7 @@ import json
 import math
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import replace
 from typing import Any, TypeVar
 
@@ -21,7 +22,7 @@ from moduagent.memory import (
 )
 from moduagent.messages import FinishReason, Message, MessageRole
 from moduagent.models import ModelClient, ModelRequest, ModelResponse
-from moduagent.observability import EventSink, mask_sensitive
+from moduagent.observability import DiagnosticReporter, EventSink, mask_sensitive
 from moduagent.output import OutputCodec
 from moduagent.persistence import (
     CheckpointStore,
@@ -56,6 +57,10 @@ from moduagent.tools import (
 
 T = TypeVar("T")
 
+_SESSION_QUEUE_WAIT_SECONDS: ContextVar[float] = ContextVar(
+    "moduagent_session_queue_wait_seconds",
+    default=0.0,
+)
 _FINALIZATION_STATE_KEY = "_moduagent_structured_finalization"
 _FINALIZATION_OUTPUT_KEY = "_moduagent_structured_output"
 _FINALIZATION_PENDING = "pending"
@@ -110,6 +115,7 @@ class AgentRuntime:
         conversation_store: ConversationStore,
         output_codec: OutputCodec,
         event_sink: EventSink,
+        diagnostic_reporter: DiagnosticReporter | None = None,
         checkpoint_store: CheckpointStore | None = None,
         conversation_memory_policy: ConversationMemoryPolicy | None = None,
         skill_runtime: SkillRuntime | None = None,
@@ -121,6 +127,7 @@ class AgentRuntime:
         self.conversation_store = conversation_store
         self.output_codec = output_codec
         self.event_sink = event_sink
+        self.diagnostic_reporter = diagnostic_reporter
         self.checkpoint_store = checkpoint_store
         self.skill_runtime = skill_runtime
         # Set by the composition layer. Direct AgentRuntime construction keeps
@@ -142,6 +149,7 @@ class AgentRuntime:
                 "strict Plan-and-Execute requires finalization_mode to be enabled"
             )
         self._session_locks: dict[str, asyncio.Lock] = {}
+        self._session_lock_users: dict[str, int] = {}
 
     async def execute(self, request: RunRequest) -> AgentResult:
         result: AgentResult | None = None
@@ -165,11 +173,15 @@ class AgentRuntime:
             if include_internal is None
             else include_internal
         )
-        async for event in self._events(request, stream_model=True):
-            if include_internal:
-                yield event
-            elif event.visibility is EventVisibility.PUBLIC:
-                yield self._public_stream_event(event)
+        iterator = self._events(request, stream_model=True)
+        try:
+            async for event in iterator:
+                if include_internal:
+                    yield event
+                elif event.visibility is EventVisibility.PUBLIC:
+                    yield self._public_stream_event(event)
+        finally:
+            await iterator.aclose()
 
     @staticmethod
     def _public_stream_event(event: AgentEvent) -> AgentEvent:
@@ -232,10 +244,42 @@ class AgentRuntime:
     async def _events(
         self, request: RunRequest, *, stream_model: bool
     ) -> AsyncIterator[AgentEvent]:
-        lock = self._session_locks.setdefault(request.session_id, asyncio.Lock())
-        async with lock:
-            async for event in self._run(request, stream_model=stream_model):
-                yield event
+        session_id = request.session_id
+        loop = asyncio.get_running_loop()
+        accepted_at = loop.time()
+        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+        self._session_lock_users[session_id] = (
+            self._session_lock_users.get(session_id, 0) + 1
+        )
+        try:
+            async with lock:
+                queue_wait_seconds = max(0.0, loop.time() - accepted_at)
+                _SESSION_QUEUE_WAIT_SECONDS.set(queue_wait_seconds)
+                iterator = self._run(request, stream_model=stream_model)
+                try:
+                    async for event in iterator:
+                        yield event
+                finally:
+                    try:
+                        await iterator.aclose()
+                    finally:
+                        # Async-generator finalization may execute in a copied
+                        # Context, where resetting a token from the creator
+                        # Context raises ValueError. Clearing the run-local
+                        # value is safe in either context.
+                        _SESSION_QUEUE_WAIT_SECONDS.set(0.0)
+        finally:
+            users = self._session_lock_users.get(session_id, 1) - 1
+            if users <= 0:
+                self._session_lock_users.pop(session_id, None)
+                if self._session_locks.get(session_id) is lock:
+                    self._session_locks.pop(session_id, None)
+            else:
+                self._session_lock_users[session_id] = users
+
+    @staticmethod
+    def _session_queue_wait_seconds() -> float:
+        return max(0.0, float(_SESSION_QUEUE_WAIT_SECONDS.get()))
 
     async def _run(
         self, request: RunRequest, *, stream_model: bool
@@ -261,6 +305,9 @@ class AgentRuntime:
         )
         initial_metadata = {
             "agent": self.config.name,
+            "_moduagent_session_queue_wait_seconds": (
+                self._session_queue_wait_seconds()
+            ),
             **{
                 key: value
                 for key, value in self.config.metadata.items()
@@ -294,6 +341,7 @@ class AgentRuntime:
                 "agent": self.config.name,
                 "session_id": request.session_id,
                 "user_context": dict(request.user_context),
+                "queue_wait_seconds": self._session_queue_wait_seconds(),
             },
         )
         await self._publish(event)
@@ -2751,6 +2799,7 @@ class AgentRuntime:
             else protected_from
         )
         usage_before_memory = context.usage
+        memory_started = asyncio.get_running_loop().time()
         memory = await self._within(
             deadline,
             lambda: self.conversation_memory_policy.prepare(
@@ -2764,6 +2813,10 @@ class AgentRuntime:
                     model_gateway=context.model_gateway,
                 )
             ),
+        )
+        memory_duration_seconds = max(
+            0.0,
+            asyncio.get_running_loop().time() - memory_started,
         )
         if context.usage == usage_before_memory:
             context.usage = context.usage + memory.usage
@@ -2784,6 +2837,7 @@ class AgentRuntime:
                 "selected_tokens": memory.selected_tokens,
                 "summarized_messages": memory.summarized_messages,
                 "dropped_messages": memory.dropped_messages,
+                "duration_seconds": memory_duration_seconds,
             }
         )
         event = AgentEvent(EventType.MEMORY_COMPACTED, context.run_id, data)
@@ -2950,6 +3004,12 @@ class AgentRuntime:
             context.metadata.get(_TOOL_TRACE_METADATA_KEY)
         )
         if tool_trace:
+            for entry in tool_trace:
+                call_id = entry.get("call_id")
+                if isinstance(call_id, str):
+                    failure_id = context.tool_failure_ids.get(call_id)
+                    if failure_id:
+                        entry["failure_id"] = failure_id
             metadata[_PUBLIC_TOOL_TRACE_KEY] = tool_trace
         if context.skill_state.catalog_digest:
             metadata["skill_usage"] = {

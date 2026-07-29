@@ -11,6 +11,7 @@ _RUNTIME_OWNED_METADATA_KEYS = frozenset(
         "skill_usage",
         "skills",
         "tool_trace",
+        "validation_failure",
     }
 )
 

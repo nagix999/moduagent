@@ -85,8 +85,11 @@ class InternalToolFailure:
     """Ephemeral Tool failure record used inside the execution boundary.
 
     Raw exceptions and raw arguments are deliberately absent. ``diagnostic_ref``
-    is an opaque local reference and must never be projected to model, public,
-    event, trace, or checkpoint payloads.
+    preserves the 0.4 local-reference contract and may therefore contain only
+    an exception type name. ``failure_id`` is the explicit marker for a
+    successfully issued diagnostic correlation ID. Only that field may cross
+    the event and result correlation boundaries; diagnostic record contents
+    remain private.
     """
 
     call_id: str
@@ -98,6 +101,7 @@ class InternalToolFailure:
     attempts: int = 0
     same_call_retry_exhausted: bool = False
     diagnostic_ref: str | None = None
+    failure_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.call_id, str) or not self.call_id.strip():
@@ -126,6 +130,10 @@ class InternalToolFailure:
             str,
         ):
             raise TypeError("diagnostic_ref must be a string")
+        if self.failure_id is not None and (
+            not isinstance(self.failure_id, str) or not self.failure_id.strip()
+        ):
+            raise ValueError("failure_id must be a non-empty string or None")
 
 
 @dataclass(frozen=True, slots=True)

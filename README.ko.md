@@ -11,7 +11,7 @@ ModuAgent는 자체 모델 엔드포인트와 Python 함수를 바탕으로 AI �
 계획-실행(Plan-and-Execute), 체크포인트 복구, 스킬, 관측성 기능을 추가할 수
 있습니다.
 
-> 현재 버전: **0.4.0 (Alpha)** · Python **3.10+** · **MIT License**
+> 현재 버전: **0.4.2 (Alpha)** · Python **3.10+** · **MIT License**
 
 ModuAgent를 처음 사용한다면 먼저 1단계와 2단계를 완료합니다. 그다음 사용
 사례에 필요할 때만 메모리, 구조화 출력 또는 계획-실행을 추가합니다.
@@ -32,7 +32,7 @@ Agent ──► Execution profile ──► Model
   ├── Output codec
   ├── Checkpoint store
   ├── Skills and authorization
-  └── Events and metrics
+  └── Events, diagnostics, and metrics
 ```
 
 - `AgentConfig`는 지침, 재시도 동작, 실행 제한을 정의합니다.
@@ -67,10 +67,10 @@ ModuAgent에는 Python 3.10 이상이 필요합니다. 접근 가능한 모델 �
 패키지를 설치합니다.
 
 ```bash
-python -m pip install "moduagent==0.4.0"
+python -m pip install "moduagent==0.4.2"
 ```
 
-패키지 인덱스에 아직 `0.4.0`이 없고 이미 0.4 소스를 체크아웃했다면 저장소
+패키지 인덱스에 아직 `0.4.2`가 없고 이미 0.4 소스를 체크아웃했다면 저장소
 루트에서 설치합니다.
 
 ```bash
@@ -89,6 +89,7 @@ python -m pip install -e '.[dev]'
 ```bash
 python -m pip install redis       # Redis conversation/checkpoint stores
 python -m pip install matplotlib  # report automation example
+python -m pip install "psycopg[binary]>=3.2,<4"  # PostgreSQL report example
 ```
 
 ## 1단계: 첫 에이전트 실행
@@ -231,6 +232,20 @@ asyncio.run(main())
 트랜잭션이나 정확히 한 번(exactly-once) 실행을 보장하는 기능은 아닙니다.
 쓰기 도구에는 애플리케이션 수준의 멱등성 키와 중복 방지가 여전히 필요합니다.
 
+`pandas.read_sql()` 같은 동기 함수는 이벤트 루프 밖에서 실행됩니다. 운영
+환경에서는 동기 도구가 공통 bounded scheduler를 사용하게 하여 timeout된
+호출이 백그라운드 스레드를 무제한 생성하지 않도록 합니다.
+
+```python
+from moduagent import SyncToolScheduler, function_tool
+
+blocking_tools = SyncToolScheduler(max_workers=8, max_queue=32)
+
+@function_tool(sync_scheduler=blocking_tools, timeout_seconds=10)
+def query_db(sql: str) -> list[dict]:
+    return run_read_only_query(sql)
+```
+
 원본 어시스턴트 도구 호출과 원본 도구 결과는 내부 프로토콜 메시지입니다.
 실행 중에는 모델이 사용할 수 있지만 `ConversationStore`나
 `AgentResult.messages`에는 추가되지 않습니다. 기본 공개 도구 추적 정보는
@@ -295,6 +310,9 @@ async def demonstrate_memory() -> None:
 엄격한 토큰 제한과 자동 요약은
 [Conversation Memory 가이드](https://github.com/nagix999/moduagent/blob/main/docs/conversation-memory-policy.md)를
 참고합니다.
+vLLM의 정확한 토큰 계산을 반복해서 사용한다면 `VLLMTokenCounter`를
+`CachingTokenCounter`로 감쌉니다. cache에는 크기가 제한된 keyed digest와
+성공한 토큰 수만 저장됩니다.
 
 ## 4단계: 검증된 구조화 출력 반환
 
@@ -428,7 +446,8 @@ PLAN → ACT_TOOL → STEP_RESULT → VALIDATE/COMMIT → VERIFY → FINALIZE
 저장소에는 단 두 개의 도구만 사용하는 완전한 계획-실행 에이전트가
 포함되어 있습니다.
 
-- `query_db`: 제한된 읽기 전용 SQLite 쿼리를 실행합니다.
+- `query_db`: SQLite(기본값) 또는 PostgreSQL에서 제한된 읽기 전용 쿼리를
+  실행합니다.
 - `plot_graph`: 해당 실행에 속한 쿼리 산출물을 읽고 PNG 차트를 생성합니다.
 
 [examples/report_automation_agent.py](https://github.com/nagix999/moduagent/blob/main/examples/report_automation_agent.py)를
@@ -440,6 +459,20 @@ export VLLM_BASE_URL="http://localhost:8000/v1"
 export VLLM_MODEL="your-tool-capable-model"
 python examples/report_automation_agent.py
 ```
+
+같은 예제를 PostgreSQL에서 실행하려면 위 모델 환경변수를 유지하고 다음을
+추가합니다.
+
+```bash
+python -m pip install "psycopg[binary]>=3.2,<4"
+export REPORT_DB_BACKEND="postgresql"
+export REPORT_DATABASE_URL="postgresql://report_reader@localhost:5432/reporting"
+python examples/report_automation_agent.py
+```
+
+`CONNECT`, 스키마 `USAGE`, `SELECT` 권한만 가진 전용 데이터베이스 역할을
+사용하세요. 예제도 읽기 전용 트랜잭션을 시작하고 statement 및 lock
+timeout을 적용합니다.
 
 ## 다섯 단계를 마친 후
 
@@ -476,6 +509,83 @@ async def stream_result() -> None:
 
 `stream_all()`은 진단용 내부 이벤트와 중간 모델 델타도 노출합니다.
 사용자에게 직접 전달하지 말고 접근이 통제된 진단 경로에서만 사용합니다.
+
+## 스텝과 오류 원인 확인
+
+실행 과정은 `EventSink` 또는 `stream_all()`로 확인합니다. 개발자가 예외의
+정제된 원인도 확인해야 한다면 `DiagnosticSink`를 추가합니다.
+
+```python
+from moduagent import InMemoryDiagnosticSink, LoggingEventSink
+
+diagnostics = InMemoryDiagnosticSink(max_records=1_000)
+
+observable_agent = Agent(
+    config=AgentConfig(
+        name="observable-agent",
+        instructions="Complete the request using the available Tools.",
+    ),
+    model=create_model(),
+    tools=[add],
+    event_sink=LoggingEventSink(),
+    diagnostic_sink=diagnostics,
+    diagnostic_timeout_seconds=0.25,
+    diagnostic_max_pending_deliveries=1_024,
+)
+
+result = await observable_agent.run("Use add for 20 + 22.")
+
+if result.failure_id is not None:
+    failure = diagnostics.get(result.failure_id)
+    if failure is not None:
+        print(failure.to_dict())
+
+for failure in diagnostics.for_run(result.run_id):
+    print(failure.failure_id, failure.component, failure.operation)
+```
+
+`result.metadata["tool_trace"]`에는 실제 실행된 도구와 연관 ID가 기록됩니다.
+`result.failure_id`는 종료된 실행의 근본 오류를 가리킵니다. 연관된 도구
+레코드의 `terminal`은 최종 결과가 아니라 수집 당시 복구 가능성을 뜻하므로,
+이후 Plan 정책이 중단을 결정한 경우에도 `False`일 수 있습니다. 복구된 도구
+오류는 도구 추적 정보와 `diagnostics.for_run()`에만 남을 수 있습니다.
+
+진단은 기본적으로 꺼져 있습니다. `diagnostic_sink`를 생략하거나
+`NoopDiagnosticSink`를 사용하면 0.4 동작을 유지합니다. 전달은 최선 노력
+방식이며
+`diagnostic_timeout_seconds`와 `diagnostic_max_pending_deliveries`로
+제한됩니다. 표준 라이브러리 로깅은 제한된 데몬 워커 풀에서 실행되며 이미
+실행 중인 동기 핸들러는 강제로 취소할 수 없습니다. 사용자 정의 비동기
+수집기는 취소를 준수해야 합니다.
+
+진단 필드는 크기가 제한되며 원본 예외 메시지, SQL, 프롬프트, 도구 인자와
+결과, 공급자 응답 본문, 소스 코드 줄, 지역 변수를 수집하지 않습니다. 실제
+`OSError.errno`와 즉시 읽을 수 있는 허용 속성은 보존할 수 있지만 Pydantic
+동적 키는 숨깁니다. 잘린 트레이스백은 가장 안쪽 프레임을 유지합니다. 내장
+이벤트 로그는 페이로드와 자유 형식 사유를 생략하고 스텝·도구 연관 ID를
+해시합니다.
+
+엄격한 Plan 검증은 프레임워크가 소유하는 `validation_code`,
+`validation_location`, 선택적 `validation_cause_code`를 제공하므로 사유
+문자열을 파싱하지 말고 이 값을 확인합니다. 사용자 정의 Engine의
+`EngineOutcome.error`는 공개되는 신뢰 텍스트로 취급해야 합니다.
+`AgentResult.metadata["error_summary"]`는 런타임 예약 필드이므로 Engine
+메타데이터로 덮어쓸 수 없습니다. 로깅, 영속 사용자 정의 수집기, 보안 지침은
+[진단 가이드](https://github.com/nagix999/moduagent/blob/main/docs/diagnostics.md)를
+참고합니다.
+
+## 성능 지표
+
+`MetricsEventSink`는 phase별 `model.calls`와 모델 실행 시간뿐 아니라 메모리
+준비, 도구, 체크포인트, 전체 실행, 동일 세션 대기 시간을 기록합니다. Noop
+관측성은 큐와 복사 경로를 완전히 건너뜁니다. 이벤트 전달 큐에는 상한이 있어
+느린 sink가 payload를 무제한 보관하는 대신 backpressure를 적용합니다.
+
+실행 또는 영속화 코드를 변경한 뒤 소스 트리의 microbenchmark를 실행합니다.
+
+```bash
+python benchmarks/performance_v042.py --pretty
+```
 
 ## 체크포인트와 안전한 재개
 
@@ -633,7 +743,8 @@ print(spec.to_dict(include_instructions=False))
   보존 기간, TTL을 설정합니다.
 - 배포 설정과 함께 `agent.inspect()` 결과를 기록하고, 운영 중인 에이전트를
   업그레이드하기 전에 재개 동작을 테스트합니다.
-- 공개 스트림은 사용자에게 보내고 내부 이벤트는 보호된 진단 수집기로 보냅니다.
+- 공개 스트림은 사용자에게 보내고 내부 이벤트는 보호된 `EventSink`로
+  보냅니다. 오류 진단은 별도로 접근이 통제된 `DiagnosticSink`에 저장합니다.
 
 ModuAgent는 분산 잠금, 작업자 큐, 스케줄러, 영속 아웃박스, 종단 간 정확히
 한 번 도구 실행을 제공하지 않습니다. 필요한 경우 애플리케이션 인프라를
@@ -676,13 +787,14 @@ Redis 또는 영속 사용자 정의 저장소를 사용합니다.
 | 대화 유지 | `ConversationStore`, `RecentTurnsConversationMemoryPolicy` |
 | 작업 재개 | `CheckpointStore`, `Agent.resume()` |
 | 도메인 절차 추가 | `SkillRegistry`, `SkillSelector` |
-| 실행 관측 | `Agent.stream()`, `EventSink`, 메트릭 및 감사 수집기 |
+| 실행 관측 | `Agent.stream_all()`, `EventSink`, `DiagnosticSink`, `failure_id` |
 | 설정 확인 | `Agent.inspect()`, `AgentSpec` |
 
 ## 예제
 
 - [리포트 자동화 에이전트](https://github.com/nagix999/moduagent/blob/main/examples/report_automation_agent.py):
-  `query_db`와 `plot_graph`만 사용하는 엄격한 계획-실행 예제입니다.
+  `query_db`와 `plot_graph`만 사용하며 SQLite와 PostgreSQL 쿼리 백엔드를
+  지원하는 엄격한 계획-실행 예제입니다.
 - [청구서 검토 스킬](https://github.com/nagix999/moduagent/tree/main/examples/skills/invoice-review):
   스킬 지침, 참고 자료, 자산 예제입니다.
 
@@ -702,6 +814,9 @@ Redis 또는 영속 사용자 정의 저장소를 사용합니다.
   재사용 가능한 절차와 리소스 접근을 설명합니다.
 - [Operations](https://github.com/nagix999/moduagent/blob/main/docs/operations.md):
   보안, 시간 제한, 저장소, 이벤트, 배포를 설명합니다.
+- [Diagnostics](https://github.com/nagix999/moduagent/blob/main/docs/diagnostics.md):
+  스텝 타임라인, 오류 연관 관계, 정제된 상세 정보, 사용자 정의 수집기를
+  설명합니다.
 - [0.4 마이그레이션](https://github.com/nagix999/moduagent/blob/main/docs/migration-0.4.md):
   소스 호환성과 체크포인트 마이그레이션을 설명합니다.
 - [Changelog](https://github.com/nagix999/moduagent/blob/main/CHANGELOG.md)

@@ -14,7 +14,7 @@ from moduagent.decision import DecisionPolicy
 from moduagent.execution import ExecutionEngine
 from moduagent.memory import ConversationMemoryPolicy
 from moduagent.models import ModelClient
-from moduagent.observability import EventSink
+from moduagent.observability import DiagnosticSink, EventSink
 from moduagent.output import OutputCodec
 from moduagent.persistence import (
     CheckpointStore,
@@ -43,6 +43,9 @@ class Agent:
         execution_engine: ExecutionEngine[Any] | None = None,
         output_codec: OutputCodec | None = None,
         event_sink: EventSink | None = None,
+        diagnostic_sink: DiagnosticSink | None = None,
+        diagnostic_timeout_seconds: float = 0.25,
+        diagnostic_max_pending_deliveries: int = 1024,
         tool_authorizer: ToolAuthorizer | None = None,
         checkpoint_store: CheckpointStore | None = None,
         conversation_memory_policy: ConversationMemoryPolicy | None = None,
@@ -60,6 +63,9 @@ class Agent:
             execution_engine=execution_engine,
             output_codec=output_codec,
             event_sink=event_sink,
+            diagnostic_sink=diagnostic_sink,
+            diagnostic_timeout_seconds=diagnostic_timeout_seconds,
+            diagnostic_max_pending_deliveries=(diagnostic_max_pending_deliveries),
             tool_authorizer=tool_authorizer,
             checkpoint_store=checkpoint_store,
             conversation_memory_policy=conversation_memory_policy,
@@ -77,6 +83,7 @@ class Agent:
         self.conversation_memory_policy = composition.conversation_memory_policy
         self.engine = composition.engine
         self.runtime = composition.runtime
+        self.diagnostic_reporter = composition.runtime.diagnostic_reporter
 
     def inspect(self) -> AgentSpec:
         """Return the immutable, secret-safe resolved Agent configuration."""

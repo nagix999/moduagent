@@ -7,8 +7,14 @@
 0.4는 실행 내부 구조를 분리하지만 기존 `Agent(config=..., model=..., ...)`, `decision_policy`, `PlanAndExecutePolicy`, Tool 안전 boolean과 주요 top-level import를 유지합니다. 우선 의존성만 올려 기존 테스트를 실행한 뒤 실행 Profile, `Agent.inspect()`, 명시적 Tool 안전 Profile을 점진적으로 적용할 수 있습니다.
 
 ```bash
-python -m pip install --upgrade "moduagent==0.4.0"
+python -m pip install --upgrade "moduagent==0.4.2"
 ```
+
+0.4.2는 checkpoint schema와 기본 실행 의미를 변경하지 않는 성능 릴리스입니다.
+checkpoint store가 없으면 Engine snapshot을 만들지 않으며, 내장 v4 store는
+legacy 상태 왕복 없이 저장합니다. `CachingTokenCounter`와
+`SyncToolScheduler`는 명시적으로 구성할 때만 적용됩니다. 동기 Redis/DB
+adapter는 이벤트 루프 대신 bounded worker에서 실행됩니다.
 
 ## 실행 Profile로 전환
 

@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.2
+
+- Removed Engine-state encoding and compatibility copies when no checkpoint store is configured.
+- Added a direct checkpoint-v4 snapshot path for built-in Standard and Plan Engines while preserving legacy stores and custom Engines.
+- Reduced large Plan legacy-adapter round trips by validating committed-result hashes at the persistence boundary instead of every policy transition.
+- Removed the duplicate Plan finalization checkpoint without changing the durable finalization barrier.
+- Added Noop event-sink fast paths, single-owner Composite isolation, lightweight published-event stamps, and bounded service/sink handoff queues.
+- Added phase-aware model, memory, Tool, checkpoint, run, and session-queue timing metrics.
+- Added request-local token-count reuse and the bounded, TTL/LRU, singleflight `CachingTokenCounter`.
+- Added the opt-in bounded `SyncToolScheduler` and moved synchronous persistence adapters off the event loop through a shared bounded scheduler.
+- Reclaimed completed session and Redis fallback locks instead of retaining one lock per identifier.
+- Added structural performance regression tests and `benchmarks/performance_v042.py`.
+
+## 0.4.1
+
+- Added an opt-in protected diagnostic pipeline with structured `FailureDiagnostic` records, injectable `DiagnosticSink` implementations, opaque failure IDs, and sanitized cause and innermost-frame metadata.
+- Correlated model attempts, Tool execution, output decoding, policy transitions, and terminal failures; a terminal result can reuse a Tool failure captured as recoverable instead of duplicating it.
+- Added bounded best-effort diagnostic delivery with configurable timeout and pending-record limits, cancellation-aware async sink guidance, and a bounded daemon worker pool for standard-library logging.
+- Added finite Plan validation codes and locations to retry, failure, terminal-result, and safe logging projections so operators do not need to parse free-form validation text.
+- Improved built-in terminal, model, Tool, and Plan event projections, hashed step and Tool correlation IDs, omitted arbitrary payloads and raw reasons, and assigned warning or error severity to retries and failures.
+- Kept diagnostic attributes bounded and allowlisted, preserved real `OSError.errno`, hid dynamic Pydantic locations, and excluded model output, Tool results, provider responses, secrets, and raw tracebacks.
+- Documented `EngineOutcome.error` as a public custom-Engine boundary and reserved runtime-generated `error_summary` metadata.
+- Preserved existing public stream behavior, constructor compatibility, and the 0.4.0 checkpoint runtime schema while keeping diagnostics disabled by default.
+
 ## 0.4.0
 
 - Split the common run lifecycle from Standard and strict Plan execution through explicit execution profiles and versioned Engine contracts.

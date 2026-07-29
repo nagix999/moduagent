@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import warnings
@@ -29,6 +30,27 @@ from moduagent.tools import (
 if TYPE_CHECKING:
     from moduagent.runtime.context import RunContext
     from moduagent.tools import ToolResult
+
+
+# These codes are intentionally finite and contain no model-, provider-, or
+# user-authored text. The Plan Engine independently allowlists them before
+# making them observable.
+_STEP_VALIDATION_CODES = frozenset(
+    {
+        "step_result_incomplete",
+        "step_result_tool_call_forbidden",
+        "step_result_tool_call_invalid",
+        "step_result_required",
+        "step_result_schema_invalid",
+        "step_result_id_mismatch",
+        "step_result_max_attempts_exceeded",
+        "step_validation_state_incomplete",
+        "step_validator_failed",
+        "step_validation_rejected",
+        "step_validation_max_attempts_exceeded",
+    }
+)
+_STEP_VALIDATION_LOCATIONS = frozenset({"act", "step_result", "step_validator"})
 
 
 class RunPhase(str, Enum):
@@ -1251,7 +1273,22 @@ class PlanAndExecutePolicy:
             if isinstance(serialized, Mapping):
                 state = ExecutionState.from_dict(serialized)
             else:
-                plan = await self.plan_generator.create(context)
+                try:
+                    plan = await self.plan_generator.create(context)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    await self._capture_policy_exception(
+                        context,
+                        exc,
+                        operation="create_plan",
+                        category="planning",
+                        code="plan_generation_failed",
+                        phase=RunPhase.PLAN.value,
+                        step_id=None,
+                        attempt=1,
+                    )
+                    raise
                 state = ExecutionState(
                     phase=RunPhase.STEP_PREPARE,
                     plan=plan,
@@ -1413,6 +1450,10 @@ class PlanAndExecutePolicy:
                 context,
                 state,
                 f"incomplete StepResult response ({finish_reason})",
+                validation_code="step_result_incomplete",
+                validation_location=(
+                    "step_result" if state.awaiting_step_result else "act"
+                ),
             )
 
         tool_calls = tuple(response.tool_calls or response.message.tool_calls)
@@ -1426,7 +1467,11 @@ class PlanAndExecutePolicy:
                 return ExecutionDecision(
                     DecisionKind.FAIL,
                     error_message=state.validation_error,
-                    metadata=self._metadata(state),
+                    metadata={
+                        **self._metadata(state),
+                        "validation_code": "step_result_tool_call_forbidden",
+                        "validation_location": "step_result",
+                    },
                 )
             call_records, call_error = self._tool_call_records(
                 state,
@@ -1443,6 +1488,10 @@ class PlanAndExecutePolicy:
                     context,
                     state,
                     call_error,
+                    validation_code="step_result_tool_call_invalid",
+                    validation_location=(
+                        "step_result" if state.awaiting_step_result else "act"
+                    ),
                 )
             if state.pending_tool_failure is not None:
                 repair_error = self._repair_tool_call_error(
@@ -1487,6 +1536,8 @@ class PlanAndExecutePolicy:
                 metadata={
                     **self._metadata(state),
                     "reason": state.validation_error,
+                    "validation_code": "step_result_required",
+                    "validation_location": "act",
                     "requires_step_result": True,
                     "count_attempt": False,
                 },
@@ -1497,12 +1548,20 @@ class PlanAndExecutePolicy:
                 context,
                 state,
                 "model reported tool calls without providing a tool call",
+                validation_code="step_result_tool_call_invalid",
+                validation_location="step_result",
             )
 
         try:
             result = self._decode_step_result(response)
         except (TypeError, ValueError) as exc:
-            return self._retry_invalid_result(context, state, str(exc))
+            return self._retry_invalid_result(
+                context,
+                state,
+                str(exc),
+                validation_code="step_result_schema_invalid",
+                validation_location="step_result",
+            )
 
         step = state.current_step
         if step is None or result.step_id != step.step_id:
@@ -1519,7 +1578,15 @@ class PlanAndExecutePolicy:
             return ExecutionDecision(
                 DecisionKind.FAIL,
                 error_message="Step validation failed",
-                metadata=self._metadata(state),
+                metadata={
+                    **self._metadata(state),
+                    "validation_code": (
+                        "step_validation_state_incomplete"
+                        if step is None
+                        else "step_result_id_mismatch"
+                    ),
+                    "validation_location": "step_result",
+                },
             )
 
         state.set_pending_result(result)
@@ -1593,7 +1660,11 @@ class PlanAndExecutePolicy:
             return ExecutionDecision(
                 DecisionKind.FAIL,
                 error_message="Step validation failed",
-                metadata=self._metadata(state),
+                metadata={
+                    **self._metadata(state),
+                    "validation_code": "step_validation_state_incomplete",
+                    "validation_location": "step_validator",
+                },
             )
         try:
             validation = self.step_validator.validate(
@@ -1603,13 +1674,27 @@ class PlanAndExecutePolicy:
             if not isinstance(validation, StepValidation):
                 raise TypeError("step validator must return a StepValidation instance")
         except Exception as exc:
+            await self._capture_policy_exception(
+                context,
+                exc,
+                operation="validate_step",
+                category="step_validation",
+                code="step_validator_failed",
+                phase=state.phase.value,
+                step_id=step.step_id,
+                attempt=max(1, step.attempt_count + 1),
+            )
             state.fail_current_step()
             state.validation_error = f"step validator failed ({type(exc).__name__})"
             self._sync(context, state)
             return ExecutionDecision(
                 DecisionKind.FAIL,
                 error_message="Step validation failed",
-                metadata=self._metadata(state),
+                metadata={
+                    **self._metadata(state),
+                    "validation_code": "step_validator_failed",
+                    "validation_location": "step_validator",
+                },
             )
         if validation.kind is ValidationKind.COMMIT:
             state.commit_pending()
@@ -1639,6 +1724,8 @@ class PlanAndExecutePolicy:
             metadata={
                 **self._metadata(state),
                 "validation": validation.to_dict(),
+                "validation_code": "step_validation_rejected",
+                "validation_location": "step_validator",
             },
         )
 
@@ -2037,7 +2124,14 @@ class PlanAndExecutePolicy:
         context: RunContext,
         state: ExecutionState,
         reason: str,
+        *,
+        validation_code: str,
+        validation_location: str,
     ) -> ExecutionDecision:
+        if validation_code not in _STEP_VALIDATION_CODES:
+            raise ValueError("validation_code is not a stable framework code")
+        if validation_location not in _STEP_VALIDATION_LOCATIONS:
+            raise ValueError("validation_location is not a stable framework location")
         step = state.current_step
         if step is None:
             state.fail_current_step()
@@ -2045,6 +2139,11 @@ class PlanAndExecutePolicy:
             return ExecutionDecision(
                 DecisionKind.FAIL,
                 error_message="there is no current step to retry",
+                metadata={
+                    **self._metadata(state),
+                    "validation_code": "step_validation_state_incomplete",
+                    "validation_location": validation_location,
+                },
             )
         was_awaiting_step_result = state.awaiting_step_result
         step.attempt_count += 1
@@ -2063,12 +2162,22 @@ class PlanAndExecutePolicy:
             if kind is DecisionKind.FAIL
             else None
         )
+        public_code = (
+            "step_result_max_attempts_exceeded"
+            if kind is DecisionKind.FAIL
+            else validation_code
+        )
         return ExecutionDecision(
             kind,
             error_message=public_error,
             metadata={
                 **self._metadata(state),
                 "reason": reason,
+                "validation_code": public_code,
+                "validation_cause_code": (
+                    validation_code if kind is DecisionKind.FAIL else None
+                ),
+                "validation_location": validation_location,
                 "count_attempt": True,
             },
         )
@@ -2086,6 +2195,11 @@ class PlanAndExecutePolicy:
             return ExecutionDecision(
                 DecisionKind.FAIL,
                 error_message="there is no current step to retry",
+                metadata={
+                    **self._metadata(state),
+                    "validation_code": "step_validation_state_incomplete",
+                    "validation_location": "step_validator",
+                },
             )
         step.attempt_count += 1
         state.validation_error = validation.reason
@@ -2109,6 +2223,15 @@ class PlanAndExecutePolicy:
             metadata={
                 **self._metadata(state),
                 "validation": validation.to_dict(),
+                "validation_code": (
+                    "step_validation_max_attempts_exceeded"
+                    if kind is DecisionKind.FAIL
+                    else "step_validation_rejected"
+                ),
+                "validation_cause_code": (
+                    "step_validation_rejected" if kind is DecisionKind.FAIL else None
+                ),
+                "validation_location": "step_validator",
                 "count_attempt": True,
             },
         )
@@ -2150,6 +2273,17 @@ class PlanAndExecutePolicy:
                 feedback,
             )
         except Exception as exc:
+            step = state.current_step
+            await self._capture_policy_exception(
+                context,
+                exc,
+                operation="revise_plan",
+                category="planning",
+                code="plan_revision_failed",
+                phase=state.phase.value,
+                step_id=None if step is None else step.step_id,
+                attempt=(None if step is None else max(1, step.attempt_count + 1)),
+            )
             # A failed revision cannot leave a checkpoint that looks resumable
             # from ACT/STEP_VALIDATE, where stale tool output or a pending
             # StepResult might otherwise be committed after recovery.
@@ -2228,6 +2362,53 @@ class PlanAndExecutePolicy:
             "plan": state.plan.to_dict(),
             "execution_state": state.to_dict(),
         }
+
+    @staticmethod
+    async def _capture_policy_exception(
+        context: RunContext,
+        exception: BaseException,
+        *,
+        operation: str,
+        category: str,
+        code: str,
+        phase: str,
+        step_id: str | None,
+        attempt: int | None,
+    ) -> str | None:
+        reporter = context.diagnostic_reporter
+        capture = getattr(reporter, "capture_exception", None)
+        if not callable(capture):
+            return None
+        try:
+            failure_id = await capture(
+                exception=exception,
+                run_id=context.run_id,
+                component="policy",
+                operation=operation,
+                phase=phase,
+                step_id=step_id,
+                attempt=attempt,
+                category=category,
+                code=code,
+                retryable=False,
+                terminal=True,
+            )
+        except Exception:
+            return None
+        if not isinstance(failure_id, str) or not failure_id:
+            return None
+        context.primary_failure = {
+            "failure_id": failure_id,
+            "component": "policy",
+            "operation": operation,
+            "phase": phase,
+            **({} if step_id is None else {"step_id": step_id}),
+            **({} if attempt is None else {"attempt": attempt}),
+            "category": category,
+            "code": code,
+            "retryable": False,
+        }
+        return failure_id
 
     @staticmethod
     def _sync(context: RunContext, state: ExecutionState) -> None:

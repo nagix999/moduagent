@@ -10,6 +10,7 @@ from moduagent.errors import (
     ExecutionInvariantError,
     ModelInvocationError,
     ModuAgentError,
+    OutputValidationError,
     PersistenceError,
     SkillError,
     ToolInvocationError,
@@ -31,6 +32,7 @@ from moduagent.models import (
     ModelResponse,
     validate_request_capabilities,
 )
+from moduagent.observability.diagnostics import NoopDiagnosticSink
 from moduagent.runtime.events import AgentEvent
 from moduagent.runtime.events import EventType
 from moduagent.runtime.events import EventVisibility
@@ -61,6 +63,7 @@ _ENGINE_OWNED_POLICY_KEYS = frozenset(
         "plan",
     }
 )
+_MAX_PENDING_SERVICE_EVENTS = 256
 
 
 def _contains_unsupported_projection(value: Any) -> bool:
@@ -108,6 +111,11 @@ class RuntimeServices:
         init=False,
         repr=False,
     )
+    _pending_event_capacity: asyncio.Event = field(
+        default_factory=asyncio.Event,
+        init=False,
+        repr=False,
+    )
 
     def bind(self, context: EngineContext) -> None:
         """Bind this per-run service bundle as the auxiliary ModelGateway."""
@@ -116,6 +124,12 @@ class RuntimeServices:
             raise ExecutionInvariantError("RuntimeServices cannot be rebound")
         self._bound_context = context
         context.run.model_gateway = self
+
+    @property
+    def checkpointing_enabled(self) -> bool:
+        """Whether Engine checkpoints have a durable destination for this run."""
+
+        return self.runtime.checkpoint_store is not None
 
     async def complete(
         self,
@@ -156,6 +170,7 @@ class RuntimeServices:
             ]
         if not self._pending_events:
             self._pending_event_signal.clear()
+        self._pending_event_capacity.set()
         return events
 
     async def wait_for_events(self) -> None:
@@ -167,7 +182,13 @@ class RuntimeServices:
                 return
             await self._pending_event_signal.wait()
 
-    def _enqueue_event(self, event: AgentEvent) -> None:
+    async def _enqueue_event(self, event: AgentEvent) -> None:
+        while len(self._pending_events) >= _MAX_PENDING_SERVICE_EVENTS:
+            self._pending_event_capacity.clear()
+            if len(self._pending_events) < _MAX_PENDING_SERVICE_EVENTS:
+                self._pending_event_capacity.set()
+                break
+            await self._pending_event_capacity.wait()
         self._pending_events.append(event)
         self._pending_event_signal.set()
 
@@ -212,7 +233,20 @@ class RuntimeServices:
         context: EngineContext,
         response: ModelResponse,
     ) -> Any:
-        return self.runtime.output_codec.decode(response)
+        reporter = getattr(self.runtime, "diagnostic_reporter", None)
+        if reporter is None or isinstance(
+            getattr(reporter, "sink", None),
+            NoopDiagnosticSink,
+        ):
+            # Preserve the 0.4 codec exception and terminal classification when
+            # diagnostics are disabled, including an explicit no-op sink.
+            return self.runtime.output_codec.decode(response)
+        try:
+            return self.runtime.output_codec.decode(response)
+        except OutputValidationError:
+            raise
+        except Exception as exc:
+            raise OutputValidationError("output validation failed") from exc
 
     async def prepare_model_request(
         self,
@@ -233,7 +267,7 @@ class RuntimeServices:
             protected_from=protected_from,
         )
         if memory_event is not None:
-            self._enqueue_event(self.runtime._published_event(memory_event))
+            await self._enqueue_event(self.runtime._published_event(memory_event))
         return prepared
 
     async def request_model(
@@ -278,6 +312,7 @@ class RuntimeServices:
                 attempt=attempt,
                 phase=phase,
             )
+            attempt_started = asyncio.get_running_loop().time()
             try:
                 response = await asyncio.wait_for(
                     model.complete(request),
@@ -292,12 +327,37 @@ class RuntimeServices:
                     response=response,
                     attempt=attempt,
                     phase=phase,
+                    duration_seconds=max(
+                        0.0,
+                        asyncio.get_running_loop().time() - attempt_started,
+                    ),
                 )
                 return response
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 if attempt >= context.config.retry.max_attempts:
+                    await self._capture_exception(
+                        context,
+                        exc,
+                        component="model",
+                        operation="complete",
+                        phase=phase,
+                        step_id=self._current_step_id(context),
+                        attempt=attempt,
+                        category=(
+                            "timeout"
+                            if isinstance(exc, asyncio.TimeoutError)
+                            else "model_invocation"
+                        ),
+                        code=(
+                            "model_timeout"
+                            if isinstance(exc, asyncio.TimeoutError)
+                            else "model_invocation_failed"
+                        ),
+                        retryable=True,
+                        terminal=True,
+                    )
                     if isinstance(exc, asyncio.TimeoutError):
                         raise
                     raise ModelInvocationError("model invocation failed") from exc
@@ -376,6 +436,7 @@ class RuntimeServices:
                 attempt=attempt,
                 phase=phase,
             )
+            attempt_started = asyncio.get_running_loop().time()
             try:
                 iterator = model.stream(request).__aiter__()
                 terminal = False
@@ -420,12 +481,37 @@ class RuntimeServices:
                     response=response,
                     attempt=attempt,
                     phase=phase,
+                    duration_seconds=max(
+                        0.0,
+                        asyncio.get_running_loop().time() - attempt_started,
+                    ),
                 )
                 return
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 if emitted_output or attempt >= context.config.retry.max_attempts:
+                    await self._capture_exception(
+                        context,
+                        exc,
+                        component="model",
+                        operation="stream",
+                        phase=phase,
+                        step_id=self._current_step_id(context),
+                        attempt=attempt,
+                        category=(
+                            "timeout"
+                            if isinstance(exc, asyncio.TimeoutError)
+                            else "model_invocation"
+                        ),
+                        code=(
+                            "model_timeout"
+                            if isinstance(exc, asyncio.TimeoutError)
+                            else "model_invocation_failed"
+                        ),
+                        retryable=True,
+                        terminal=True,
+                    )
                     if isinstance(exc, asyncio.TimeoutError):
                         raise
                     raise ModelInvocationError("model invocation failed") from exc
@@ -442,6 +528,94 @@ class RuntimeServices:
                 if delay:
                     await asyncio.sleep(delay)
         raise AssertionError("model stream retry loop ended unexpectedly")
+
+    async def _capture_exception(
+        self,
+        context: EngineContext,
+        exception: BaseException,
+        *,
+        component: str,
+        operation: str,
+        phase: str | None,
+        attempt: int | None,
+        category: str,
+        code: str,
+        retryable: bool,
+        terminal: bool,
+        step_id: str | None = None,
+        call_id: str | None = None,
+        tool_name: str | None = None,
+        set_primary: bool = True,
+    ) -> str | None:
+        """Capture a sanitized failure without letting observability alter a run."""
+
+        reporter = getattr(self.runtime, "diagnostic_reporter", None)
+        capture = getattr(reporter, "capture_exception", None)
+        if not callable(capture):
+            return None
+        try:
+            failure_id = await capture(
+                exception=exception,
+                run_id=context.run.run_id,
+                component=component,
+                operation=operation,
+                phase=phase,
+                step_id=step_id,
+                call_id=call_id,
+                tool_name=tool_name,
+                attempt=attempt,
+                category=category,
+                code=code,
+                retryable=retryable,
+                terminal=terminal,
+            )
+        except Exception:
+            return None
+        if isinstance(failure_id, str) and failure_id:
+            if not set_primary:
+                return failure_id
+            context.run.primary_failure = {
+                "failure_id": failure_id,
+                "component": component,
+                "operation": operation,
+                **({} if phase is None else {"phase": phase}),
+                **({} if step_id is None else {"step_id": step_id}),
+                **({} if attempt is None else {"attempt": attempt}),
+                "category": category,
+                "code": code,
+                "retryable": retryable,
+            }
+            return failure_id
+        return None
+
+    @staticmethod
+    def _current_step_id(context: EngineContext) -> str | None:
+        state = context.run.execution_state
+        step_id = getattr(state, "current_step_id", None)
+        step_execution = getattr(state, "step_execution", None)
+        if step_execution is not None:
+            step_id = getattr(step_execution, "current_step_id", step_id)
+        return step_id if isinstance(step_id, str) and step_id else None
+
+    async def _capture_tool_batch_failure(
+        self,
+        context: EngineContext,
+        exception: BaseException,
+    ) -> str | None:
+        timed_out = isinstance(exception, asyncio.TimeoutError)
+        return await self._capture_exception(
+            context,
+            exception,
+            component="tool",
+            operation="execute_batch",
+            phase="act",
+            step_id=self._current_step_id(context),
+            attempt=None,
+            category="timeout" if timed_out else "tool_invocation",
+            code="tool_timeout" if timed_out else "tool_execution_failed",
+            retryable=timed_out,
+            terminal=True,
+        )
 
     async def execute_tool_batch(
         self,
@@ -526,8 +700,8 @@ class RuntimeServices:
                     raise
                 except ModuAgentError:
                     raise
-                except Exception:
-                    raise ToolInvocationError("tool execution failed") from None
+                except Exception as exc:
+                    raise ToolInvocationError("tool execution failed") from exc
             else:
                 try:
                     raw_results = await asyncio.wait_for(
@@ -546,12 +720,13 @@ class RuntimeServices:
                     raise
                 except ModuAgentError:
                     raise
-                except Exception:
-                    raise ToolInvocationError("tool execution failed") from None
+                except Exception as exc:
+                    raise ToolInvocationError("tool execution failed") from exc
                 outcome = self._legacy_tool_outcome(calls, raw_results)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            await self._capture_tool_batch_failure(context, exc)
             await self._queue_tool_execution_failure(
                 context,
                 calls,
@@ -561,21 +736,34 @@ class RuntimeServices:
         finally:
             context.run.status = RunStatus.RUNNING
         if not isinstance(outcome, ToolBatchOutcome):
+            error = ToolInvocationError("tool executor returned mismatched results")
+            await self._capture_tool_batch_failure(context, error)
             await self._queue_tool_execution_failure(context, calls)
-            raise ToolInvocationError("tool executor returned mismatched results")
+            raise error
         outcome = self._apply_skill_resource_limits(context, outcome)
         safe_views = {view.call_id: view for view in outcome.sanitized_failure_views}
+        internal_failures = {failure.call_id: failure for failure in outcome.failures}
         for call, result in zip(outcome.calls, outcome.results):
             self.runtime._record_tool_trace(context.run, call, result)
+            failure_payload = (
+                None
+                if result.success or result.call_id not in safe_views
+                else safe_views[result.call_id].to_dict()
+            )
+            internal_failure = internal_failures.get(result.call_id)
+            failure_id = getattr(internal_failure, "failure_id", None)
+            if (
+                isinstance(failure_payload, dict)
+                and isinstance(failure_id, str)
+                and failure_id
+            ):
+                failure_payload["failure_id"] = failure_id
+                context.run.tool_failure_ids[result.call_id] = failure_id
             await self._queue_tool_completed(
                 context,
                 call,
                 result,
-                failure=(
-                    None
-                    if result.success or result.call_id not in safe_views
-                    else safe_views[result.call_id].to_dict()
-                ),
+                failure=failure_payload,
             )
         return outcome
 
@@ -654,7 +842,7 @@ class RuntimeServices:
             raise ModelInvocationError(
                 f"incomplete finalization response ({finish_reason})"
             )
-        output = self.runtime.output_codec.decode(response)
+        output = self.decode_output(context, response)
         content = response.message.content
         if content is None or not str(content).strip():
             raise ModelInvocationError("finalization response is empty")
@@ -755,6 +943,8 @@ class RuntimeServices:
         *,
         boundary: DurableBoundary,
     ) -> None:
+        if not self.checkpointing_enabled:
+            return
         self._last_engine_snapshot = snapshot
         context.run.metadata["_moduagent_engine_id"] = snapshot.engine_id
         context.run.metadata["_moduagent_engine_state_version"] = snapshot.state_version
@@ -773,33 +963,47 @@ class RuntimeServices:
             "state_version": snapshot.state_version,
             "state": dict(snapshot.state),
         }
-        if self.runtime.checkpoint_store is not None:
-            saved_event = self.runtime._reserve_event(
-                AgentEvent(
-                    EventType.CHECKPOINT_SAVED,
-                    context.run.run_id,
-                    {
-                        "engine_id": snapshot.engine_id,
-                        "state_version": snapshot.state_version,
-                        "boundary": boundary.value,
-                    },
-                )
+        saved_event = self.runtime._reserve_event(
+            AgentEvent(
+                EventType.CHECKPOINT_SAVED,
+                context.run.run_id,
+                {
+                    "engine_id": snapshot.engine_id,
+                    "state_version": snapshot.state_version,
+                    "boundary": boundary.value,
+                },
             )
-            try:
-                await self._save_engine_snapshot(
-                    context,
-                    snapshot,
-                    timeout=self.remaining_seconds(context),
-                )
-            except BaseException:
-                self.runtime._reserved_events.pop(
-                    (saved_event.run_id, saved_event.event_id),
-                    None,
-                )
-                raise
-            self._enqueue_event(
-                await self.runtime._dispatch_reserved_event(saved_event)
+        )
+        checkpoint_started = asyncio.get_running_loop().time()
+        try:
+            await self._save_engine_snapshot(
+                context,
+                snapshot,
+                timeout=self.remaining_seconds(context),
             )
+        except BaseException:
+            self.runtime._reserved_events.pop(
+                (saved_event.run_id, saved_event.event_id),
+                None,
+            )
+            raise
+        checkpoint_duration_seconds = max(
+            0.0,
+            asyncio.get_running_loop().time() - checkpoint_started,
+        )
+        saved_event = replace(
+            saved_event,
+            data={
+                **dict(saved_event.data),
+                "duration_seconds": checkpoint_duration_seconds,
+            },
+        )
+        self.runtime._reserved_events[(saved_event.run_id, saved_event.event_id)] = (
+            saved_event
+        )
+        await self._enqueue_event(
+            await self.runtime._dispatch_reserved_event(saved_event)
+        )
 
     async def checkpoint_safely(
         self,
@@ -897,7 +1101,7 @@ class RuntimeServices:
         context: EngineContext,
         event: AgentEvent,
     ) -> None:
-        self._enqueue_event(await self.publish_event(context, event))
+        await self._enqueue_event(await self.publish_event(context, event))
 
     async def _queue_retry_event(
         self,
@@ -918,7 +1122,7 @@ class RuntimeServices:
                 "error_type": type(error).__name__,
             },
         )
-        self._enqueue_event(await self.publish_event(context, event))
+        await self._enqueue_event(await self.publish_event(context, event))
 
     async def _queue_model_started(
         self,
@@ -948,6 +1152,7 @@ class RuntimeServices:
         response: ModelResponse,
         attempt: int,
         phase: str,
+        duration_seconds: float,
     ) -> None:
         await self.defer_event(
             context,
@@ -958,8 +1163,12 @@ class RuntimeServices:
                     "step": context.run.step,
                     "attempt": attempt,
                     "phase": phase,
+                    "duration_seconds": duration_seconds,
                     "usage": response.usage,
                     "finish_reason": response.finish_reason,
+                    "tool_call_count": len(
+                        response.tool_calls or response.message.tool_calls
+                    ),
                 },
                 visibility=EventVisibility.INTERNAL,
             ),
@@ -1070,6 +1279,12 @@ class RuntimeServices:
             )
         )
         projected["success"] = success
+        attempts = getattr(result, "attempts", None)
+        if type(attempts) is int and attempts >= 0:
+            projected["attempt"] = attempts
+        duration = getattr(result, "duration_seconds", None)
+        if isinstance(duration, (int, float)) and duration >= 0:
+            projected["duration_seconds"] = float(duration)
         if not success:
             safe_failure = event.data.get("failure")
             if isinstance(safe_failure, Mapping):
@@ -1087,6 +1302,7 @@ class RuntimeServices:
                         "arguments_fingerprint",
                         "invocation_fingerprint",
                         "message",
+                        "failure_id",
                     }
                 }
             else:
@@ -1121,43 +1337,59 @@ class RuntimeServices:
         if callable(save_snapshot):
             # Import lazily to keep the Engine contracts below persistence and
             # to avoid a package initialization cycle.
-            from moduagent.persistence import RunCheckpoint
+            from moduagent.persistence.checkpoint import _build_run_snapshot
 
             compatibility_policy_state = {
                 key: value
                 for key, value in context.run.policy_state.items()
                 if key not in _ENGINE_OWNED_POLICY_KEYS
             }
-            # Build the compatibility part without re-migrating the mutable
-            # legacy Plan facade. The explicit EngineSnapshot is authoritative
-            # and may legitimately be ahead of that facade during repair.
-            checkpoint = replace(
-                RunCheckpoint.from_context(context.run),
-                execution_state=None,
-                policy_state=compatibility_policy_state,
-                engine_id=snapshot.engine_id,
-                engine_state_version=snapshot.state_version,
-                engine_state=snapshot.state,
-            )
-            envelope = checkpoint.to_snapshot()
-            common_state = replace(
-                envelope.common_state,
-                compatibility_policy_state=compatibility_policy_state,
-            )
             agent_spec = getattr(self.runtime, "agent_spec", None)
             fingerprint = getattr(agent_spec, "agent_fingerprint", None)
-            if isinstance(fingerprint, str) and fingerprint:
-                envelope = replace(
-                    envelope,
-                    agent_fingerprint=fingerprint,
-                    common_state=common_state,
+            finalization = snapshot.state.get("finalization")
+            if snapshot.engine_id in {"standard", "plan"} and isinstance(
+                finalization,
+                Mapping,
+            ):
+                envelope = _build_run_snapshot(
+                    context.run,
+                    snapshot,
+                    compatibility_policy_state=compatibility_policy_state,
+                    agent_fingerprint=(
+                        fingerprint
+                        if isinstance(fingerprint, str) and fingerprint
+                        else None
+                    ),
                 )
             else:
+                # Bootstrap and custom Engine snapshots retain the 0.4
+                # compatibility path until they expose common finalization
+                # markers explicitly.
+                from moduagent.persistence import RunCheckpoint
+
+                checkpoint = replace(
+                    RunCheckpoint.from_context(context.run),
+                    execution_state=None,
+                    policy_state=compatibility_policy_state,
+                    engine_id=snapshot.engine_id,
+                    engine_state_version=snapshot.state_version,
+                    engine_state=snapshot.state,
+                )
+                envelope = checkpoint.to_snapshot()
+                common_state = replace(
+                    envelope.common_state,
+                    compatibility_policy_state=compatibility_policy_state,
+                )
                 envelope = replace(
                     envelope,
                     common_state=common_state,
+                    engine=snapshot,
+                    **(
+                        {"agent_fingerprint": fingerprint}
+                        if isinstance(fingerprint, str) and fingerprint
+                        else {}
+                    ),
                 )
-            envelope = replace(envelope, engine=snapshot)
             try:
                 await asyncio.wait_for(
                     save_snapshot(envelope),

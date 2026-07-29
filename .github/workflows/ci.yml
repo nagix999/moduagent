@@ -23,8 +23,8 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[dev]'
-      - run: ruff check moduagent tests
-      - run: ruff format --check moduagent tests
+      - run: ruff check moduagent tests benchmarks
+      - run: ruff format --check moduagent tests benchmarks
       - run: pytest -q
 
   package:
@@ -68,18 +68,19 @@ jobs:
           sdist = next(Path("/tmp/moduagent-sdist").glob("moduagent-*.tar.gz"))
           with open_tar(sdist, "r:gz") as archive:
               source_names = archive.getnames()
-          required_tests = {
+          required_files = {
+              "benchmarks/performance_v042.py",
               "tests/integration/test_live_models.py",
               "tests/integration/test_live_persistence.py",
           }
-          missing_tests = {
+          missing_files = {
               expected
-              for expected in required_tests
+              for expected in required_files
               if not any(name.endswith(expected) for name in source_names)
           }
-          if missing_tests:
+          if missing_files:
               raise SystemExit(
-                  f"sdist omits integration tests: {sorted(missing_tests)}"
+                  f"sdist omits required files: {sorted(missing_files)}"
               )
           generated_files = {
               name
@@ -97,5 +98,5 @@ jobs:
           python -m venv /tmp/moduagent-venv
           /tmp/moduagent-venv/bin/python -m pip install /tmp/moduagent-wheel/moduagent-*.whl
           /tmp/moduagent-venv/bin/python -c \
-            "import moduagent; assert moduagent.__version__ == '0.4.0'"
+            "import moduagent; assert moduagent.__version__ == '0.4.2'"
           /tmp/moduagent-venv/bin/moduagent --help

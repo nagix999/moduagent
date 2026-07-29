@@ -5,7 +5,7 @@ import inspect
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ValidationError
 
@@ -45,6 +45,9 @@ from moduagent.tools.failure import (
     tool_error_from_classification,
 )
 from moduagent.tools.registry import ToolRegistry
+
+if TYPE_CHECKING:
+    from moduagent.observability.diagnostics import DiagnosticReporter
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +170,15 @@ class _CallExecution:
     failure: InternalToolFailure | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _ClassifiedToolError:
+    error: ToolError
+    safe_message_declared: bool
+    diagnostic_error: Exception
+    diagnostic_operation: str = "invoke"
+    diagnostic_category: str = "tool_invocation"
+
+
 class ToolRuntime:
     """Single operational boundary for validation, authorization and execution."""
 
@@ -178,6 +190,7 @@ class ToolRuntime:
         retry: RetryConfig | None = None,
         retry_config: RetryConfig | None = None,
         failure_projector: FailureProjector | None = None,
+        diagnostic_reporter: DiagnosticReporter | None = None,
         default_timeout_seconds: float | None = 30.0,
         max_result_bytes: int | None = 1_000_000,
     ) -> None:
@@ -199,6 +212,7 @@ class ToolRuntime:
         self.authorizer = authorizer or AllowAllAuthorizer()
         self.retry = retry or retry_config or RetryConfig()
         self.failure_projector = failure_projector or FailureProjector()
+        self.diagnostic_reporter = diagnostic_reporter
         self.default_timeout_seconds = default_timeout_seconds
         self.max_result_bytes = max_result_bytes
 
@@ -526,6 +540,15 @@ class ToolRuntime:
             raw_decision = self.authorizer.authorize(tool, arguments, context)
             decision = await _await_if_needed(raw_decision)
         except Exception as exc:
+            failure_id = await self._capture_diagnostic(
+                exc,
+                context=context,
+                call=call,
+                operation="authorize",
+                category="tool_authorization",
+                code="authorization_backend_failed",
+                retryable=False,
+            )
             result = ToolResult.failed(
                 call_id=call.id,
                 tool_name=call.name,
@@ -545,7 +568,8 @@ class ToolRuntime:
                     profile,
                     requested_fingerprint=requested_fingerprint,
                     effective_fingerprint=effective_fingerprint,
-                    diagnostic_ref=type(exc).__name__,
+                    diagnostic_ref=failure_id or type(exc).__name__,
+                    failure_id=failure_id,
                 ),
             )
         if isinstance(decision, bool):
@@ -601,6 +625,7 @@ class ToolRuntime:
         if timeout is None:
             timeout = self.default_timeout_seconds
         diagnostic_ref: str | None = None
+        failure_id: str | None = None
 
         for attempt in range(1, attempts + 1):
             call_context = context.for_call(call.id, attempt=attempt)
@@ -663,12 +688,14 @@ class ToolRuntime:
                 )
             except Exception as exc:
                 diagnostic_ref = type(exc).__name__
-                error, safe_message_declared = self._classify_error(
+                classified_error = self._classify_error(
                     tool,
                     exc,
                     timeout_seconds=timeout,
                     safety_profile=profile,
                 )
+                error = classified_error.error
+                safe_message_declared = classified_error.safe_message_declared
 
             retry_recovery = error.recovery in {
                 None,
@@ -688,6 +715,19 @@ class ToolRuntime:
                 if delay:
                     await asyncio.sleep(delay)
                 continue
+            classification = classification_from_tool_error(error)
+            failure_id = await self._capture_diagnostic(
+                classified_error.diagnostic_error,
+                context=context,
+                call=call,
+                operation=classified_error.diagnostic_operation,
+                category=classified_error.diagnostic_category,
+                code=classification.stable_reason,
+                retryable=classification.retryable,
+                attempt=attempt,
+            )
+            if failure_id is not None:
+                diagnostic_ref = failure_id
             result = ToolResult.failed(
                 call_id=call.id,
                 tool_name=call.name,
@@ -706,6 +746,7 @@ class ToolRuntime:
                     effective_fingerprint=effective_fingerprint,
                     retry_exhausted=retry_safe and attempt >= attempts,
                     diagnostic_ref=diagnostic_ref,
+                    failure_id=failure_id,
                     safe_message_declared=safe_message_declared,
                 ),
             )
@@ -742,6 +783,7 @@ class ToolRuntime:
         effective_fingerprint: str | None = None,
         retry_exhausted: bool = False,
         diagnostic_ref: str | None = None,
+        failure_id: str | None = None,
         safe_message_declared: bool = False,
     ) -> InternalToolFailure:
         if result.error is None:
@@ -768,6 +810,7 @@ class ToolRuntime:
             attempts=result.attempts,
             same_call_retry_exhausted=retry_exhausted,
             diagnostic_ref=diagnostic_ref,
+            failure_id=failure_id,
         )
 
     @staticmethod
@@ -776,6 +819,45 @@ class ToolRuntime:
             return fingerprint_tool_arguments(arguments)
         except (TypeError, ValueError):
             return None
+
+    async def _capture_diagnostic(
+        self,
+        exception: Exception,
+        *,
+        context: ToolExecutionContext,
+        call: ToolCall,
+        operation: str,
+        category: str,
+        code: str,
+        retryable: bool,
+        attempt: int | None = None,
+    ) -> str | None:
+        capture = getattr(self.diagnostic_reporter, "capture_exception", None)
+        if not callable(capture):
+            return None
+        try:
+            failure_id = await capture(
+                exception=exception,
+                run_id=context.run_id,
+                component="tool",
+                operation=operation,
+                phase="act",
+                call_id=call.id,
+                tool_name=call.name,
+                attempt=attempt,
+                category=category,
+                code=code,
+                retryable=retryable,
+                terminal=False,
+            )
+        except Exception:
+            # Diagnostics are best-effort and cannot alter Tool classification,
+            # authorization, retries, or the returned outcome.
+            return None
+        if not isinstance(failure_id, str):
+            return None
+        failure_id = failure_id.strip()
+        return failure_id or None
 
     @staticmethod
     def _validate_arguments(
@@ -838,11 +920,11 @@ class ToolRuntime:
         *,
         timeout_seconds: float | None,
         safety_profile: ToolSafetyProfile,
-    ) -> tuple[ToolError, bool]:
+    ) -> _ClassifiedToolError:
         if isinstance(exception, asyncio.TimeoutError) and not (
             safety_profile.timeout_retry_safe
         ):
-            return (
+            return _ClassifiedToolError(
                 ToolError(
                     ToolErrorType.TIMEOUT,
                     f"tool timed out: {tool.name}",
@@ -852,16 +934,17 @@ class ToolRuntime:
                     recovery=ToolRecoveryAction.FAIL,
                 ),
                 True,
+                exception,
             )
         if isinstance(exception, ToolFailure):
-            return exception.error, False
+            return _ClassifiedToolError(exception.error, False, exception)
 
         classifier = getattr(tool, "failure_classifier", None)
         if callable(classifier):
             try:
                 classified = classifier(exception)
             except Exception as classifier_error:
-                return (
+                return _ClassifiedToolError(
                     ToolError(
                         ToolErrorType.EXECUTION_ERROR,
                         "tool failure classifier failed",
@@ -870,11 +953,18 @@ class ToolRuntime:
                         recovery=ToolRecoveryAction.FAIL,
                     ),
                     False,
+                    classifier_error,
+                    diagnostic_operation="classify_failure",
+                    diagnostic_category="tool_classification",
                 )
             if classified is not None:
                 if isinstance(classified, ToolFailureClassification):
-                    return tool_error_from_classification(classified), True
-                return (
+                    return _ClassifiedToolError(
+                        tool_error_from_classification(classified),
+                        True,
+                        exception,
+                    )
+                return _ClassifiedToolError(
                     ToolError(
                         ToolErrorType.EXECUTION_ERROR,
                         "tool failure classifier returned an invalid result",
@@ -883,6 +973,9 @@ class ToolRuntime:
                         recovery=ToolRecoveryAction.FAIL,
                     ),
                     False,
+                    exception,
+                    diagnostic_operation="classify_failure",
+                    diagnostic_category="tool_classification",
                 )
 
         mapper = getattr(tool, "error_mapper", None)
@@ -890,26 +983,34 @@ class ToolRuntime:
             try:
                 mapped = mapper(exception)
             except Exception as mapper_error:
-                return (
+                return _ClassifiedToolError(
                     ToolError(
                         ToolErrorType.EXECUTION_ERROR,
                         "tool error mapper failed",
                         details={"exception_type": type(mapper_error).__name__},
+                        reason="error_mapper_failed",
                         recovery=ToolRecoveryAction.FAIL,
                     ),
                     False,
+                    mapper_error,
+                    diagnostic_operation="map_error",
+                    diagnostic_category="tool_error_mapping",
                 )
             if mapped is not None:
                 if isinstance(mapped, ToolError):
-                    return mapped, False
-                return (
+                    return _ClassifiedToolError(mapped, False, exception)
+                return _ClassifiedToolError(
                     ToolError(
                         ToolErrorType.EXECUTION_ERROR,
                         "tool error mapper returned an invalid result",
                         details={"result_type": type(mapped).__name__},
+                        reason="invalid_error_mapper_result",
                         recovery=ToolRecoveryAction.FAIL,
                     ),
                     False,
+                    exception,
+                    diagnostic_operation="map_error",
+                    diagnostic_category="tool_error_mapping",
                 )
 
         if isinstance(exception, asyncio.TimeoutError):
@@ -917,7 +1018,7 @@ class ToolRuntime:
                 safety_profile.same_call_retry_safe
                 and safety_profile.timeout_retry_safe
             )
-            return (
+            return _ClassifiedToolError(
                 ToolError(
                     ToolErrorType.TIMEOUT,
                     f"tool timed out: {tool.name}",
@@ -931,8 +1032,9 @@ class ToolRuntime:
                     ),
                 ),
                 True,
+                exception,
             )
-        return (
+        return _ClassifiedToolError(
             ToolError(
                 ToolErrorType.EXECUTION_ERROR,
                 f"tool execution failed: {exception}",
@@ -940,4 +1042,5 @@ class ToolRuntime:
                 details={"exception_type": type(exception).__name__},
             ),
             False,
+            exception,
         )
