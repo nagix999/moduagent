@@ -22,6 +22,7 @@ from moduagent import (
     ModelResponse,
     ModelSkillSelector,
     PlanAndExecutePolicy,
+    PlanExecutionProfile,
     PydanticOutputCodec,
     RBACToolAuthorizer,
     RecentTurnsConversationMemoryPolicy,
@@ -103,7 +104,7 @@ def test_explicit_skill_is_prompt_only_and_not_persisted() -> None:
 
         events = [
             event
-            async for event in agent.stream(
+            async for event in agent.stream_all(
                 "간단히 답해줘",
                 session_id="skill-session",
                 skills=["brief-answer"],
@@ -345,7 +346,11 @@ def test_reference_read_is_bounded_ephemeral_and_separately_counted(
         )
         conversations = InMemoryConversationStore()
         agent = Agent(
-            config=AgentConfig("policy", "Use the policy source."),
+            config=AgentConfig(
+                "policy",
+                "Use the policy source.",
+                limits=RunLimits(max_tool_calls=0),
+            ),
             model=model,
             skill_registry=registry,
             conversation_store=conversations,
@@ -353,7 +358,7 @@ def test_reference_read_is_bounded_ephemeral_and_separately_counted(
 
         events = [
             event
-            async for event in agent.stream(
+            async for event in agent.stream_all(
                 "연차 승인 조건은?",
                 session_id="resource-session",
                 skills=["policy-guide"],
@@ -497,17 +502,20 @@ def test_checkpoint_resume_rejects_changed_skill_digest(tmp_path: Path) -> None:
             session_id="skill-resume",
             skills=["stable-workflow"],
         )
-        assert failed.error == "model unavailable"
-        assert await checkpoints.load(failed.run_id) is not None
+        assert failed.error == "model invocation failed"
+        before_resume = await checkpoints.load_snapshot(failed.run_id)
+        assert before_resume is not None
 
         skill_file.write_text(
             _skill("stable-workflow", "Use revision two."),
             encoding="utf-8",
         )
         resumed = await agent.resume(failed.run_id, session_id="skill-resume")
+        after_resume = await checkpoints.load_snapshot(failed.run_id)
 
         assert resumed.finish_reason == "error"
         assert "skill content changed" in (resumed.error or "")
+        assert after_resume == before_resume
 
     asyncio.run(scenario())
 
@@ -554,13 +562,85 @@ def test_checkpoint_resume_retries_incomplete_auto_selection() -> None:
             session_id="selection-resume",
             skill_mode="auto",
         )
-        assert failed.error == "selector temporarily unavailable"
+        assert failed.error == "Skill activation failed"
 
         resumed = await agent.resume(failed.run_id, session_id="selection-resume")
 
         assert resumed.output == "완료"
         assert selector.calls == 2
         assert resumed.metadata["skills"][0]["name"] == "retry-guide"
+
+    asyncio.run(scenario())
+
+
+def test_plan_checkpoint_retries_skill_failure_before_engine_initialization() -> None:
+    async def scenario() -> None:
+        registry = SkillRegistry.from_sources(
+            InMemorySkillSource(
+                {
+                    "plan-guide": _skill(
+                        "plan-guide",
+                        "Use the plan guide.",
+                    )
+                }
+            )
+        )
+
+        class FlakySelector:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def select(self, request):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("selector temporarily unavailable")
+                return SkillSelectionResult(
+                    names=("plan-guide",),
+                    selected_by={"plan-guide": "model"},
+                )
+
+        class ReachedPlanGenerator:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def create(self, context):
+                self.calls += 1
+                raise RuntimeError("plan initialization reached")
+
+            async def revise(self, context, plan, feedback):
+                return plan
+
+        selector = FlakySelector()
+        generator = ReachedPlanGenerator()
+        checkpoints = InMemoryCheckpointStore()
+        agent = Agent(
+            config=AgentConfig("plan-bootstrap", "Plan accurately."),
+            model=RecordingModel([]),
+            execution_profile=PlanExecutionProfile(generator),
+            skill_registry=registry,
+            skill_selector=selector,
+            checkpoint_store=checkpoints,
+        )
+
+        failed = await agent.run(
+            "처리해줘",
+            session_id="plan-bootstrap",
+            skill_mode="auto",
+        )
+        snapshot = await checkpoints.load_snapshot(failed.run_id)
+
+        assert snapshot is not None
+        assert snapshot.engine.engine_id == "plan"
+        assert snapshot.engine.state == {}
+
+        resumed = await agent.resume(
+            failed.run_id,
+            session_id="plan-bootstrap",
+        )
+
+        assert resumed.error == "run failed"
+        assert selector.calls == 2
+        assert generator.calls == 1
 
     asyncio.run(scenario())
 
@@ -621,7 +701,7 @@ def test_filesystem_activation_and_restore_are_off_loop_and_reuse_artifacts(
             session_id="async-skill-load",
             skills=["cached-reference"],
         )
-        assert failed.error == "pause for resume"
+        assert failed.error == "model invocation failed"
         # Activation loads once. has_resources() and supports_resource_search()
         # must use the activated artifact instead of scanning twice more.
         assert len(load_threads) == 1
@@ -784,7 +864,7 @@ def test_mixed_resource_and_business_rejection_resumes_complete_protocol(
             message.tool_call_id
             for message in checkpoint.messages
             if message.role.value == "tool"
-        ] == ["resource-1", "business-1"]
+        ] == []
 
         resumed = await agent.resume(failed.run_id, session_id="mixed-resume")
 
@@ -852,7 +932,7 @@ def test_resource_read_quota_rejection_resumes_complete_protocol() -> None:
             message.tool_call_id
             for message in checkpoint.messages
             if message.role.value == "tool"
-        ] == ["quota-read-1"]
+        ] == []
 
         resumed = await agent.resume(failed.run_id, session_id="quota-resume")
 
@@ -919,7 +999,7 @@ def test_restore_rejects_checkpoint_resource_reads_above_current_limit() -> None
             session_id="restore-quota",
             skills=["restore-quota"],
         )
-        assert failed.error == "pause after resource read"
+        assert failed.error == "model invocation failed"
         checkpoint = await checkpoints.load(failed.run_id)
         assert checkpoint is not None
         assert checkpoint.skill_state.resource_reads == 1
@@ -937,7 +1017,8 @@ def test_restore_rejects_checkpoint_resource_reads_above_current_limit() -> None
         )
 
         assert resumed.finish_reason is FinishReason.ERROR
-        assert resumed.error == "checkpoint reads exceed max_resource_reads"
+        assert resumed.error == "checkpoint state migration failed"
+        assert resumed.metadata["error_summary"]["category"] == "state_migration"
 
     asyncio.run(scenario())
 
@@ -984,7 +1065,7 @@ def test_hallucinated_resource_tool_without_registry_resumes_complete_protocol()
             message.tool_call_id
             for message in checkpoint.messages
             if message.role.value == "tool"
-        ] == ["hallucinated-read-1"]
+        ] == []
 
         resumed = await agent.resume(
             failed.run_id,
@@ -1050,7 +1131,7 @@ def test_skill_allowed_tools_never_bypass_tool_authorizer() -> None:
         tool_messages = [
             message for message in result.messages if message.role.value == "tool"
         ]
-        assert len(tool_messages) == 1
-        assert "unauthorized" in (tool_messages[0].content or "")
+        assert tool_messages == []
+        assert result.metadata["tool_trace"][0]["error"]["type"] == "unauthorized"
 
     asyncio.run(scenario())

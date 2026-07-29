@@ -11,7 +11,7 @@ from moduagent.memory.token import (
     VLLMTokenCounter,
 )
 from moduagent.messages import Message, Usage
-from moduagent.models import ModelClient, ModelRequest
+from moduagent.models import ModelClient, ModelGateway, ModelRequest
 
 
 _DEFAULT_INSTRUCTIONS = (
@@ -40,6 +40,17 @@ class ConversationSummarizer(Protocol):
         messages: tuple[Message, ...],
         *,
         previous_summary: str | None = None,
+    ) -> SummaryResult: ...
+
+
+@runtime_checkable
+class GatewayConversationSummarizer(Protocol):
+    async def summarize_with_gateway(
+        self,
+        messages: tuple[Message, ...],
+        *,
+        previous_summary: str | None,
+        gateway: ModelGateway,
     ) -> SummaryResult: ...
 
 
@@ -95,6 +106,32 @@ class ModelConversationSummarizer:
         *,
         previous_summary: str | None = None,
     ) -> SummaryResult:
+        return await self._summarize(
+            messages,
+            previous_summary=previous_summary,
+            gateway=None,
+        )
+
+    async def summarize_with_gateway(
+        self,
+        messages: tuple[Message, ...],
+        *,
+        previous_summary: str | None,
+        gateway: ModelGateway,
+    ) -> SummaryResult:
+        return await self._summarize(
+            messages,
+            previous_summary=previous_summary,
+            gateway=gateway,
+        )
+
+    async def _summarize(
+        self,
+        messages: tuple[Message, ...],
+        *,
+        previous_summary: str | None,
+        gateway: ModelGateway | None,
+    ) -> SummaryResult:
         if not messages:
             if previous_summary and previous_summary.strip():
                 return SummaryResult(previous_summary.strip())
@@ -138,7 +175,16 @@ class ModelConversationSummarizer:
                 else:
                     index += 1
 
-            response = await self.model.complete(self._request(summary, batch))
+            model_request = self._request(summary, batch)
+            response = (
+                await self.model.complete(model_request)
+                if gateway is None
+                else await gateway.complete(
+                    self.model,
+                    model_request,
+                    phase="memory_summary",
+                )
+            )
             calls = response.tool_calls or response.message.tool_calls
             if calls:
                 raise RuntimeError("conversation summarizer returned Tool Calls")
@@ -212,6 +258,7 @@ class ModelConversationSummarizer:
 
 __all__ = [
     "ConversationSummarizer",
+    "GatewayConversationSummarizer",
     "ModelConversationSummarizer",
     "SummaryResult",
 ]

@@ -7,10 +7,15 @@ from typing import Any, TypeVar, get_type_hints, overload
 from pydantic import BaseModel, ConfigDict, create_model
 
 from moduagent.tools.base import (
+    ToolError,
     ToolExecutionContext,
     ToolSchema,
     _await_if_needed,
     _run_sync_in_daemon,
+)
+from moduagent.tools.failure import (
+    ToolFailureClassification,
+    ToolSafetyProfile,
 )
 
 
@@ -19,7 +24,11 @@ F = TypeVar("F", bound=Function)
 
 
 class FunctionTool:
-    """Adapt a typed Python function to the Tool contract."""
+    """Adapt a typed Python function to the Tool contract.
+
+    ``error_mapper`` results become model-visible ToolError payloads, so their
+    message and details must already be sanitized by the caller.
+    """
 
     def __init__(
         self,
@@ -32,6 +41,13 @@ class FunctionTool:
         idempotent: bool = False,
         timeout_seconds: float | None = None,
         max_result_bytes: int | None = None,
+        repair_safe: bool = False,
+        timeout_retry_safe: bool | None = None,
+        error_mapper: Callable[[Exception], ToolError | None] | None = None,
+        safety_profile: ToolSafetyProfile | None = None,
+        failure_classifier: (
+            Callable[[Exception], ToolFailureClassification | None] | None
+        ) = None,
     ) -> None:
         if input_model is not None and args_schema is not None:
             raise ValueError("use either input_model or args_schema, not both")
@@ -39,15 +55,59 @@ class FunctionTool:
             raise ValueError("timeout_seconds must be positive")
         if max_result_bytes is not None and max_result_bytes < 1:
             raise ValueError("max_result_bytes must be at least 1")
+        if not isinstance(idempotent, bool):
+            raise TypeError("idempotent must be a bool")
+        if not isinstance(repair_safe, bool):
+            raise TypeError("repair_safe must be a bool")
+        if timeout_retry_safe is not None and not isinstance(
+            timeout_retry_safe,
+            bool,
+        ):
+            raise TypeError("timeout_retry_safe must be a bool")
+        if error_mapper is not None and not callable(error_mapper):
+            raise TypeError("error_mapper must be callable")
+        if safety_profile is not None and not isinstance(
+            safety_profile,
+            ToolSafetyProfile,
+        ):
+            raise TypeError("safety_profile must be a ToolSafetyProfile")
+        if failure_classifier is not None and not callable(failure_classifier):
+            raise TypeError("failure_classifier must be callable")
+        if error_mapper is not None and failure_classifier is not None:
+            raise ValueError("use either error_mapper or failure_classifier, not both")
+        if safety_profile is not None and (
+            idempotent or repair_safe or timeout_retry_safe is not None
+        ):
+            raise ValueError(
+                "safety_profile cannot be combined with legacy safety arguments"
+            )
 
         self.function = function
         self.name = name or function.__name__
         if not self.name.strip():
             raise ValueError("tool name cannot be empty")
         self.description = description or inspect.getdoc(function) or self.name
-        self.idempotent = idempotent
         self.timeout_seconds = timeout_seconds
         self.max_result_bytes = max_result_bytes
+        resolved_safety_profile = safety_profile or ToolSafetyProfile(
+            same_call_retry_safe=idempotent,
+            changed_argument_repair_safe=repair_safe,
+            # A coroutine can be cancelled by asyncio.wait_for. A daemon-backed
+            # synchronous function keeps running after timeout, so overlapping
+            # retry is unsafe unless the integration explicitly guarantees it.
+            timeout_retry_safe=(
+                inspect.iscoroutinefunction(function)
+                if timeout_retry_safe is None
+                else timeout_retry_safe
+            ),
+        )
+        self.safety_profile = resolved_safety_profile
+        # Retain the 0.3.2 attributes for custom integrations and introspection.
+        self.idempotent = resolved_safety_profile.same_call_retry_safe
+        self.repair_safe = resolved_safety_profile.changed_argument_repair_safe
+        self.timeout_retry_safe = resolved_safety_profile.timeout_retry_safe
+        self.error_mapper = error_mapper
+        self.failure_classifier = failure_classifier
         self._context_parameter: str | None = None
         explicit_model = input_model or args_schema
         if explicit_model is not None:
@@ -166,6 +226,13 @@ def function_tool(
     idempotent: bool = False,
     timeout_seconds: float | None = None,
     max_result_bytes: int | None = None,
+    repair_safe: bool = False,
+    timeout_retry_safe: bool | None = None,
+    error_mapper: Callable[[Exception], ToolError | None] | None = None,
+    safety_profile: ToolSafetyProfile | None = None,
+    failure_classifier: (
+        Callable[[Exception], ToolFailureClassification | None] | None
+    ) = None,
 ) -> Callable[[F], FunctionTool]: ...
 
 
@@ -180,6 +247,13 @@ def function_tool(
     idempotent: bool = False,
     timeout_seconds: float | None = None,
     max_result_bytes: int | None = None,
+    repair_safe: bool = False,
+    timeout_retry_safe: bool | None = None,
+    error_mapper: Callable[[Exception], ToolError | None] | None = None,
+    safety_profile: ToolSafetyProfile | None = None,
+    failure_classifier: (
+        Callable[[Exception], ToolFailureClassification | None] | None
+    ) = None,
 ) -> FunctionTool | Callable[[F], FunctionTool]:
     """Create a FunctionTool, usable both directly and as a decorator."""
 
@@ -193,6 +267,11 @@ def function_tool(
             idempotent=idempotent,
             timeout_seconds=timeout_seconds,
             max_result_bytes=max_result_bytes,
+            repair_safe=repair_safe,
+            timeout_retry_safe=timeout_retry_safe,
+            error_mapper=error_mapper,
+            safety_profile=safety_profile,
+            failure_classifier=failure_classifier,
         )
 
     if function is None:

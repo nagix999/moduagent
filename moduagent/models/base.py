@@ -18,6 +18,10 @@ class ModelCapabilities:
     embeddings: bool = False
     vision: bool = False
     limits: Mapping[str, Any] = field(default_factory=dict)
+    # Appended so existing positional construction retains its 0.3 meaning.
+    # ``True`` preserves the permissive behavior of custom/legacy adapters;
+    # adapters with a known conflict (notably vLLM) override it to ``False``.
+    tool_calling_with_structured_output: bool = True
 
     @property
     def supports_streaming(self) -> bool:
@@ -34,6 +38,10 @@ class ModelCapabilities:
     @property
     def supports_structured_output(self) -> bool:
         return self.structured_output
+
+    @property
+    def supports_tool_calling_with_structured_output(self) -> bool:
+        return self.tool_calling_with_structured_output
 
     @property
     def supports_embeddings(self) -> bool:
@@ -118,6 +126,19 @@ class ModelClient(Protocol):
     ) -> tuple[tuple[float, ...], ...]: ...
 
 
+@runtime_checkable
+class ModelGateway(Protocol):
+    """Run-bound boundary for normalized auxiliary model completion calls."""
+
+    async def complete(
+        self,
+        model: ModelClient,
+        request: ModelRequest,
+        *,
+        phase: str,
+    ) -> ModelResponse: ...
+
+
 def validate_request_capabilities(
     request: ModelRequest,
     capabilities: ModelCapabilities,
@@ -130,3 +151,12 @@ def validate_request_capabilities(
         raise ValueError("the configured model does not support tool calling")
     if request.output_schema is not None and not capabilities.structured_output:
         raise ValueError("the configured model does not support structured output")
+    if (
+        request.tools
+        and request.output_schema is not None
+        and not capabilities.tool_calling_with_structured_output
+    ):
+        raise ValueError(
+            "the configured model requires separate tool-calling and "
+            "structured-output requests"
+        )

@@ -1,7 +1,45 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping
+
+
+class _FrozenDict(dict[Any, Any]):
+    """JSON-compatible mapping that rejects mutation after construction."""
+
+    @staticmethod
+    def _immutable(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise TypeError("configuration mappings are immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _FrozenDict:
+        del memo
+        return self
+
+
+def _freeze_configuration(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("configuration mapping keys must be strings")
+        return _FrozenDict(
+            {key: _freeze_configuration(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_configuration(item) for item in value)
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    raise TypeError("configuration values must be JSON-like and finite")
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,14 +53,35 @@ class RunLimits:
     # its meaning. New code should still prefer keyword arguments.
     max_step_attempts: int = 2
     max_replans: int = 2
+    max_tool_repair_attempts: int = 1
 
     def __post_init__(self) -> None:
+        for field_name in (
+            "max_steps",
+            "max_tool_calls",
+            "max_parallel_tools",
+            "max_step_attempts",
+            "max_replans",
+            "max_tool_repair_attempts",
+        ):
+            if type(getattr(self, field_name)) is not int:
+                raise TypeError(f"{field_name} must be an integer")
+        if type(self.parallel_tool_calls) is not bool:
+            raise TypeError("parallel_tool_calls must be a bool")
+        if (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, (int, float))
+            or not math.isfinite(float(self.timeout_seconds))
+        ):
+            raise TypeError("timeout_seconds must be a finite number")
         if self.max_steps < 1:
             raise ValueError("max_steps must be at least 1")
         if self.max_step_attempts < 1:
             raise ValueError("max_step_attempts must be at least 1")
         if self.max_replans < 0:
             raise ValueError("max_replans cannot be negative")
+        if self.max_tool_repair_attempts < 0:
+            raise ValueError("max_tool_repair_attempts cannot be negative")
         if self.max_tool_calls < 0:
             raise ValueError("max_tool_calls cannot be negative")
         if self.timeout_seconds <= 0:
@@ -39,6 +98,16 @@ class RetryConfig:
     backoff_factor: float = 2.0
 
     def __post_init__(self) -> None:
+        if type(self.max_attempts) is not int:
+            raise TypeError("max_attempts must be an integer")
+        for field_name in ("initial_delay", "max_delay", "backoff_factor"):
+            value = getattr(self, field_name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            ):
+                raise TypeError(f"{field_name} must be a finite number")
         if self.max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
         if self.initial_delay < 0 or self.max_delay < 0:
@@ -66,6 +135,10 @@ class AgentConfig:
     tool_trace_mode: Literal["off", "summary", "arguments"] = "summary"
 
     def __post_init__(self) -> None:
+        if not isinstance(self.name, str):
+            raise TypeError("agent name must be a string")
+        if not isinstance(self.instructions, str):
+            raise TypeError("agent instructions must be a string")
         if not self.name.strip():
             raise ValueError("agent name cannot be empty")
         if not self.instructions.strip():
@@ -82,3 +155,21 @@ class AgentConfig:
             raise ValueError("stream_visibility must be 'public_only' or 'all'")
         if self.tool_trace_mode not in {"off", "summary", "arguments"}:
             raise ValueError("tool_trace_mode must be 'off', 'summary', or 'arguments'")
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("agent metadata must be a mapping")
+        if any(not isinstance(key, str) for key in self.metadata):
+            raise TypeError("agent metadata keys must be strings")
+        if not isinstance(self.model_options, Mapping):
+            raise TypeError("model_options must be a mapping")
+        if any(not isinstance(key, str) for key in self.model_options):
+            raise TypeError("model_options keys must be strings")
+        object.__setattr__(
+            self,
+            "model_options",
+            _freeze_configuration(self.model_options),
+        )
+        object.__setattr__(
+            self,
+            "metadata",
+            _freeze_configuration(self.metadata),
+        )

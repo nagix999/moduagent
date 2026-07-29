@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping
 
 from moduagent.messages import FinishReason, Message, MessageRole, Usage
+from moduagent.models import ModelGateway
 
 
 _SKILL_MODES = frozenset({"disabled", "explicit", "auto", "hybrid"})
@@ -225,6 +227,13 @@ class RunContext:
     # are deliberately omitted from checkpoints, conversation storage, and
     # AgentResult.messages; resume rebuilds them from the immutable digest.
     skill_messages: tuple[Message, ...] = field(default_factory=tuple, repr=False)
+    # Ephemeral run-scoped provider boundary. It is intentionally absent from
+    # snapshots and is rebound by the Coordinator on every run/resume.
+    model_gateway: ModelGateway | None = field(default=None, repr=False)
+    created_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        repr=False,
+    )
 
     def add_message(self, message: Message, *, persist: bool = True) -> None:
         self.messages.append(message)

@@ -2,8 +2,10 @@ from .base import (
     ModelCapabilities,
     ModelChunk,
     ModelClient,
+    ModelGateway,
     ModelRequest,
     ModelResponse,
+    validate_request_capabilities,
 )
 from .ollama import OllamaClient
 from .openai_compatible import OpenAICompatibleClient
@@ -16,9 +18,11 @@ __all__ = [
     "ModelCapabilities",
     "ModelChunk",
     "ModelClient",
+    "ModelGateway",
     "ModelRequest",
     "ModelResponse",
     "OllamaClient",
     "OpenAICompatibleClient",
     "VLLMClient",
+    "validate_request_capabilities",
 ]

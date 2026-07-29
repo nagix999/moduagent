@@ -285,6 +285,8 @@ def test_vllm_rejects_tools_and_final_output_schema_in_one_request() -> None:
             model="m",
             transport=FakeTransport(),
         )
+        assert client.capabilities.tool_calling_with_structured_output is False
+        assert client.capabilities.supports_tool_calling_with_structured_output is False
         request = ModelRequest(
             (Message.user("go"),),
             tools=(FakeToolSchema(),),
@@ -297,6 +299,43 @@ def test_vllm_rejects_tools_and_final_output_schema_in_one_request() -> None:
             assert "separate ACT and FINALIZE requests" in str(exc)
         else:
             raise AssertionError("combined vLLM constraints must be rejected")
+
+    asyncio.run(scenario())
+
+
+def test_vllm_respects_explicit_combined_contract_capability() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport(
+            response={
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "{}"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        )
+        client = VLLMClient(
+            base_url="http://vllm/v1",
+            model="m",
+            transport=transport,
+            capabilities=ModelCapabilities(
+                tool_calling_with_structured_output=True,
+            ),
+        )
+
+        await client.complete(
+            ModelRequest(
+                (Message.user("go"),),
+                tools=(FakeToolSchema(),),
+                output_schema={"type": "object", "properties": {}},
+            )
+        )
+
+        assert client.capabilities.tool_calling_with_structured_output is True
+        body = transport.requests[0]["json"]
+        assert body["tools"]
+        assert body["response_format"]["type"] == "json_schema"
 
     asyncio.run(scenario())
 
@@ -483,6 +522,36 @@ def test_capabilities_reject_unsupported_requested_feature() -> None:
             assert "tool calling" in str(exc)
         else:
             raise AssertionError("unsupported capability must fail before HTTP")
+
+    asyncio.run(scenario())
+
+
+def test_capabilities_reject_unsupported_combined_tool_and_output_contract() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport()
+        client = OpenAICompatibleClient(
+            base_url="http://model",
+            model="m",
+            transport=transport,
+            capabilities=ModelCapabilities(
+                tool_calling_with_structured_output=False,
+            ),
+        )
+
+        try:
+            await client.complete(
+                ModelRequest(
+                    (Message.user("go"),),
+                    tools=(FakeToolSchema(),),
+                    output_schema={"type": "object", "properties": {}},
+                )
+            )
+        except ValueError as exc:
+            assert "separate tool-calling and structured-output requests" in str(exc)
+        else:
+            raise AssertionError("unsupported combined contract must fail before HTTP")
+
+        assert transport.requests == []
 
     asyncio.run(scenario())
 

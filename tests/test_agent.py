@@ -234,10 +234,8 @@ def test_resumed_tool_trace_is_redacted_reprojected_and_bounded() -> None:
 
         trace = result.metadata["tool_trace"]
         assert len(trace) == 2
-        assert trace[0]["arguments"] == {
-            "password": "[REDACTED]",
-            "value": 0,
-        }
+        assert "arguments" not in trace[0]
+        assert trace[0]["arguments_fingerprint"].startswith("sha256:")
         assert "secret-" not in repr(result.metadata)
 
         summary_checkpoint = RunCheckpoint(
@@ -283,9 +281,8 @@ def test_stream_emits_terminal_result() -> None:
 
         events = [event async for event in agent.stream("실행")]
 
-        assert events[0].type is EventType.RUN_STARTED
-        assert events[-1].type is EventType.RUN_COMPLETED
-        assert events[-1].data["result"].output == "완료"
+        assert [event.type for event in events] == [EventType.RUN_COMPLETED]
+        assert events[0].data["result"].output == "완료"
 
     asyncio.run(scenario())
 
@@ -379,7 +376,7 @@ def test_rbac_denial_is_returned_to_model() -> None:
     asyncio.run(scenario())
 
 
-def test_timed_out_sync_tool_keeps_valid_history() -> None:
+def test_timed_out_sync_tool_keeps_protocol_out_of_public_history() -> None:
     async def scenario() -> None:
         @function_tool
         def slow() -> str:
@@ -403,13 +400,16 @@ def test_timed_out_sync_tool_keeps_valid_history() -> None:
         result = await agent.run("실행", session_id="timeout-session")
 
         assert result.finish_reason == "timeout"
-        assert result.messages[-1].role == "tool"
-        assert "timed out" in (result.messages[-1].content or "")
+        assert [message.role.value for message in result.messages] == [
+            "system",
+            "user",
+        ]
+        assert all(not message.tool_calls for message in result.messages)
 
     asyncio.run(scenario())
 
 
-def test_tool_limit_keeps_assistant_tool_message_pair() -> None:
+def test_tool_limit_does_not_persist_assistant_tool_message_pair() -> None:
     async def scenario() -> None:
         @function_tool
         def unused() -> str:
@@ -436,9 +436,12 @@ def test_tool_limit_keeps_assistant_tool_message_pair() -> None:
         second = await agent.run("다음 요청", session_id="limited")
 
         assert first.finish_reason == "max_tool_calls"
-        assert first.messages[-1].role == "tool"
+        assert [message.role.value for message in first.messages] == [
+            "system",
+            "user",
+        ]
         assert second.output == "다음 요청은 정상"
         roles = [message.role for message in model.requests[1].messages]
-        assert roles == ["system", "user", "assistant", "tool", "user"]
+        assert roles == ["system", "user", "user"]
 
     asyncio.run(scenario())

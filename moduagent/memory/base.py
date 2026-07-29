@@ -4,8 +4,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Mapping, Protocol, runtime_checkable
 
+from moduagent.errors import MemoryError as FrameworkMemoryError
 from moduagent.messages import Message, Usage
-from moduagent.models import ModelRequest
+from moduagent.models import ModelGateway, ModelRequest
 
 
 class MemoryPhase(str, Enum):
@@ -24,6 +25,7 @@ class MemoryRequest:
     model_request: ModelRequest
     protected_from: int
     user_context: Mapping[str, object] = field(default_factory=dict)
+    model_gateway: ModelGateway | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.phase, MemoryPhase):
@@ -61,7 +63,7 @@ class ConversationMemoryPolicy(Protocol):
     async def prepare(self, request: MemoryRequest) -> MemoryResult: ...
 
 
-class ConversationMemoryError(Exception):
+class ConversationMemoryError(FrameworkMemoryError):
     """Base error raised while preparing a bounded conversation view."""
 
 

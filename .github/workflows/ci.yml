@@ -26,3 +26,76 @@ jobs:
       - run: ruff check moduagent tests
       - run: ruff format --check moduagent tests
       - run: pytest -q
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+      - run: python -m pip install --upgrade pip build
+      - name: Build a wheel from a clean sdist
+        run: |
+          python -m build --sdist --outdir /tmp/moduagent-sdist
+          mkdir -p /tmp/moduagent-source
+          tar -xzf /tmp/moduagent-sdist/moduagent-*.tar.gz -C /tmp/moduagent-source
+          python -m build --wheel --outdir /tmp/moduagent-wheel /tmp/moduagent-source/moduagent-*
+      - name: Verify package namespace
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from tarfile import open as open_tar
+          from zipfile import ZipFile
+
+          wheel = next(Path("/tmp/moduagent-wheel").glob("moduagent-*.whl"))
+          with ZipFile(wheel) as archive:
+              names = archive.namelist()
+          roots = {name.split("/", 1)[0] for name in names if "/" in name}
+          if "moduagent" not in roots:
+              raise SystemExit("wheel does not contain the moduagent package")
+          if any(name.startswith("company_agent/") for name in names):
+              raise SystemExit("wheel contains the retired company_agent package")
+          unexpected = {
+              root
+              for root in roots
+              if root != "moduagent" and not root.startswith("moduagent-")
+          }
+          if unexpected:
+              raise SystemExit(f"wheel contains unexpected roots: {sorted(unexpected)}")
+
+          sdist = next(Path("/tmp/moduagent-sdist").glob("moduagent-*.tar.gz"))
+          with open_tar(sdist, "r:gz") as archive:
+              source_names = archive.getnames()
+          required_tests = {
+              "tests/integration/test_live_models.py",
+              "tests/integration/test_live_persistence.py",
+          }
+          missing_tests = {
+              expected
+              for expected in required_tests
+              if not any(name.endswith(expected) for name in source_names)
+          }
+          if missing_tests:
+              raise SystemExit(
+                  f"sdist omits integration tests: {sorted(missing_tests)}"
+              )
+          generated_files = {
+              name
+              for name in source_names
+              if "/__pycache__/" in name
+              or name.endswith((".pyc", ".pyo", ".pyd", ".DS_Store"))
+          }
+          if generated_files:
+              raise SystemExit(
+                  f"sdist contains generated files: {sorted(generated_files)}"
+              )
+          PY
+      - name: Verify clean installation
+        run: |
+          python -m venv /tmp/moduagent-venv
+          /tmp/moduagent-venv/bin/python -m pip install /tmp/moduagent-wheel/moduagent-*.whl
+          /tmp/moduagent-venv/bin/python -c \
+            "import moduagent; assert moduagent.__version__ == '0.4.0'"
+          /tmp/moduagent-venv/bin/moduagent --help
