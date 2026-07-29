@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
+import sys
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
 
-from examples import report_automation_agent as report_example
 from moduagent.messages import ToolCall
 from moduagent.tools import (
     ToolErrorType,
@@ -15,6 +17,25 @@ from moduagent.tools import (
     ToolExecutor,
     ToolRecoveryAction,
 )
+
+
+def _load_report_example() -> ModuleType:
+    example_path = (
+        Path(__file__).resolve().parents[1] / "examples" / "report_automation_agent.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_moduagent_report_automation_example",
+        example_path,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load report automation example: {example_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+report_example = _load_report_example()
 
 
 def run(coroutine):
