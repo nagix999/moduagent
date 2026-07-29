@@ -1,13 +1,22 @@
 """Report automation Agent using only query_db and plot_graph.
 
-Install:
+SQLite (default):
     python -m pip install -e . matplotlib
 
-Run:
+PostgreSQL:
+    python -m pip install -e . matplotlib "psycopg[binary]>=3.2,<4"
+    export REPORT_DB_BACKEND="postgresql"
+    export REPORT_DATABASE_URL="postgresql://report_reader@localhost:5432/reporting"
+
+Run either backend:
     export VLLM_BASE_URL="http://localhost:8000/v1"
     export VLLM_MODEL="your-tool-capable-model"
     export VLLM_API_KEY="optional-token"
     python examples/report_automation_agent.py
+
+For PostgreSQL, use a dedicated role with only CONNECT, schema USAGE, and
+SELECT privileges. The Tool also enforces a read-only transaction and database
+timeouts, but application-side checks are not a substitute for database grants.
 """
 
 from __future__ import annotations
@@ -98,6 +107,108 @@ def _map_query_error(exc: Exception) -> ToolError | None:
     )
 
 
+class _PostgreSQLConfigurationError(RuntimeError):
+    """Safe configuration error raised before a PostgreSQL query starts."""
+
+
+def _map_postgresql_query_error(exc: Exception) -> ToolError:
+    """Map PostgreSQL failures without exposing DSNs, SQL, or server details."""
+
+    if isinstance(exc, _PostgreSQLConfigurationError):
+        return ToolError(
+            type=ToolErrorType.EXECUTION_ERROR,
+            reason="postgres_configuration_error",
+            message=(
+                "PostgreSQL query_db is not configured correctly. Check "
+                "REPORT_DATABASE_URL and REPORT_* timeout settings, and "
+                "install psycopg 3."
+            ),
+            retryable=False,
+            recovery=ToolRecoveryAction.FAIL,
+        )
+
+    sqlstate = getattr(exc, "sqlstate", None)
+    if sqlstate == "42501" or (isinstance(sqlstate, str) and sqlstate.startswith("28")):
+        return ToolError(
+            type=ToolErrorType.UNAUTHORIZED,
+            reason="database_access_denied",
+            message="The reporting database denied access to the requested data.",
+            retryable=False,
+            recovery=ToolRecoveryAction.FAIL,
+        )
+    if isinstance(sqlstate, str) and sqlstate.startswith("08"):
+        return ToolError(
+            type=ToolErrorType.EXECUTION_ERROR,
+            reason="postgres_connection_unavailable",
+            message="The PostgreSQL connection is temporarily unavailable.",
+            retryable=True,
+            recovery=ToolRecoveryAction.RETRY_CALL,
+        )
+    if sqlstate == "57014":
+        return ToolError(
+            type=ToolErrorType.TIMEOUT,
+            reason="query_timeout",
+            message=(
+                "The read-only query exceeded its database deadline. "
+                "Reduce its date range, joins, or aggregation scope."
+            ),
+            retryable=False,
+            recovery=ToolRecoveryAction.REPAIR_CALL,
+        )
+    if sqlstate == "55P03":
+        return ToolError(
+            type=ToolErrorType.EXECUTION_ERROR,
+            reason="query_lock_timeout",
+            message="The read-only query could not acquire a database lock in time.",
+            retryable=True,
+            recovery=ToolRecoveryAction.RETRY_CALL,
+        )
+    if (
+        isinstance(exc, ValueError)
+        or sqlstate == "25006"
+        or (isinstance(sqlstate, str) and sqlstate.startswith(("22", "42")))
+    ):
+        return ToolError(
+            type=ToolErrorType.EXECUTION_ERROR,
+            reason="invalid_read_query",
+            message=(
+                "The read-only PostgreSQL query could not be executed. Correct "
+                "its syntax, table names, column names, data types, or limit."
+            ),
+            retryable=False,
+            recovery=ToolRecoveryAction.REPAIR_CALL,
+        )
+    if isinstance(exc, OSError):
+        return ToolError(
+            type=ToolErrorType.EXECUTION_ERROR,
+            reason="dataset_artifact_failed",
+            message="The query dataset artifact could not be stored.",
+            retryable=False,
+            recovery=ToolRecoveryAction.FAIL,
+        )
+
+    try:
+        import psycopg
+    except ImportError:
+        pass
+    else:
+        if isinstance(exc, psycopg.OperationalError):
+            return ToolError(
+                type=ToolErrorType.EXECUTION_ERROR,
+                reason="postgres_connection_unavailable",
+                message="The PostgreSQL connection is temporarily unavailable.",
+                retryable=True,
+                recovery=ToolRecoveryAction.RETRY_CALL,
+            )
+    return ToolError(
+        type=ToolErrorType.EXECUTION_ERROR,
+        reason="postgres_query_failed",
+        message="The PostgreSQL read-only query failed.",
+        retryable=False,
+        recovery=ToolRecoveryAction.REPLAN,
+    )
+
+
 def _map_plot_error(exc: Exception) -> ToolError | None:
     if isinstance(exc, FileNotFoundError):
         return ToolError(
@@ -134,6 +245,49 @@ def _load_pyplot() -> Any:
     return pyplot
 
 
+def _validated_read_query(sql: str, limit: int) -> str:
+    statement = sql.strip().rstrip(";").strip()
+    if not re.match(r"^(select|with)\b", statement, flags=re.IGNORECASE):
+        raise ValueError("only SELECT or WITH queries are allowed")
+    if ";" in statement:
+        raise ValueError("only one SQL statement is allowed")
+    if len(statement) > 20_000:
+        raise ValueError("query must be at most 20000 characters")
+    if isinstance(limit, bool) or not 1 <= limit <= 500:
+        raise ValueError("limit must be between 1 and 500")
+    return statement
+
+
+def _cache_query_rows(
+    fetched: list[Any],
+    *,
+    limit: int,
+    context: ToolExecutionContext,
+) -> dict[str, Any]:
+    truncated = len(fetched) > limit
+    rows = [dict(row) for row in fetched[:limit]]
+    if not rows:
+        raise ValueError("query returned no rows")
+
+    dataset_path = _run_artifact(context, "dataset.json")
+    temporary_path = dataset_path.with_suffix(".tmp.json")
+    try:
+        temporary_path.write_text(
+            json.dumps(rows, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, dataset_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return {
+        "columns": list(rows[0]),
+        "rows": rows,
+        "row_count": len(rows),
+        "truncated": truncated,
+        "dataset_path": str(dataset_path),
+    }
+
+
 @function_tool(
     idempotent=True,
     repair_safe=True,
@@ -152,13 +306,7 @@ def query_db(
     `month` and `revenue`.
     """
 
-    statement = sql.strip().rstrip(";").strip()
-    if not re.match(r"^(select|with)\b", statement, flags=re.IGNORECASE):
-        raise ValueError("only SELECT or WITH queries are allowed")
-    if ";" in statement:
-        raise ValueError("only one SQL statement is allowed")
-    if not 1 <= limit <= 500:
-        raise ValueError("limit must be between 1 and 500")
+    statement = _validated_read_query(sql, limit)
     if not DB_PATH.exists():
         raise ValueError("report database does not exist")
 
@@ -173,25 +321,122 @@ def query_db(
         cursor = connection.execute(statement)
         fetched = cursor.fetchmany(limit + 1)
 
-    truncated = len(fetched) > limit
-    rows = [dict(row) for row in fetched[:limit]]
-    if not rows:
-        raise ValueError("query returned no rows")
+    return _cache_query_rows(fetched, limit=limit, context=context)
 
-    dataset_path = _run_artifact(context, "dataset.json")
-    temporary_path = dataset_path.with_suffix(".tmp.json")
-    temporary_path.write_text(
-        json.dumps(rows, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
+
+def _bounded_environment_integer(
+    name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw_value = os.getenv(name, str(default))
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise _PostgreSQLConfigurationError(f"{name} must be an integer") from exc
+    if not minimum <= value <= maximum:
+        raise _PostgreSQLConfigurationError(
+            f"{name} must be between {minimum} and {maximum}"
+        )
+    return value
+
+
+def _open_postgresql_connection(
+    dsn: str,
+    *,
+    connect_timeout_seconds: int,
+) -> Any:
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+    except ImportError as exc:
+        raise _PostgreSQLConfigurationError(
+            'install "psycopg[binary]>=3.2,<4"'
+        ) from exc
+
+    return psycopg.connect(
+        dsn,
+        autocommit=True,
+        connect_timeout=connect_timeout_seconds,
+        row_factory=dict_row,
+        application_name="moduagent-report-example",
     )
-    os.replace(temporary_path, dataset_path)
-    return {
-        "columns": list(rows[0]),
-        "rows": rows,
-        "row_count": len(rows),
-        "truncated": truncated,
-        "dataset_path": str(dataset_path),
-    }
+
+
+@function_tool(
+    name="query_db",
+    idempotent=True,
+    repair_safe=True,
+    timeout_retry_safe=False,
+    timeout_seconds=35,
+    max_result_bytes=64 * 1024,
+    error_mapper=_map_postgresql_query_error,
+)
+def query_db_postgresql(
+    sql: str,
+    context: ToolExecutionContext,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """Execute one bounded, read-only PostgreSQL query for plot_graph.
+
+    Configure REPORT_DATABASE_URL and use a database role restricted to
+    CONNECT, schema USAGE, and SELECT. The SQL must return the exact aliases
+    needed by the chart, such as `month` and `revenue`.
+    """
+
+    statement = _validated_read_query(sql, limit)
+    dsn = os.getenv("REPORT_DATABASE_URL", "").strip()
+    if not dsn:
+        raise _PostgreSQLConfigurationError("REPORT_DATABASE_URL is required")
+    connect_timeout_seconds = _bounded_environment_integer(
+        "REPORT_CONNECT_TIMEOUT_SECONDS",
+        default=5,
+        minimum=1,
+        maximum=10,
+    )
+    statement_timeout_ms = _bounded_environment_integer(
+        "REPORT_QUERY_TIMEOUT_MS",
+        default=15_000,
+        minimum=100,
+        maximum=18_000,
+    )
+    lock_timeout_ms = _bounded_environment_integer(
+        "REPORT_LOCK_TIMEOUT_MS",
+        default=3_000,
+        minimum=100,
+        maximum=10_000,
+    )
+
+    bounded_statement = (
+        f"SELECT * FROM ({statement}) AS moduagent_query LIMIT {limit + 1}"
+    )
+    with _open_postgresql_connection(
+        dsn,
+        connect_timeout_seconds=connect_timeout_seconds,
+    ) as connection:
+        with connection.transaction():
+            with connection.cursor() as cursor:
+                cursor.execute("SET TRANSACTION READ ONLY")
+                cursor.execute(
+                    "SELECT set_config('statement_timeout', %s, true)",
+                    (str(statement_timeout_ms),),
+                )
+                cursor.execute(
+                    "SELECT set_config('lock_timeout', %s, true)",
+                    (str(lock_timeout_ms),),
+                )
+                cursor.execute(bounded_statement)
+                description = cursor.description
+                if description is None:
+                    raise ValueError("query must return rows")
+                columns = [column.name for column in description]
+                if len(columns) != len(set(columns)):
+                    raise ValueError("query columns must use unique aliases")
+                fetched = cursor.fetchmany(limit + 1)
+
+    return _cache_query_rows(fetched, limit=limit, context=context)
 
 
 @function_tool(
@@ -295,8 +540,19 @@ def seed_demo_database() -> None:
 
 
 async def main() -> None:
-    if not DB_PATH.exists():
-        seed_demo_database()
+    database_backend = os.getenv("REPORT_DB_BACKEND", "sqlite").strip().lower()
+    if database_backend not in {"sqlite", "postgresql"}:
+        raise RuntimeError("REPORT_DB_BACKEND must be either 'sqlite' or 'postgresql'.")
+    if database_backend == "sqlite":
+        if not DB_PATH.exists():
+            seed_demo_database()
+        selected_query_tool = query_db
+    else:
+        if not os.getenv("REPORT_DATABASE_URL", "").strip():
+            raise RuntimeError(
+                "Set REPORT_DATABASE_URL when REPORT_DB_BACKEND=postgresql."
+            )
+        selected_query_tool = query_db_postgresql
 
     model_name = os.getenv("VLLM_MODEL")
     if not model_name:
@@ -316,6 +572,7 @@ async def main() -> None:
                 "당신은 경영 리포트 자동화 에이전트다. 사용할 수 있는 "
                 "business Tool은 query_db와 plot_graph뿐이다. DB schema는 "
                 "sales(month TEXT, channel TEXT, revenue REAL, orders INTEGER)다. "
+                f"현재 DB backend는 {database_backend}다. "
                 "먼저 query_db를 정확히 한 번 호출해 월별 집계 데이터를 "
                 "조회하고 month, revenue, orders alias를 사용한다. 다음 "
                 "plot_graph를 호출해 query_db가 같은 run에 저장한 데이터로 "
@@ -336,7 +593,7 @@ async def main() -> None:
             model_options={"temperature": 0.0},
         ),
         model=model,
-        tools=[query_db, plot_graph],
+        tools=[selected_query_tool, plot_graph],
         execution_profile=PlanExecutionProfile(
             plan_generator=LLMPlanGenerator(model=model, max_steps=4),
             revise_on_tool_failure=True,

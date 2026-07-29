@@ -17,6 +17,7 @@ from moduagent.tools.failure import (
     ToolFailureClassification,
     ToolSafetyProfile,
 )
+from moduagent.tools.scheduler import SyncToolScheduler
 
 
 Function = Callable[..., Any]
@@ -48,6 +49,7 @@ class FunctionTool:
         failure_classifier: (
             Callable[[Exception], ToolFailureClassification | None] | None
         ) = None,
+        sync_scheduler: SyncToolScheduler | None = None,
     ) -> None:
         if input_model is not None and args_schema is not None:
             raise ValueError("use either input_model or args_schema, not both")
@@ -73,6 +75,11 @@ class FunctionTool:
             raise TypeError("safety_profile must be a ToolSafetyProfile")
         if failure_classifier is not None and not callable(failure_classifier):
             raise TypeError("failure_classifier must be callable")
+        if sync_scheduler is not None and not isinstance(
+            sync_scheduler,
+            SyncToolScheduler,
+        ):
+            raise TypeError("sync_scheduler must be a SyncToolScheduler")
         if error_mapper is not None and failure_classifier is not None:
             raise ValueError("use either error_mapper or failure_classifier, not both")
         if safety_profile is not None and (
@@ -108,6 +115,7 @@ class FunctionTool:
         self.timeout_retry_safe = resolved_safety_profile.timeout_retry_safe
         self.error_mapper = error_mapper
         self.failure_classifier = failure_classifier
+        self.sync_scheduler = sync_scheduler
         self._context_parameter: str | None = None
         explicit_model = input_model or args_schema
         if explicit_model is not None:
@@ -206,7 +214,15 @@ class FunctionTool:
 
         if inspect.iscoroutinefunction(self.function):
             return await self.function(**values)
-        result = await _run_sync_in_daemon(lambda: self.function(**values))
+
+        def invoke() -> Any:
+            return self.function(**values)
+
+        result = (
+            await _run_sync_in_daemon(invoke)
+            if self.sync_scheduler is None
+            else await self.sync_scheduler.run(invoke)
+        )
         return await _await_if_needed(result)
 
 
@@ -233,6 +249,7 @@ def function_tool(
     failure_classifier: (
         Callable[[Exception], ToolFailureClassification | None] | None
     ) = None,
+    sync_scheduler: SyncToolScheduler | None = None,
 ) -> Callable[[F], FunctionTool]: ...
 
 
@@ -254,6 +271,7 @@ def function_tool(
     failure_classifier: (
         Callable[[Exception], ToolFailureClassification | None] | None
     ) = None,
+    sync_scheduler: SyncToolScheduler | None = None,
 ) -> FunctionTool | Callable[[F], FunctionTool]:
     """Create a FunctionTool, usable both directly and as a decorator."""
 
@@ -272,6 +290,7 @@ def function_tool(
             error_mapper=error_mapper,
             safety_profile=safety_profile,
             failure_classifier=failure_classifier,
+            sync_scheduler=sync_scheduler,
         )
 
     if function is None:

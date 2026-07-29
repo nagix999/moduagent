@@ -21,6 +21,10 @@ class ModelInvocationError(ModuAgentError, RuntimeError):
     """A model provider call failed or returned an invalid protocol response."""
 
 
+class OutputValidationError(ModuAgentError, ValueError):
+    """A model response could not be decoded into the configured output contract."""
+
+
 class ToolValidationError(ModuAgentError, ValueError):
     """Tool arguments failed schema or repair-guard validation."""
 
@@ -79,6 +83,7 @@ __all__ = [
     "MemoryError",
     "ModelInvocationError",
     "ModuAgentError",
+    "OutputValidationError",
     "PersistenceError",
     "RunTimeoutError",
     "SkillError",

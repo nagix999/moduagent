@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 from moduagent.config import RetryConfig
 from moduagent.messages import ToolCall
@@ -13,6 +14,9 @@ from moduagent.tools.runtime import (
     ToolRepairConstraint,
     ToolRuntime,
 )
+
+if TYPE_CHECKING:
+    from moduagent.observability.diagnostics import DiagnosticReporter
 
 
 class ToolExecutor:
@@ -30,6 +34,7 @@ class ToolExecutor:
         authorizer: ToolAuthorizer | None = None,
         retry: RetryConfig | None = None,
         retry_config: RetryConfig | None = None,
+        diagnostic_reporter: DiagnosticReporter | None = None,
         default_timeout_seconds: float | None = 30.0,
         max_result_bytes: int | None = 1_000_000,
     ) -> None:
@@ -38,6 +43,7 @@ class ToolExecutor:
             authorizer=authorizer,
             retry=retry,
             retry_config=retry_config,
+            diagnostic_reporter=diagnostic_reporter,
             default_timeout_seconds=default_timeout_seconds,
             max_result_bytes=max_result_bytes,
         )

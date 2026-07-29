@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 from dataclasses import dataclass, replace
 
 from moduagent.memory.base import (
@@ -19,11 +20,12 @@ from moduagent.memory.summarizer import (
     ConversationSummarizer,
     GatewayConversationSummarizer,
 )
-from moduagent.models import ModelGateway
+from moduagent.models import ModelGateway, ModelRequest
 from moduagent.memory.token import (
     ApproximateTokenCounter,
     TokenBudget,
     TokenCounter,
+    _request_digest,
 )
 from moduagent.messages import Message, MessageRole, Usage
 
@@ -35,6 +37,23 @@ class _ConversationParts:
     protected: tuple[Message, ...]
     invalid_history_messages: int = 0
     invalid_history_turns: int = 0
+
+
+class _RequestTokenMemo:
+    """Memoize exact counts only for one memory-policy preparation."""
+
+    def __init__(self, delegate: TokenCounter) -> None:
+        self._delegate = delegate
+        self._digest_key = secrets.token_bytes(32)
+        self._counts: dict[bytes, int] = {}
+
+    async def count_request(self, request: ModelRequest) -> int:
+        key = _request_digest(request, digest_key=self._digest_key)
+        if key in self._counts:
+            return self._counts[key]
+        count = await self._delegate.count_request(request)
+        self._counts[key] = count
+        return count
 
 
 class FullConversationMemoryPolicy:
@@ -149,8 +168,9 @@ class TokenBudgetConversationMemoryPolicy(_ImmutableSemanticConfiguration):
         ).hexdigest()
 
     async def prepare(self, request: MemoryRequest) -> MemoryResult:
+        token_counter = _RequestTokenMemo(self.token_counter)
         parts = _conversation_parts(request)
-        original_tokens = await self.token_counter.count_request(request.model_request)
+        original_tokens = await token_counter.count_request(request.model_request)
         all_turns = parts.history_turns
         if self.max_history_turns is None:
             selected = list(all_turns)
@@ -163,7 +183,7 @@ class TokenBudgetConversationMemoryPolicy(_ImmutableSemanticConfiguration):
         selected_tokens = (
             original_tokens
             if selected_messages == request.model_request.messages
-            else await self._count(request, selected_messages)
+            else await self._count(request, selected_messages, token_counter)
         )
         if selected and selected_tokens > self.budget.input_tokens:
             # Token counts are monotonic for a suffix of complete turns. Find the
@@ -175,17 +195,28 @@ class TokenBudgetConversationMemoryPolicy(_ImmutableSemanticConfiguration):
                 middle = (low + high) // 2
                 candidate = selected[middle:]
                 candidate_tokens = await self._count(
-                    request, _compose(parts, candidate)
+                    request,
+                    _compose(parts, candidate),
+                    token_counter,
                 )
                 if candidate_tokens <= self.budget.input_tokens:
                     high = middle
                 else:
                     low = middle + 1
             selected = selected[low:]
-            selected_tokens = await self._count(request, _compose(parts, selected))
+            selected_tokens = await self._count(
+                request,
+                _compose(parts, selected),
+                token_counter,
+            )
 
         if selected_tokens > self.budget.input_tokens:
-            await self._raise_overflow(request, _compose(parts, ()), selected_tokens)
+            await self._raise_overflow(
+                request,
+                _compose(parts, ()),
+                selected_tokens,
+                token_counter,
+            )
 
         excluded_count = len(all_turns) - len(selected)
         excluded_turns = all_turns[:excluded_count]
@@ -205,7 +236,11 @@ class TokenBudgetConversationMemoryPolicy(_ImmutableSemanticConfiguration):
                     model_gateway=request.model_gateway,
                 )
                 with_summary = _compose(parts, selected, summary=summary_message)
-                summary_tokens = await self._count(request, with_summary)
+                summary_tokens = await self._count(
+                    request,
+                    with_summary,
+                    token_counter,
+                )
                 while selected and summary_tokens > self.budget.input_tokens:
                     selected.pop(0)
                     excluded_count += 1
@@ -217,7 +252,11 @@ class TokenBudgetConversationMemoryPolicy(_ImmutableSemanticConfiguration):
                     )
                     summary_usage = summary_usage + extra_usage
                     with_summary = _compose(parts, selected, summary=summary_message)
-                    summary_tokens = await self._count(request, with_summary)
+                    summary_tokens = await self._count(
+                        request,
+                        with_summary,
+                        token_counter,
+                    )
                 if summary_tokens <= self.budget.input_tokens:
                     selected_tokens = summary_tokens
                 else:
@@ -236,7 +275,6 @@ class TokenBudgetConversationMemoryPolicy(_ImmutableSemanticConfiguration):
                 selected_tokens = fallback_tokens
 
         messages = _compose(parts, selected, summary=summary_message)
-        selected_tokens = await self._count(request, messages)
         represented = sum(len(turn) for turn in excluded_turns)
         summarized_messages = represented if summary_message is not None else 0
         valid_history_messages = sum(len(turn) for turn in all_turns)
@@ -267,9 +305,12 @@ class TokenBudgetConversationMemoryPolicy(_ImmutableSemanticConfiguration):
         )
 
     async def _count(
-        self, request: MemoryRequest, messages: tuple[Message, ...]
+        self,
+        request: MemoryRequest,
+        messages: tuple[Message, ...],
+        token_counter: TokenCounter,
     ) -> int:
-        return await self.token_counter.count_request(
+        return await token_counter.count_request(
             replace(request.model_request, messages=messages)
         )
 
@@ -278,12 +319,13 @@ class TokenBudgetConversationMemoryPolicy(_ImmutableSemanticConfiguration):
         request: MemoryRequest,
         messages: tuple[Message, ...],
         required_tokens: int,
+        token_counter: TokenCounter,
     ) -> None:
         original = request.model_request
-        message_tokens = await self.token_counter.count_request(
+        message_tokens = await token_counter.count_request(
             replace(original, messages=messages, tools=(), output_schema=None)
         )
-        messages_and_tools = await self.token_counter.count_request(
+        messages_and_tools = await token_counter.count_request(
             replace(original, messages=messages, output_schema=None)
         )
         tool_tokens = max(0, messages_and_tools - message_tokens)

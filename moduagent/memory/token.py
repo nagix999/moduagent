@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import hmac
 import json
 import math
+import secrets
+import time
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
@@ -106,6 +112,109 @@ class VLLMTokenCounter:
         return await self.client.count_tokens(request)
 
 
+@dataclass(frozen=True, slots=True)
+class _TokenCountCacheEntry:
+    count: int
+    expires_at: float | None
+
+
+class CachingTokenCounter:
+    """Bounded in-process cache for an exact or approximate token counter.
+
+    Concurrent requests with the same content share one delegate call. Only a
+    successful count is cached. Cache keys are process-local keyed digests, so
+    prompts, Tool arguments, and schemas are not retained by the cache.
+    """
+
+    def __init__(
+        self,
+        delegate: TokenCounter,
+        *,
+        max_entries: int = 1_024,
+        ttl_seconds: float | None = 300.0,
+    ) -> None:
+        if not callable(getattr(delegate, "count_request", None)):
+            raise TypeError("delegate must provide count_request()")
+        if max_entries < 1:
+            raise ValueError("max_entries must be at least 1")
+        if ttl_seconds is not None and ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive when provided")
+        self.delegate = delegate
+        self.max_entries = max_entries
+        self.ttl_seconds = float(ttl_seconds) if ttl_seconds is not None else None
+        self._digest_key = secrets.token_bytes(32)
+        self._cache: OrderedDict[bytes, _TokenCountCacheEntry] = OrderedDict()
+        self._inflight: dict[bytes, asyncio.Task[int]] = {}
+        self._lock = asyncio.Lock()
+
+    async def count_request(self, request: ModelRequest) -> int:
+        key = _request_digest(request, digest_key=self._digest_key)
+        async with self._lock:
+            entry = self._cache.get(key)
+            if entry is not None:
+                if entry.expires_at is None or entry.expires_at > time.monotonic():
+                    self._cache.move_to_end(key)
+                    return entry.count
+                self._cache.pop(key, None)
+
+            task = self._inflight.get(key)
+            if task is None:
+                task = asyncio.create_task(self._count_and_cache(key, request))
+                self._inflight[key] = task
+                task.add_done_callback(_consume_task_exception)
+
+        # A cancelled waiter must not cancel the shared delegate operation for
+        # other callers.
+        return await asyncio.shield(task)
+
+    async def _count_and_cache(self, key: bytes, request: ModelRequest) -> int:
+        task = asyncio.current_task()
+        try:
+            count = await self.delegate.count_request(request)
+            expires_at = (
+                time.monotonic() + self.ttl_seconds
+                if self.ttl_seconds is not None
+                else None
+            )
+            async with self._lock:
+                self._cache[key] = _TokenCountCacheEntry(count, expires_at)
+                self._cache.move_to_end(key)
+                while len(self._cache) > self.max_entries:
+                    self._cache.popitem(last=False)
+            return count
+        finally:
+            async with self._lock:
+                if self._inflight.get(key) is task:
+                    self._inflight.pop(key, None)
+
+
+def _consume_task_exception(task: asyncio.Task[int]) -> None:
+    if task.cancelled():
+        return
+    task.exception()
+
+
+def _request_digest(
+    request: ModelRequest,
+    *,
+    digest_key: bytes,
+) -> bytes:
+    payload = {
+        "messages": [_json_safe(message.to_dict()) for message in request.messages],
+        "tools": [_json_safe(tool) for tool in request.tools],
+        "output_schema": _json_safe(request.output_schema),
+        "options": _json_safe(request.options),
+        "provider_options": _json_safe(request.provider_options),
+    }
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hmac.new(digest_key, serialized, hashlib.sha256).digest()
+
+
 def _json_safe(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -128,6 +237,7 @@ def _json_safe(value: Any) -> Any:
 
 __all__ = [
     "ApproximateTokenCounter",
+    "CachingTokenCounter",
     "TokenBudget",
     "TokenCounter",
     "VLLMTokenCounter",

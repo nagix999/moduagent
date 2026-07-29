@@ -439,6 +439,12 @@ class CodecBackedEngine(Generic[StateT]):
         services: ExecutionServices,
         boundary: DurableBoundary,
     ) -> None:
+        # ``checkpointing_enabled`` is an optional concrete-service capability,
+        # not part of the required ExecutionServices protocol. Third-party
+        # services that predate it keep the conservative 0.4 behavior, while the
+        # built-in runtime can avoid encoding an otherwise discarded snapshot.
+        if getattr(services, "checkpointing_enabled", True) is False:
+            return
         await services.checkpoint(
             context,
             EngineSnapshot(

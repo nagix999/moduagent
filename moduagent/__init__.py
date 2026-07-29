@@ -38,6 +38,7 @@ from moduagent.messages import (
 )
 from moduagent.memory import (
     ApproximateTokenCounter,
+    CachingTokenCounter,
     ConversationMemoryError,
     ConversationMemoryOverflowError,
     ConversationMemoryPolicy,
@@ -73,11 +74,19 @@ from moduagent.models import (
 )
 from moduagent.observability import (
     AuditEventSink,
+    CompositeDiagnosticSink,
     CompositeEventSink,
+    DiagnosticFrame,
+    DiagnosticReporter,
+    DiagnosticSink,
     EventSink,
+    FailureDiagnostic,
+    InMemoryDiagnosticSink,
     InMemoryMetricRecorder,
+    LoggingDiagnosticSink,
     LoggingEventSink,
     MetricsEventSink,
+    NoopDiagnosticSink,
     NoopEventSink,
 )
 from moduagent.output import (
@@ -150,6 +159,9 @@ from moduagent.tools import (
     InternalToolFailure,
     RBACToolAuthorizer,
     SafeToolFailureView,
+    SyncToolScheduler,
+    SyncToolSchedulerOverloaded,
+    SyncToolSchedulerStats,
     Tool,
     ToolAuthorizer,
     ToolBatchOutcome,
@@ -171,7 +183,7 @@ from moduagent.tools import (
     is_tool_argument_fingerprint,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.4.2"
 
 __all__ = [
     "__version__",
@@ -184,10 +196,12 @@ __all__ = [
     "AgentTool",
     "AllowAllAuthorizer",
     "ApproximateTokenCounter",
+    "CachingTokenCounter",
     "AuditEventSink",
     "AuthorizationDecision",
     "CheckpointStore",
     "CommonRunState",
+    "CompositeDiagnosticSink",
     "CompositeEventSink",
     "ConversationMemoryError",
     "ConversationMemoryOverflowError",
@@ -197,6 +211,9 @@ __all__ = [
     "DatabaseConversationStore",
     "DecisionKind",
     "DecisionPolicy",
+    "DiagnosticFrame",
+    "DiagnosticReporter",
+    "DiagnosticSink",
     "EventSink",
     "EventPublisher",
     "EventType",
@@ -206,6 +223,7 @@ __all__ = [
     "ExecutionDecision",
     "ExplicitSkillSelector",
     "FailureProjector",
+    "FailureDiagnostic",
     "FinalizationMarkers",
     "FinishReason",
     "FilesystemSkillSource",
@@ -216,12 +234,14 @@ __all__ = [
     "HybridSkillSelector",
     "InMemoryCheckpointStore",
     "InMemoryConversationStore",
+    "InMemoryDiagnosticSink",
     "InMemoryMemoryStateStore",
     "InMemoryMetricRecorder",
     "InMemorySkillSource",
     "InternalToolFailure",
     "LegacyPlanAndExecutePolicy",
     "LLMPlanGenerator",
+    "LoggingDiagnosticSink",
     "LoggingEventSink",
     "Message",
     "MessageRole",
@@ -239,6 +259,7 @@ __all__ = [
     "ModelRequest",
     "ModelResponse",
     "ModelSkillSelector",
+    "NoopDiagnosticSink",
     "NoopEventSink",
     "OllamaClient",
     "OpenAICompatibleClient",
@@ -296,6 +317,9 @@ __all__ = [
     "StepValidator",
     "SummaryResult",
     "SummarizingConversationMemoryPolicy",
+    "SyncToolScheduler",
+    "SyncToolSchedulerOverloaded",
+    "SyncToolSchedulerStats",
     "TextOutputCodec",
     "TokenBudget",
     "TokenBudgetConversationMemoryPolicy",

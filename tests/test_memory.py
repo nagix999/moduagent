@@ -6,6 +6,7 @@ from dataclasses import replace
 
 from moduagent.memory import (
     ApproximateTokenCounter,
+    CachingTokenCounter,
     ConversationMemoryOverflowError,
     InMemoryMemoryStateStore,
     MemoryIntegrityError,
@@ -240,6 +241,80 @@ def test_token_budget_max_history_turns_applies_below_budget() -> None:
     asyncio.run(scenario())
 
 
+def test_token_budget_counts_an_unchanged_request_once() -> None:
+    async def scenario() -> None:
+        class CountingTokenCounter(SimpleTokenCounter):
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def count_request(self, request: ModelRequest) -> int:
+                self.calls += 1
+                return await super().count_request(request)
+
+        counter = CountingTokenCounter()
+        messages = (
+            Message.system("system"),
+            Message.user("history"),
+            Message.assistant("answer"),
+            Message.user("current"),
+        )
+
+        result = await TokenBudgetConversationMemoryPolicy(
+            budget=TokenBudget(100_000),
+            token_counter=counter,
+        ).prepare(_memory_request(messages, protected_from=3))
+
+        assert result.messages == messages
+        assert result.original_tokens == result.selected_tokens
+        assert counter.calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_token_budget_memoizes_binary_search_and_final_selection() -> None:
+    async def scenario() -> None:
+        class MessageCountTokenCounter:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def count_request(self, request: ModelRequest) -> int:
+                self.calls += 1
+                return len(request.messages)
+
+        counter = MessageCountTokenCounter()
+        messages = (
+            Message.system("system"),
+            Message.user("turn-1"),
+            Message.assistant("answer-1"),
+            Message.user("turn-2"),
+            Message.assistant("answer-2"),
+            Message.user("turn-3"),
+            Message.assistant("answer-3"),
+            Message.user("turn-4"),
+            Message.assistant("answer-4"),
+            Message.user("current"),
+        )
+
+        result = await TokenBudgetConversationMemoryPolicy(
+            budget=TokenBudget(6),
+            token_counter=counter,
+        ).prepare(_memory_request(messages, protected_from=9))
+
+        assert [message.content for message in result.messages] == [
+            "system",
+            "turn-3",
+            "answer-3",
+            "turn-4",
+            "answer-4",
+            "current",
+        ]
+        # Original, last two turns, and last three turns are three distinct
+        # requests. The selected last-two view is not counted again.
+        assert counter.calls == 3
+
+    asyncio.run(scenario())
+
+
 def test_token_budget_rejects_oversized_protected_input() -> None:
     async def scenario() -> None:
         messages = (
@@ -466,5 +541,132 @@ def test_approximate_counter_includes_tools_and_output_schema() -> None:
         assert await counter.count_request(constrained) > await counter.count_request(
             plain
         )
+
+    asyncio.run(scenario())
+
+
+def test_caching_token_counter_singleflights_and_retains_no_prompt() -> None:
+    async def scenario() -> None:
+        class SlowTokenCounter:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def count_request(self, request: ModelRequest) -> int:
+                self.calls += 1
+                self.started.set()
+                await self.release.wait()
+                return len(request.messages)
+
+        secret = "private-customer-prompt-42"
+        delegate = SlowTokenCounter()
+        counter = CachingTokenCounter(
+            delegate,
+            max_entries=4,
+            ttl_seconds=None,
+        )
+        request = ModelRequest((Message.user(secret),))
+        tasks = [asyncio.create_task(counter.count_request(request)) for _ in range(20)]
+        await delegate.started.wait()
+        delegate.release.set()
+
+        assert await asyncio.gather(*tasks) == [1] * 20
+        assert await counter.count_request(request) == 1
+        assert delegate.calls == 1
+        assert counter._inflight == {}
+        assert len(counter._cache) == 1
+        assert all(isinstance(key, bytes) and len(key) == 32 for key in counter._cache)
+        assert secret not in repr(counter.__dict__)
+
+    asyncio.run(scenario())
+
+
+def test_caching_token_counter_caches_only_successful_counts() -> None:
+    async def scenario() -> None:
+        class FlakyTokenCounter:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def count_request(self, request: ModelRequest) -> int:
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("tokenizer unavailable")
+                return 17
+
+        delegate = FlakyTokenCounter()
+        counter = CachingTokenCounter(delegate)
+        request = ModelRequest((Message.user("hello"),))
+
+        try:
+            await counter.count_request(request)
+        except RuntimeError as exc:
+            assert str(exc) == "tokenizer unavailable"
+        else:
+            raise AssertionError("delegate failure must be propagated")
+
+        assert await counter.count_request(request) == 17
+        assert await counter.count_request(request) == 17
+        assert delegate.calls == 2
+
+    asyncio.run(scenario())
+
+
+def test_caching_token_counter_uses_a_bounded_lru() -> None:
+    async def scenario() -> None:
+        class CountingTokenCounter:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def count_request(self, request: ModelRequest) -> int:
+                self.calls += 1
+                return len(request.messages[0].content or "")
+
+        delegate = CountingTokenCounter()
+        counter = CachingTokenCounter(
+            delegate,
+            max_entries=2,
+            ttl_seconds=None,
+        )
+        requests = {
+            value: ModelRequest((Message.user(value),)) for value in ("a", "bb", "ccc")
+        }
+
+        assert await counter.count_request(requests["a"]) == 1
+        assert await counter.count_request(requests["bb"]) == 2
+        assert await counter.count_request(requests["a"]) == 1
+        assert await counter.count_request(requests["ccc"]) == 3
+        assert await counter.count_request(requests["bb"]) == 2
+        assert delegate.calls == 4
+        assert len(counter._cache) == 2
+
+    asyncio.run(scenario())
+
+
+def test_caching_token_counter_keys_the_complete_model_request() -> None:
+    async def scenario() -> None:
+        class SequenceTokenCounter:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def count_request(self, request: ModelRequest) -> int:
+                self.calls += 1
+                return self.calls
+
+        delegate = SequenceTokenCounter()
+        counter = CachingTokenCounter(delegate, ttl_seconds=None)
+        base = ModelRequest((Message.user("hello", metadata={"opaque": object()}),))
+        requests = (
+            base,
+            replace(base, tools=({"name": "lookup"},)),
+            replace(base, output_schema={"type": "object"}),
+            replace(base, options={"temperature": 0}),
+            replace(base, provider_options={"chat_template": "custom"}),
+        )
+
+        for expected, request in enumerate(requests, start=1):
+            assert await counter.count_request(request) == expected
+            assert await counter.count_request(request) == expected
+        assert delegate.calls == len(requests)
 
     asyncio.run(scenario())

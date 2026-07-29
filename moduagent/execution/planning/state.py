@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
@@ -9,8 +10,10 @@ from moduagent.decision.planning import (
     ExecutionState,
     Plan,
     PlanStep,
+    PlanStepStatus,
     RunPhase,
     StepResult,
+    step_result_ref,
 )
 from moduagent.execution.base import EngineStateCodec
 from moduagent.messages import FinishReason
@@ -301,9 +304,12 @@ class PlanEngineState:
         return cls(
             phase=_from_legacy_phase(state),
             plan_progress=PlanProgressState(
-                plan=Plan.from_dict(state.plan.to_dict()),
+                # Both representations are internal, already-validated Python
+                # objects. A deep copy preserves mutation isolation without the
+                # much more expensive JSON dump/validation round-trip.
+                plan=copy.deepcopy(state.plan),
                 committed_results={
-                    key: StepResult.model_validate(result.model_dump(mode="json"))
+                    key: result.model_copy(deep=True)
                     for key, result in state.committed_results.items()
                 },
                 replan_count=state.replan_count,
@@ -313,9 +319,7 @@ class PlanEngineState:
                 pending_step_result=(
                     None
                     if state.pending_step_result is None
-                    else StepResult.model_validate(
-                        state.pending_step_result.model_dump(mode="json")
-                    )
+                    else state.pending_step_result.model_copy(deep=True)
                 ),
                 validation_feedback=state.validation_error,
                 step_attempt_count=0 if step is None else step.attempt_count,
@@ -355,7 +359,7 @@ class PlanEngineState:
         )
 
     def to_legacy(self) -> ExecutionState:
-        plan = Plan.from_dict(self.plan_progress.plan.to_dict())
+        plan = copy.deepcopy(self.plan_progress.plan)
         current_step_id = self.step_execution.current_step_id
         if current_step_id is not None:
             current = next(
@@ -378,20 +382,26 @@ class PlanEngineState:
             terminal_failure["finish_reason"] = self.terminal_finish_reason.value
             if self.terminal_error is not None:
                 terminal_failure["terminal_error"] = self.terminal_error
-        return ExecutionState(
+        committed_results = {
+            key: result.model_copy(deep=True)
+            for key, result in self.plan_progress.committed_results.items()
+        }
+        # ExecutionState normally recomputes the content hash of every committed
+        # result in __post_init__. The Engine state was already checked when it
+        # entered the runtime, so repeating that O(total artifact bytes) work at
+        # every legacy-policy adapter call is unnecessary. Construct the facade
+        # with an empty committed set, validate the cheap structural invariants,
+        # then attach isolated copies.
+        _validate_committed_result_structure(plan, committed_results)
+        legacy = ExecutionState(
             phase=phase,
             plan=plan,
             current_step_id=current_step_id,
-            committed_results={
-                key: StepResult.model_validate(result.model_dump(mode="json"))
-                for key, result in self.plan_progress.committed_results.items()
-            },
+            committed_results={},
             pending_step_result=(
                 None
                 if self.step_execution.pending_step_result is None
-                else StepResult.model_validate(
-                    self.step_execution.pending_step_result.model_dump(mode="json")
-                )
+                else self.step_execution.pending_step_result.model_copy(deep=True)
             ),
             validation_error=self.step_execution.validation_feedback,
             awaiting_step_result=awaiting_step_result,
@@ -414,6 +424,8 @@ class PlanEngineState:
             },
             seen_tool_call_ids=list(self.tool_recovery.seen_call_ids),
         )
+        legacy.committed_results = committed_results
+        return legacy
 
 
 def _from_legacy_phase(state: ExecutionState) -> PlanExecutionPhase:
@@ -531,7 +543,7 @@ class PlanStateCodec(EngineStateCodec[PlanEngineState]):
         raw_seen = recovery.get("seen_call_ids", ())
         if isinstance(raw_seen, (str, bytes)) or not isinstance(raw_seen, Sequence):
             raise ValueError("seen_call_ids must be an array")
-        return PlanEngineState(
+        state = PlanEngineState(
             phase=PlanExecutionPhase(str(payload.get("phase", ""))),
             plan_progress=PlanProgressState(
                 plan=Plan.from_dict(_mapping(progress.get("plan"), "plan")),
@@ -609,6 +621,8 @@ class PlanStateCodec(EngineStateCodec[PlanEngineState]):
                 None if terminal.get("error") is None else str(terminal["error"])
             ),
         )
+        _validate_committed_result_integrity(state.plan_progress)
+        return state
 
     def migrate(
         self,
@@ -633,6 +647,35 @@ def _mapping(value: Any, field_name: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{field_name} must be an object")
     return value
+
+
+def _validate_committed_result_structure(
+    plan: Plan,
+    committed_results: Mapping[str, StepResult],
+) -> None:
+    steps_by_id = {step.step_id: step for step in plan.steps}
+    for step_id, result in committed_results.items():
+        if step_id != result.step_id:
+            raise ValueError(
+                f"committed result key {step_id!r} does not match result step_id"
+            )
+        step = steps_by_id.get(step_id)
+        if step is None:
+            raise ValueError(f"committed result refers to unknown step {step_id!r}")
+        if step.status is not PlanStepStatus.COMPLETED:
+            raise ValueError(f"committed result step {step_id!r} is not completed")
+        if not isinstance(step.result_ref, str) or not step.result_ref.startswith(
+            "sha256:"
+        ):
+            raise ValueError(f"committed result step {step_id!r} has no result hash")
+
+
+def _validate_committed_result_integrity(progress: PlanProgressState) -> None:
+    _validate_committed_result_structure(progress.plan, progress.committed_results)
+    steps_by_id = {step.step_id: step for step in progress.plan.steps}
+    for step_id, result in progress.committed_results.items():
+        if steps_by_id[step_id].result_ref != step_result_ref(result):
+            raise ValueError(f"committed result hash does not match step {step_id!r}")
 
 
 __all__ = [

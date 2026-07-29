@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from threading import Event
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import pytest
@@ -78,6 +79,8 @@ def test_conversation_stores_round_trip_json_and_expire_independently() -> None:
         key = "moduagent:conversation:s2"
         assert redis.expirations[key] == 30
         assert '"tool_calls"' in redis.values[key]
+        assert store._fallback_locks == {}
+        assert store._fallback_lock_users == {}
         await store.clear("s2")
         assert await store.load("s2") == []
 
@@ -114,6 +117,40 @@ def test_database_conversation_store_uses_json_repository_rows() -> None:
         assert await store.load("db-session") == messages
         await store.clear("db-session")
         assert await store.load("db-session") == []
+
+    asyncio.run(scenario())
+
+
+def test_sync_database_repository_does_not_block_the_event_loop() -> None:
+    class BlockingRepository:
+        def __init__(self) -> None:
+            self.started = Event()
+            self.release = Event()
+
+        def load_messages(self, session_id: str) -> list[str]:
+            del session_id
+            self.started.set()
+            if not self.release.wait(timeout=0.5):
+                raise AssertionError("synchronous repository blocked the event loop")
+            return []
+
+        def append_messages(self, session_id: str, messages: list[str]) -> None:
+            del session_id, messages
+
+        def clear_messages(self, session_id: str) -> None:
+            del session_id
+
+    async def scenario() -> None:
+        repository = BlockingRepository()
+        store = DatabaseConversationStore(repository)  # type: ignore[arg-type]
+        loading = asyncio.create_task(store.load("sync-db"))
+
+        while not repository.started.is_set():
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        repository.release.set()
+
+        assert await loading == []
 
     asyncio.run(scenario())
 

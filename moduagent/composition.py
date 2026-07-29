@@ -34,7 +34,13 @@ from moduagent.memory import (
     TokenBudgetConversationMemoryPolicy,
 )
 from moduagent.models import ModelCapabilities, ModelClient
-from moduagent.observability import EventSink, NoopEventSink
+from moduagent.observability import (
+    DiagnosticReporter,
+    DiagnosticSink,
+    EventSink,
+    NoopDiagnosticSink,
+    NoopEventSink,
+)
 from moduagent.output import OutputCodec, TextOutputCodec
 from moduagent.persistence import (
     CheckpointStore,
@@ -363,6 +369,9 @@ def compose_agent(
     execution_engine: ExecutionEngine[Any] | None = None,
     output_codec: OutputCodec | None = None,
     event_sink: EventSink | None = None,
+    diagnostic_sink: DiagnosticSink | None = None,
+    diagnostic_timeout_seconds: float = 0.25,
+    diagnostic_max_pending_deliveries: int = 1024,
     tool_authorizer: ToolAuthorizer | None = None,
     checkpoint_store: CheckpointStore | None = None,
     conversation_memory_policy: ConversationMemoryPolicy | None = None,
@@ -401,11 +410,6 @@ def compose_agent(
             SkillSearchTool(skill_runtime),
         )
     tool_registry = ToolRegistry(registered_tools)
-    tool_executor = ToolExecutor(
-        tool_registry,
-        authorizer=tool_authorizer or AllowAllAuthorizer(),
-        retry=config.retry,
-    )
     memory_policy = (
         conversation_memory_policy
         if conversation_memory_policy is not None
@@ -414,6 +418,22 @@ def compose_agent(
     resolved_output = output_codec or TextOutputCodec()
     resolved_conversation_store = conversation_store or InMemoryConversationStore()
     resolved_event_sink = event_sink or NoopEventSink()
+    resolved_diagnostic_sink = diagnostic_sink or NoopDiagnosticSink()
+    diagnostic_reporter = (
+        None
+        if diagnostic_sink is None
+        else DiagnosticReporter(
+            resolved_diagnostic_sink,
+            timeout_seconds=diagnostic_timeout_seconds,
+            max_pending_deliveries=diagnostic_max_pending_deliveries,
+        )
+    )
+    tool_executor = ToolExecutor(
+        tool_registry,
+        authorizer=tool_authorizer or AllowAllAuthorizer(),
+        retry=config.retry,
+        diagnostic_reporter=diagnostic_reporter,
+    )
     if checkpoint_store is not None and not _supports_idempotent_append(
         resolved_conversation_store
     ):
@@ -494,6 +514,17 @@ def compose_agent(
             "visibility": config.stream_visibility,
             "tool_trace_mode": config.tool_trace_mode,
             "event_sink": _qualified_type_name(resolved_event_sink),
+            **(
+                {}
+                if diagnostic_sink is None
+                else {
+                    "diagnostic_sink": _qualified_type_name(resolved_diagnostic_sink),
+                    "diagnostic_timeout_seconds": diagnostic_timeout_seconds,
+                    "diagnostic_max_pending_deliveries": (
+                        diagnostic_max_pending_deliveries
+                    ),
+                }
+            ),
         },
         skill_policy={
             "enabled": skill_runtime is not None,
@@ -532,6 +563,7 @@ def compose_agent(
         conversation_store=resolved_conversation_store,
         output_codec=resolved_output,
         event_sink=resolved_event_sink,
+        diagnostic_reporter=diagnostic_reporter,
         checkpoint_store=checkpoint_store,
         conversation_memory_policy=memory_policy,
         skill_runtime=skill_runtime,

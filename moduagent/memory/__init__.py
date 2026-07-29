@@ -26,6 +26,7 @@ from .summarizer import (
 )
 from .token import (
     ApproximateTokenCounter,
+    CachingTokenCounter,
     TokenBudget,
     TokenCounter,
     VLLMTokenCounter,
@@ -33,6 +34,7 @@ from .token import (
 
 __all__ = [
     "ApproximateTokenCounter",
+    "CachingTokenCounter",
     "ConversationMemoryError",
     "ConversationMemoryOverflowError",
     "ConversationMemoryPolicy",
