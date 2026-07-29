@@ -1,40 +1,27 @@
 from __future__ import annotations
 
-import asyncio
-import inspect
-import time
-from collections.abc import Iterable, Mapping
-from typing import Any
-
-from pydantic import BaseModel, ValidationError
+from collections.abc import Iterable
 
 from moduagent.config import RetryConfig
 from moduagent.messages import ToolCall
-from moduagent.tools.auth import (
-    AllowAllAuthorizer,
-    AuthorizationDecision,
-    ToolAuthorizer,
-)
-from moduagent.tools.base import (
-    Tool,
-    ToolError,
-    ToolErrorType,
-    ToolExecutionContext,
-    ToolFailure,
-    ToolRecoveryAction,
-    ToolResult,
-    _TOOL_REPAIR_METADATA_KEY,
-    _await_if_needed,
-    _json_safe,
-    _run_sync_in_daemon,
-    _serialized_size,
-    _tool_arguments_fingerprint,
-)
+from moduagent.tools.auth import ToolAuthorizer
+from moduagent.tools.base import Tool, ToolExecutionContext, ToolResult
+from moduagent.tools.failure import FailureProjector
 from moduagent.tools.registry import ToolRegistry
+from moduagent.tools.runtime import (
+    ToolBatchOutcome,
+    ToolRepairConstraint,
+    ToolRuntime,
+)
 
 
 class ToolExecutor:
-    """Validate, authorize and execute registered tools."""
+    """Backward-compatible 0.3 Tool executor facade.
+
+    New execution engines should use :class:`ToolRuntime`, whose batch method
+    returns the richer :class:`ToolBatchOutcome`. This adapter intentionally
+    preserves the 0.3 return types.
+    """
 
     def __init__(
         self,
@@ -46,228 +33,86 @@ class ToolExecutor:
         default_timeout_seconds: float | None = 30.0,
         max_result_bytes: int | None = 1_000_000,
     ) -> None:
-        if retry is not None and retry_config is not None:
-            raise ValueError("use either retry or retry_config, not both")
-        if default_timeout_seconds is not None and default_timeout_seconds <= 0:
-            raise ValueError("default_timeout_seconds must be positive")
-        if max_result_bytes is not None and max_result_bytes < 1:
-            raise ValueError("max_result_bytes must be at least 1")
-
-        self.registry = (
-            registry if isinstance(registry, ToolRegistry) else ToolRegistry(registry)
+        self.runtime = ToolRuntime(
+            registry,
+            authorizer=authorizer,
+            retry=retry,
+            retry_config=retry_config,
+            default_timeout_seconds=default_timeout_seconds,
+            max_result_bytes=max_result_bytes,
         )
-        self.authorizer = authorizer or AllowAllAuthorizer()
-        self.retry = retry or retry_config or RetryConfig()
-        self.default_timeout_seconds = default_timeout_seconds
-        self.max_result_bytes = max_result_bytes
+
+    @property
+    def registry(self) -> ToolRegistry:
+        return self.runtime.registry
+
+    @property
+    def authorizer(self) -> ToolAuthorizer:
+        return self.runtime.authorizer
+
+    @authorizer.setter
+    def authorizer(self, value: ToolAuthorizer) -> None:
+        self.runtime.authorizer = value
+
+    @property
+    def retry(self) -> RetryConfig:
+        return self.runtime.retry
+
+    @retry.setter
+    def retry(self, value: RetryConfig) -> None:
+        self.runtime.retry = value
+
+    @property
+    def failure_projector(self) -> FailureProjector:
+        return self.runtime.failure_projector
+
+    @property
+    def default_timeout_seconds(self) -> float | None:
+        return self.runtime.default_timeout_seconds
+
+    @default_timeout_seconds.setter
+    def default_timeout_seconds(self, value: float | None) -> None:
+        self.runtime.default_timeout_seconds = value
+
+    @property
+    def max_result_bytes(self) -> int | None:
+        return self.runtime.max_result_bytes
+
+    @max_result_bytes.setter
+    def max_result_bytes(self, value: int | None) -> None:
+        self.runtime.max_result_bytes = value
 
     async def execute(
         self,
         call: ToolCall,
         context: ToolExecutionContext | None = None,
+        *,
+        repair_constraint: ToolRepairConstraint | None = None,
     ) -> ToolResult:
-        started = time.monotonic()
-        context = context if context is not None else ToolExecutionContext()
-        tool = self.registry.get(call.name)
-        if tool is None:
-            return ToolResult.failed(
-                call_id=call.id,
-                tool_name=call.name,
-                error=ToolError(
-                    ToolErrorType.NOT_FOUND,
-                    f"unknown tool: {call.name}",
-                    recovery=ToolRecoveryAction.FAIL,
-                ),
-                duration_seconds=time.monotonic() - started,
-            )
-        repair_safe = bool(getattr(tool, "repair_safe", False))
-
-        try:
-            arguments = self._validate_arguments(tool, call.arguments)
-        except ValidationError as exc:
-            return ToolResult.failed(
-                call_id=call.id,
-                tool_name=call.name,
-                error=ToolError(
-                    ToolErrorType.INVALID_ARGUMENTS,
-                    f"invalid arguments for tool {call.name}",
-                    reason="invalid_arguments",
-                    recovery=ToolRecoveryAction.REPAIR_CALL,
-                    details={
-                        "errors": exc.errors(
-                            include_url=False,
-                            include_context=False,
-                            include_input=False,
-                        )
-                    },
-                ),
-                duration_seconds=time.monotonic() - started,
-                repair_safe=repair_safe,
-            )
-        except (TypeError, ValueError) as exc:
-            return ToolResult.failed(
-                call_id=call.id,
-                tool_name=call.name,
-                error=ToolError(
-                    ToolErrorType.INVALID_ARGUMENTS,
-                    f"invalid arguments for tool {call.name}: {exc}",
-                    reason="invalid_arguments",
-                    recovery=ToolRecoveryAction.REPAIR_CALL,
-                ),
-                duration_seconds=time.monotonic() - started,
-                repair_safe=repair_safe,
-            )
-
-        repair_context = context.metadata.get(_TOOL_REPAIR_METADATA_KEY)
-        if (
-            isinstance(repair_context, Mapping)
-            and repair_context.get("tool_name") == call.name
-            and repair_context.get("invocation_fingerprint")
-            == _tool_arguments_fingerprint(arguments)
-        ):
-            return ToolResult.failed(
-                call_id=call.id,
-                tool_name=call.name,
-                error=ToolError(
-                    ToolErrorType.INVALID_ARGUMENTS,
-                    "tool repair must change the effective arguments",
-                    reason="unchanged_repair_arguments",
-                    recovery=ToolRecoveryAction.REPAIR_CALL,
-                ),
-                duration_seconds=time.monotonic() - started,
-                invocation_arguments=arguments,
-                repair_safe=repair_safe,
-            )
-
-        try:
-            raw_decision = self.authorizer.authorize(tool, arguments, context)
-            decision = await _await_if_needed(raw_decision)
-        except Exception as exc:
-            return ToolResult.failed(
-                call_id=call.id,
-                tool_name=call.name,
-                error=ToolError(
-                    ToolErrorType.UNAUTHORIZED,
-                    f"tool authorization failed: {exc}",
-                    recovery=ToolRecoveryAction.FAIL,
-                ),
-                duration_seconds=time.monotonic() - started,
-                repair_safe=repair_safe,
-            )
-        if isinstance(decision, bool):
-            decision = AuthorizationDecision(decision)
-        if not isinstance(decision, AuthorizationDecision):
-            return ToolResult.failed(
-                call_id=call.id,
-                tool_name=call.name,
-                error=ToolError(
-                    ToolErrorType.UNAUTHORIZED,
-                    "tool authorizer returned an invalid decision",
-                    recovery=ToolRecoveryAction.FAIL,
-                ),
-                duration_seconds=time.monotonic() - started,
-                repair_safe=repair_safe,
-            )
-        if not decision.allowed:
-            return ToolResult.failed(
-                call_id=call.id,
-                tool_name=call.name,
-                error=ToolError(
-                    ToolErrorType.UNAUTHORIZED,
-                    decision.reason or f"not authorized to call tool: {call.name}",
-                    recovery=ToolRecoveryAction.FAIL,
-                ),
-                duration_seconds=time.monotonic() - started,
-                repair_safe=repair_safe,
-            )
-
-        attempts = (
-            self.retry.max_attempts if bool(getattr(tool, "idempotent", False)) else 1
+        return await self.runtime.execute(
+            call,
+            context,
+            repair_constraint=repair_constraint,
         )
-        timeout = getattr(tool, "timeout_seconds", None)
-        if timeout is None:
-            timeout = self.default_timeout_seconds
-        timeout_retry_safe = self._timeout_retry_safe(tool)
 
-        for attempt in range(1, attempts + 1):
-            call_context = context.for_call(call.id, attempt=attempt)
-            try:
-                invocation = self._invoke_tool(tool, arguments, call_context)
-                value = (
-                    await asyncio.wait_for(invocation, timeout=timeout)
-                    if timeout is not None
-                    else await invocation
-                )
-                size_limit = self._result_size_limit(tool)
-                if size_limit is not None:
-                    actual_size = _serialized_size(_json_safe(value))
-                    if actual_size > size_limit:
-                        return ToolResult.failed(
-                            call_id=call.id,
-                            tool_name=call.name,
-                            error=ToolError(
-                                ToolErrorType.RESULT_TOO_LARGE,
-                                f"tool result exceeds {size_limit} bytes",
-                                reason=("result_too_large" if repair_safe else None),
-                                recovery=(
-                                    ToolRecoveryAction.REPAIR_CALL
-                                    if repair_safe
-                                    else None
-                                ),
-                                details={
-                                    "actual_bytes": actual_size,
-                                    "max_bytes": size_limit,
-                                },
-                            ),
-                            attempts=attempt,
-                            duration_seconds=time.monotonic() - started,
-                            invocation_arguments=arguments,
-                            repair_safe=repair_safe,
-                        )
-                return ToolResult.succeeded(
-                    call_id=call.id,
-                    tool_name=call.name,
-                    value=value,
-                    attempts=attempt,
-                    duration_seconds=time.monotonic() - started,
-                    invocation_arguments=arguments,
-                    repair_safe=repair_safe,
-                )
-            except Exception as exc:
-                error = self._classify_error(
-                    tool,
-                    exc,
-                    timeout_seconds=timeout,
-                    timeout_retry_safe=timeout_retry_safe,
-                )
+    async def execute_batch(
+        self,
+        calls: Iterable[ToolCall],
+        context: ToolExecutionContext | None = None,
+        *,
+        parallel: bool = False,
+        max_parallel: int = 4,
+        repair_constraint: ToolRepairConstraint | None = None,
+    ) -> ToolBatchOutcome:
+        """Execute a batch and expose the 0.4 structured outcome."""
 
-            retry_recovery = error.recovery in {
-                None,
-                ToolRecoveryAction.RETRY_CALL,
-            }
-            should_retry = (
-                bool(getattr(tool, "idempotent", False))
-                and error.retryable
-                and retry_recovery
-                and (error.type is not ToolErrorType.TIMEOUT or timeout_retry_safe)
-                and attempt < attempts
-            )
-            if should_retry:
-                delay = self.retry.delay_for(attempt)
-                if delay:
-                    await asyncio.sleep(delay)
-                continue
-            return ToolResult.failed(
-                call_id=call.id,
-                tool_name=call.name,
-                error=error,
-                attempts=attempt,
-                duration_seconds=time.monotonic() - started,
-                invocation_arguments=arguments,
-                repair_safe=repair_safe,
-            )
-
-        raise AssertionError("tool execution loop ended unexpectedly")
+        return await self.runtime.execute_many(
+            calls,
+            context,
+            parallel=parallel,
+            max_parallel=max_parallel,
+            repair_constraint=repair_constraint,
+        )
 
     async def execute_many(
         self,
@@ -276,145 +121,13 @@ class ToolExecutor:
         *,
         parallel: bool = False,
         max_parallel: int = 4,
+        repair_constraint: ToolRepairConstraint | None = None,
     ) -> tuple[ToolResult, ...]:
-        calls = tuple(calls)
-        context = context if context is not None else ToolExecutionContext()
-        if not parallel:
-            return tuple([await self.execute(call, context) for call in calls])
-        if max_parallel < 1:
-            raise ValueError("max_parallel must be at least 1")
-
-        semaphore = asyncio.Semaphore(max_parallel)
-
-        async def limited(call: ToolCall) -> ToolResult:
-            async with semaphore:
-                return await self.execute(call, context)
-
-        # asyncio.gather preserves input order while allowing bounded overlap.
-        return tuple(await asyncio.gather(*(limited(call) for call in calls)))
-
-    @staticmethod
-    def _validate_arguments(
-        tool: Tool, arguments: Mapping[str, Any]
-    ) -> Mapping[str, Any]:
-        if not isinstance(arguments, Mapping):
-            raise TypeError("tool arguments must be a mapping")
-        validator = getattr(tool, "validate_arguments", None)
-        if callable(validator):
-            return dict(validator(arguments))
-
-        input_model = getattr(tool, "input_model", None)
-        if isinstance(input_model, type) and issubclass(input_model, BaseModel):
-            model = input_model.model_validate(dict(arguments))
-            return {name: getattr(model, name) for name in type(model).model_fields}
-        return dict(arguments)
-
-    @staticmethod
-    async def _invoke_tool(
-        tool: Tool,
-        arguments: Mapping[str, Any],
-        context: ToolExecutionContext,
-    ) -> Any:
-        invoke = getattr(tool, "invoke_validated", None)
-        if invoke is None:
-            invoke = getattr(tool, "invoke", None)
-        if invoke is None:
-            invoke = getattr(tool, "execute", None)
-        if not callable(invoke):
-            raise TypeError(f"tool {tool.name} has no callable invoke method")
-
-        accepts_context = True
-        try:
-            inspect.signature(invoke).bind(arguments, context)
-        except TypeError:
-            accepts_context = False
-        except (ValueError, AttributeError):
-            pass
-
-        def call() -> Any:
-            return invoke(arguments, context) if accepts_context else invoke(arguments)
-
-        if inspect.iscoroutinefunction(invoke):
-            return await call()
-        value = await _run_sync_in_daemon(call)
-        return await _await_if_needed(value)
-
-    def _result_size_limit(self, tool: Tool) -> int | None:
-        tool_limit = getattr(tool, "max_result_bytes", None)
-        limits = [
-            limit for limit in (self.max_result_bytes, tool_limit) if limit is not None
-        ]
-        return min(limits) if limits else None
-
-    @staticmethod
-    def _timeout_retry_safe(tool: Tool) -> bool:
-        declared = getattr(tool, "timeout_retry_safe", None)
-        # Unknown custom Tools fail closed. FunctionTool publishes an explicit
-        # capability based on its underlying function, while advanced custom
-        # Tools may declare the same capability after proving cancellation.
-        return bool(declared) if declared is not None else False
-
-    @staticmethod
-    def _classify_error(
-        tool: Tool,
-        exception: Exception,
-        *,
-        timeout_seconds: float | None,
-        timeout_retry_safe: bool,
-    ) -> ToolError:
-        if isinstance(exception, asyncio.TimeoutError) and not timeout_retry_safe:
-            return ToolError(
-                ToolErrorType.TIMEOUT,
-                f"tool timed out: {tool.name}",
-                retryable=False,
-                details={"timeout_seconds": timeout_seconds},
-                reason="uncancellable_timeout",
-                recovery=ToolRecoveryAction.FAIL,
-            )
-        if isinstance(exception, ToolFailure):
-            return exception.error
-
-        mapper = getattr(tool, "error_mapper", None)
-        if callable(mapper):
-            # The mapper owns sanitization: ToolError.message/details are later
-            # serialized into the model-visible tool response.
-            try:
-                mapped = mapper(exception)
-            except Exception as mapper_error:
-                return ToolError(
-                    ToolErrorType.EXECUTION_ERROR,
-                    "tool error mapper failed",
-                    details={"exception_type": type(mapper_error).__name__},
-                    recovery=ToolRecoveryAction.FAIL,
-                )
-            if mapped is not None:
-                if isinstance(mapped, ToolError):
-                    return mapped
-                return ToolError(
-                    ToolErrorType.EXECUTION_ERROR,
-                    "tool error mapper returned an invalid result",
-                    details={"result_type": type(mapped).__name__},
-                    recovery=ToolRecoveryAction.FAIL,
-                )
-
-        idempotent = bool(getattr(tool, "idempotent", False))
-        if isinstance(exception, asyncio.TimeoutError):
-            retryable = idempotent and timeout_retry_safe
-            return ToolError(
-                ToolErrorType.TIMEOUT,
-                f"tool timed out: {tool.name}",
-                retryable=retryable,
-                details={"timeout_seconds": timeout_seconds},
-                reason="tool_timeout",
-                recovery=(
-                    ToolRecoveryAction.RETRY_CALL
-                    if retryable
-                    else ToolRecoveryAction.FAIL
-                ),
-            )
-        return ToolError(
-            ToolErrorType.EXECUTION_ERROR,
-            f"tool execution failed: {exception}",
-            retryable=idempotent,
-            details={"exception_type": type(exception).__name__},
+        outcome = await self.execute_batch(
+            calls,
+            context,
+            parallel=parallel,
+            max_parallel=max_parallel,
+            repair_constraint=repair_constraint,
         )
+        return outcome.results

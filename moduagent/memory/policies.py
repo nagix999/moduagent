@@ -15,7 +15,11 @@ from moduagent.memory.state import (
     MemorySnapshot,
     MemoryStateStore,
 )
-from moduagent.memory.summarizer import ConversationSummarizer
+from moduagent.memory.summarizer import (
+    ConversationSummarizer,
+    GatewayConversationSummarizer,
+)
+from moduagent.models import ModelGateway
 from moduagent.memory.token import (
     ApproximateTokenCounter,
     TokenBudget,
@@ -42,8 +46,19 @@ class FullConversationMemoryPolicy:
         return MemoryResult(messages=request.model_request.messages)
 
 
-class RecentTurnsConversationMemoryPolicy:
+class _ImmutableSemanticConfiguration:
+    _semantic_fields: frozenset[str] = frozenset()
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in self._semantic_fields and name in self.__dict__:
+            raise AttributeError(f"{name} is immutable after policy construction")
+        object.__setattr__(self, name, value)
+
+
+class RecentTurnsConversationMemoryPolicy(_ImmutableSemanticConfiguration):
     """Keep at most the most recent complete historical user turns."""
+
+    _semantic_fields = frozenset({"max_turns"})
 
     def __init__(self, max_turns: int) -> None:
         if max_turns < 0:
@@ -73,8 +88,19 @@ class RecentTurnsConversationMemoryPolicy:
         )
 
 
-class TokenBudgetConversationMemoryPolicy:
+class TokenBudgetConversationMemoryPolicy(_ImmutableSemanticConfiguration):
     """Select a contiguous suffix of complete turns within a token budget."""
+
+    _semantic_fields = frozenset(
+        {
+            "budget",
+            "token_counter",
+            "summarizer",
+            "state_store",
+            "max_history_turns",
+            "policy_fingerprint",
+        }
+    )
 
     def __init__(
         self,
@@ -174,7 +200,9 @@ class TokenBudgetConversationMemoryPolicy:
         if self.summarizer is not None and excluded_turns:
             try:
                 summary_message, summary_usage, cache_hit = await self._summary(
-                    request.session_id, excluded_turns
+                    request.session_id,
+                    excluded_turns,
+                    model_gateway=request.model_gateway,
                 )
                 with_summary = _compose(parts, selected, summary=summary_message)
                 summary_tokens = await self._count(request, with_summary)
@@ -183,7 +211,9 @@ class TokenBudgetConversationMemoryPolicy:
                     excluded_count += 1
                     excluded_turns = all_turns[:excluded_count]
                     summary_message, extra_usage, cache_hit = await self._summary(
-                        request.session_id, excluded_turns
+                        request.session_id,
+                        excluded_turns,
+                        model_gateway=request.model_gateway,
                     )
                     summary_usage = summary_usage + extra_usage
                     with_summary = _compose(parts, selected, summary=summary_message)
@@ -270,6 +300,8 @@ class TokenBudgetConversationMemoryPolicy:
         self,
         session_id: str,
         turns: tuple[tuple[Message, ...], ...],
+        *,
+        model_gateway: ModelGateway | None,
     ) -> tuple[Message, Usage, bool]:
         if self.summarizer is None:
             raise RuntimeError("summarizer is not configured")
@@ -296,9 +328,20 @@ class TokenBudgetConversationMemoryPolicy:
                 cache_hit = True
                 return _summary_message(snapshot.summary), Usage(), cache_hit
 
-        result = await self.summarizer.summarize(
-            new_messages, previous_summary=previous_summary
-        )
+        if model_gateway is not None and isinstance(
+            self.summarizer,
+            GatewayConversationSummarizer,
+        ):
+            result = await self.summarizer.summarize_with_gateway(
+                new_messages,
+                previous_summary=previous_summary,
+                gateway=model_gateway,
+            )
+        else:
+            result = await self.summarizer.summarize(
+                new_messages,
+                previous_summary=previous_summary,
+            )
         if self.state_store is not None:
             await self.state_store.save(
                 session_id,

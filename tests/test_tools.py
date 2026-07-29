@@ -677,7 +677,7 @@ def test_tool_result_preserves_supported_object_converters() -> None:
     }
 
 
-def test_unknown_nested_tool_value_falls_back_locally_to_repr() -> None:
+def test_unknown_nested_tool_value_uses_stable_type_projection() -> None:
     class Unknown:
         def __repr__(self) -> str:
             return "<unknown-result>"
@@ -691,7 +691,14 @@ def test_unknown_nested_tool_value_falls_back_locally_to_repr() -> None:
     payload = json.loads(result.model_content())
 
     assert payload["value"] == {
-        "rows": [{"known": 1, "unknown": "<unknown-result>"}],
+        "rows": [
+            {
+                "known": 1,
+                "unknown": {
+                    "unsupported_type": (f"{Unknown.__module__}.{Unknown.__qualname__}")
+                },
+            }
+        ],
         "row_count": 1,
     }
 

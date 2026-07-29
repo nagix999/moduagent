@@ -104,7 +104,7 @@ def test_runtime_retries_model_without_emitted_tokens() -> None:
             model=model,
         )
 
-        events = [event async for event in agent.stream("실행")]
+        events = [event async for event in agent.stream_all("실행")]
 
         assert sum(event.type is EventType.RETRY for event in events) == 1
         assert events[-1].data["result"].output == "복구"
@@ -140,7 +140,7 @@ def test_standard_finalization_mode_always_adds_a_text_finalizer() -> None:
         assert model.requests[1].output_schema is None
         assert [
             message.content for message in await conversations.load("always-finalize")
-        ] == ["answer this", "internal draft", "public final"]
+        ] == ["answer this", "public final"]
 
     asyncio.run(scenario())
 
@@ -196,7 +196,10 @@ def test_recent_turns_policy_limits_model_view_but_preserves_full_history() -> N
         await agent.run("question 2", session_id="recent-session")
         events = [
             event
-            async for event in agent.stream("question 3", session_id="recent-session")
+            async for event in agent.stream_all(
+                "question 3",
+                session_id="recent-session",
+            )
         ]
 
         assert [message.content for message in model.requests[2].messages] == [
@@ -392,7 +395,7 @@ def test_checkpoint_resumes_failed_run() -> None:
         )
 
         failed = await agent.run("작업", session_id="resume-session")
-        assert failed.error == "model unavailable"
+        assert failed.error == "model invocation failed"
         assert await checkpoints.load(failed.run_id) is not None
 
         resumed = await agent.resume(failed.run_id, session_id="resume-session")
@@ -712,7 +715,7 @@ def test_structured_finalization_resume_does_not_repeat_act() -> None:
 
         failed = await agent.run("What is 2 + 3?", session_id="structured-resume")
 
-        assert failed.error == "finalizer unavailable"
+        assert failed.error == "model invocation failed"
         assert len(model.requests) == 2
         assert model.requests[0].tools and model.requests[0].output_schema is None
         assert model.requests[1].tools == ()
@@ -731,7 +734,6 @@ def test_structured_finalization_resume_does_not_repeat_act() -> None:
             message.content for message in await conversations.load("structured-resume")
         ] == [
             "What is 2 + 3?",
-            "Draft answer: 5",
             '{"answer":"5","confidence":1.0}',
         ]
 
@@ -811,12 +813,12 @@ def test_structured_tool_stream_labels_act_and_finalize_deltas() -> None:
             output_codec=PydanticOutputCodec(StructuredAnswer),
         )
 
-        events = [event async for event in agent.stream("What is 2 + 3?")]
+        events = [event async for event in agent.stream_all("What is 2 + 3?")]
 
         deltas = [
             (event.data["phase"], event.data["delta"])
             for event in events
-            if event.type is EventType.MODEL_DELTA
+            if event.type in {EventType.MODEL_DELTA, EventType.FINAL_DELTA}
         ]
         assert deltas == [
             ("act", "Draft answer: 5"),
@@ -884,7 +886,10 @@ def test_memory_policy_prepares_act_and_finalize_without_mutating_requests() -> 
 
         events = [
             event
-            async for event in agent.stream("new question", session_id="memory-session")
+            async for event in agent.stream_all(
+                "new question",
+                session_id="memory-session",
+            )
         ]
 
         assert [request.phase.value for request in memory_policy.requests] == [
@@ -939,7 +944,6 @@ def test_memory_policy_prepares_act_and_finalize_without_mutating_requests() -> 
             "old question",
             "old answer",
             "new question",
-            "Draft answer",
             '{"answer":"final","confidence":1.0}',
         ]
 
@@ -1026,11 +1030,13 @@ def test_stream_cancellation_keeps_checkpoint_for_resume() -> None:
             model=BlockingStreamingModel(),
             checkpoint_store=checkpoints,
         )
-        stream = agent.stream("long task", session_id="cancel-session")
+        stream = agent.stream_all("long task", session_id="cancel-session")
 
         started = await anext(stream)
         assert started.type is EventType.RUN_STARTED
         model_started = await anext(stream)
+        while model_started.type is not EventType.MODEL_STARTED:
+            model_started = await anext(stream)
         assert model_started.type is EventType.MODEL_STARTED
 
         pending = asyncio.create_task(anext(stream))

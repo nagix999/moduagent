@@ -392,7 +392,7 @@ failed = await agent.run(
 resumed = await agent.resume(failed.run_id, session_id="invoice-42")
 ```
 
-Resume 시 Registry 전체의 catalog digest나 활성 Skill의 digest·source·Tool 범위·`applies-to`가 달라지면 실행을 최신 내용으로 조용히 바꾸지 않고 실패한다. 활성화하지 않은 다른 Skill의 변경도 catalog digest를 바꾸므로 진행 중 checkpoint가 있으면 배포 단위 전체를 고정해야 한다. Checkpoint v3는 phase-scoped Skill과 strict Plan-and-Execute 실행 상태를 저장한다. 과거 v2 Skill 상태는 `applies-to`를 세 단계 전체로 복원하고, v1은 Skills가 비활성화된 상태로 읽는다.
+Resume 시 Registry 전체의 catalog digest나 활성 Skill의 digest·source·Tool 범위·`applies-to`가 달라지면 실행을 최신 내용으로 조용히 바꾸지 않고 실패한다. 활성화하지 않은 다른 Skill의 변경도 catalog digest를 바꾸므로 진행 중 checkpoint가 있으면 배포 단위 전체를 고정해야 한다. Checkpoint outer schema v4는 phase-scoped Skill 상태와 versioned Engine state를 분리해 저장한다. 과거 v1-v3 payload는 검증 후 v4로 migration한다.
 
 ## CLI
 

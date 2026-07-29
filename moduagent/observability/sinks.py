@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import json
 import logging
@@ -65,7 +66,7 @@ class CompositeEventSink:
 
     async def publish(self, event: AgentEvent) -> None:
         results = await asyncio.gather(
-            *(_publish(sink, event) for sink in self.sinks),
+            *(_publish(sink, copy.deepcopy(event)) for sink in self.sinks),
             return_exceptions=True,
         )
         failures: list[BaseException] = []
@@ -104,7 +105,7 @@ class LoggingEventSink:
     async def publish(self, event: AgentEvent) -> None:
         try:
             payload = mask_sensitive(
-                event_to_dict(event),
+                _observability_event_to_dict(event),
                 sensitive_keys=self.sensitive_keys,
                 replacement=self.replacement,
             )
@@ -328,7 +329,7 @@ class AuditEventSink:
             return
         try:
             record = mask_sensitive(
-                event_to_dict(event),
+                _observability_event_to_dict(event),
                 sensitive_keys=self.sensitive_keys,
                 replacement=self.replacement,
             )
@@ -342,13 +343,111 @@ class AuditEventSink:
 
 
 def event_to_dict(event: AgentEvent) -> dict[str, Any]:
-    return {
-        "type": _event_name(event),
-        "run_id": event.run_id,
-        "occurred_at": _utc_iso(event.occurred_at),
-        "visibility": event.visibility.value,
-        "data": _json_safe(event.data),
-    }
+    return event.to_dict()
+
+
+def _observability_event_to_dict(event: AgentEvent) -> dict[str, Any]:
+    """Project sensitive event objects before built-in logging/audit sinks."""
+
+    record = event_to_dict(event)
+    if event.type is EventType.RUN_STARTED:
+        record["data"] = {
+            key: event.data[key] for key in ("agent", "session_id") if key in event.data
+        }
+        return record
+    if event.type in {EventType.RUN_COMPLETED, EventType.RUN_FAILED}:
+        result = event.data.get("result")
+        usage = _event_usage(event.data)
+        finish_reason = getattr(result, "finish_reason", None)
+        if isinstance(finish_reason, Enum):
+            finish_reason = finish_reason.value
+        messages = getattr(result, "messages", ())
+        record["data"] = {
+            "finish_reason": str(
+                finish_reason
+                or ("error" if event.type is EventType.RUN_FAILED else "completed")
+            ),
+            "has_output": getattr(result, "output", None) is not None,
+            "has_error": bool(getattr(result, "error", None)),
+            "message_count": (
+                len(messages) if isinstance(messages, (list, tuple)) else 0
+            ),
+            "usage": (
+                {
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "total_tokens": usage.total_tokens,
+                }
+                if usage is not None
+                else None
+            ),
+        }
+        return record
+    if event.type in {EventType.TOOL_STARTED, EventType.TOOL_COMPLETED}:
+        data = {
+            key: event.data[key]
+            for key in (
+                "tool_name",
+                "call_id",
+                "step_id",
+                "success",
+                "arguments_fingerprint",
+            )
+            if key in event.data
+        }
+        failure = event.data.get("failure")
+        if isinstance(failure, Mapping):
+            data["failure"] = {
+                key: failure[key]
+                for key in (
+                    "type",
+                    "reason",
+                    "recovery",
+                    "retryable",
+                    "arguments_fingerprint",
+                    "invocation_fingerprint",
+                )
+                if key in failure
+            }
+        record["data"] = data
+        return record
+    if event.type is EventType.MODEL_COMPLETED:
+        response = event.data.get("response")
+        usage = _event_usage(event.data)
+        calls = tuple(
+            getattr(response, "tool_calls", ())
+            or getattr(getattr(response, "message", None), "tool_calls", ())
+        )
+        record["data"] = {
+            "step": event.data.get("step"),
+            "phase": event.data.get("phase"),
+            "finish_reason": getattr(response, "finish_reason", None),
+            "tool_call_count": len(calls),
+            "usage": (
+                {
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "total_tokens": usage.total_tokens,
+                }
+                if usage is not None
+                else None
+            ),
+        }
+        return record
+    if event.type in {
+        EventType.MODEL_DELTA,
+        EventType.STEP_MODEL_DELTA,
+        EventType.FINAL_DELTA,
+    }:
+        delta = str(event.data.get("delta", ""))
+        record["data"] = {
+            "step": event.data.get("step"),
+            "phase": event.data.get("phase"),
+            "delta_chars": len(delta),
+            "delta_bytes": len(delta.encode("utf-8")),
+        }
+        return record
+    return record
 
 
 def mask_sensitive(
@@ -385,7 +484,11 @@ async def _publish(sink: Any, event: AgentEvent) -> None:
         publisher = getattr(sink, "emit", None)
     if not callable(publisher):
         raise TypeError("event sink must provide publish() or emit()")
-    result = publisher(event)
+    result = (
+        await publisher(event)
+        if inspect.iscoroutinefunction(publisher)
+        else await asyncio.to_thread(publisher, event)
+    )
     if inspect.isawaitable(result):
         await result
 

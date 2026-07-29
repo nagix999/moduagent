@@ -31,12 +31,17 @@ class ToolSchema(Mapping[str, Any]):
     name: str
     description: str
     parameters: Mapping[str, Any]
+    # Runtime accounting metadata is not serialized into the model-facing
+    # function schema. Resource tools use their own independent quota.
+    counts_toward_tool_limit: bool = True
 
     def __post_init__(self) -> None:
         if not self.name.strip():
             raise ValueError("tool name cannot be empty")
         if not isinstance(self.parameters, Mapping):
             raise TypeError("tool parameters must be a mapping")
+        if type(self.counts_toward_tool_limit) is not bool:
+            raise TypeError("counts_toward_tool_limit must be a bool")
 
     def to_function_dict(self) -> dict[str, Any]:
         return {
@@ -403,7 +408,19 @@ def _json_key(value: Any, seen: set[int]) -> str:
         return "false"
     if isinstance(normalized, (int, float)):
         return str(normalized)
-    return repr(normalized)
+    return json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _unsupported_json_value(value: Any) -> dict[str, str]:
+    value_type = type(value)
+    qualified_name = f"{value_type.__module__}.{value_type.__qualname__}"
+    return {"unsupported_type": qualified_name[:256]}
 
 
 def _normalize_json(value: Any, seen: set[int]) -> Any:
@@ -426,7 +443,7 @@ def _normalize_json(value: Any, seen: set[int]) -> Any:
 
     value_id = id(value)
     if value_id in seen:
-        return "<recursive reference>"
+        return {"unsupported_type": "recursive_reference"}
     seen.add(value_id)
     try:
         if isinstance(value, BaseModel):
@@ -445,7 +462,7 @@ def _normalize_json(value: Any, seen: set[int]) -> Any:
             try:
                 records = value.to_dict(orient="records")
             except Exception:
-                return repr(value)
+                return _unsupported_json_value(value)
             return _normalize_json(records, seen)
 
         if _is_numpy_value(value):
@@ -455,9 +472,9 @@ def _normalize_json(value: Any, seen: set[int]) -> Any:
                 elif hasattr(value, "item") and callable(value.item):
                     converted = value.item()
                 else:
-                    return repr(value)
+                    return _unsupported_json_value(value)
             except Exception:
-                return repr(value)
+                return _unsupported_json_value(value)
             return _normalize_json(converted, seen)
 
         to_dict = getattr(value, "to_dict", None)
@@ -465,9 +482,9 @@ def _normalize_json(value: Any, seen: set[int]) -> Any:
             try:
                 converted = to_dict()
             except Exception:
-                return repr(value)
+                return _unsupported_json_value(value)
             return _normalize_json(converted, seen)
-        return repr(value)
+        return _unsupported_json_value(value)
     finally:
         seen.remove(value_id)
 
@@ -479,10 +496,10 @@ def _json_safe(value: Any) -> Any:
         normalized = _normalize_json(value, set())
         return json.loads(json.dumps(normalized, ensure_ascii=False, allow_nan=False))
     except (TypeError, ValueError, OverflowError):
-        return repr(value)
+        return _unsupported_json_value(value)
 
 
-def _tool_arguments_fingerprint(arguments: Mapping[str, Any]) -> str:
+def canonical_tool_arguments_fingerprint(arguments: Mapping[str, Any]) -> str:
     """Hash canonical Tool arguments without retaining their raw values."""
 
     normalized = _json_safe(dict(arguments))

@@ -5,14 +5,26 @@ import json
 import warnings
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal, Mapping, Protocol, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    Mapping,
+    Protocol,
+    Sequence,
+    runtime_checkable,
+)
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from moduagent.decision.base import DecisionKind, ExecutionDecision
 from moduagent.messages import Message, ToolCall
 from moduagent.models import ModelClient, ModelRequest, ModelResponse
-from moduagent.tools.base import ToolRecoveryAction, _tool_arguments_fingerprint
+from moduagent.tools import (
+    ToolRecoveryAction,
+    fingerprint_tool_arguments,
+    is_tool_argument_fingerprint,
+)
 
 if TYPE_CHECKING:
     from moduagent.runtime.context import RunContext
@@ -46,16 +58,6 @@ StepStatus = PlanStepStatus
 def _stable_step_id(objective: str) -> str:
     digest = hashlib.sha256(objective.encode("utf-8")).hexdigest()[:12]
     return f"step-{digest}"
-
-
-def _is_tool_arguments_fingerprint(value: Any) -> bool:
-    text = str(value)
-    digest = text.removeprefix("sha256:")
-    return (
-        text.startswith("sha256:")
-        and len(digest) == 64
-        and all(character in "0123456789abcdef" for character in digest)
-    )
 
 
 def _string_list(value: Sequence[str], field_name: str) -> list[str]:
@@ -527,7 +529,7 @@ class ExecutionState:
                 "invocation_fingerprint",
             ):
                 fingerprint = self.pending_tool_failure.get(field_name)
-                if fingerprint is not None and not _is_tool_arguments_fingerprint(
+                if fingerprint is not None and not is_tool_argument_fingerprint(
                     fingerprint
                 ):
                     raise ValueError(
@@ -548,7 +550,7 @@ class ExecutionState:
             fingerprint = str(raw_call.get("arguments_fingerprint", "")).strip()
             if not normalized_call_id or not tool_name:
                 raise ValueError("active Tool call identity cannot be empty")
-            if not _is_tool_arguments_fingerprint(fingerprint):
+            if not is_tool_argument_fingerprint(fingerprint):
                 raise ValueError(
                     "active Tool call arguments_fingerprint must use sha256"
                 )
@@ -822,7 +824,22 @@ class PlanGenerator(Protocol):
     async def revise(self, context: RunContext, plan: Plan, feedback: str) -> Plan: ...
 
 
+@runtime_checkable
+class ToolScopedPlanGenerator(Protocol):
+    def configure_available_tools(
+        self,
+        available_tools: frozenset[str],
+    ) -> None: ...
+
+
 class LLMPlanGenerator:
+    _IMMUTABLE_CONFIGURATION = frozenset({"model", "max_steps", "history_limit"})
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in self._IMMUTABLE_CONFIGURATION and name in self.__dict__:
+            raise AttributeError(f"{name} is immutable after generator construction")
+        object.__setattr__(self, name, value)
+
     def __init__(
         self,
         model: ModelClient,
@@ -837,13 +854,24 @@ class LLMPlanGenerator:
         self.model = model
         self.max_steps = max_steps
         self.history_limit = history_limit
+        self._configured_available_tools: frozenset[str] | None = None
+
+    def configure_available_tools(
+        self,
+        available_tools: frozenset[str],
+    ) -> None:
+        if not isinstance(available_tools, frozenset) or not all(
+            isinstance(name, str) and name for name in available_tools
+        ):
+            raise TypeError("available_tools must be a frozenset of Tool names")
+        self._configured_available_tools = available_tools
 
     async def create(self, context: RunContext) -> Plan:
         # Local import keeps the planning domain importable by runtime.context
         # without executing the skills package/runtime import graph.
         from moduagent.skills.prompting import compose_skill_prompt
 
-        available_tools = self._available_tools(context)
+        available_tools = self._available_tools()
         request = ModelRequest(
             messages=compose_skill_prompt(
                 self._base_messages(
@@ -873,8 +901,17 @@ class LLMPlanGenerator:
             ),
             output_schema=self._schema(),
         )
-        response = await self.model.complete(request)
-        context.usage = context.usage + response.usage
+        response = (
+            await self.model.complete(request)
+            if context.model_gateway is None
+            else await context.model_gateway.complete(
+                self.model,
+                request,
+                phase="plan",
+            )
+        )
+        if context.model_gateway is None:
+            context.usage = context.usage + response.usage
         self._validate_response(response)
         return self._parse(
             response.message.content,
@@ -885,7 +922,7 @@ class LLMPlanGenerator:
     async def revise(self, context: RunContext, plan: Plan, feedback: str) -> Plan:
         from moduagent.skills.prompting import compose_skill_prompt
 
-        available_tools = self._available_tools(context)
+        available_tools = self._available_tools()
         request = ModelRequest(
             messages=compose_skill_prompt(
                 self._base_messages(
@@ -914,8 +951,17 @@ class LLMPlanGenerator:
             ),
             output_schema=self._schema(),
         )
-        response = await self.model.complete(request)
-        context.usage = context.usage + response.usage
+        response = (
+            await self.model.complete(request)
+            if context.model_gateway is None
+            else await context.model_gateway.complete(
+                self.model,
+                request,
+                phase="replan",
+            )
+        )
+        if context.model_gateway is None:
+            context.usage = context.usage + response.usage
         self._validate_response(response)
         return self._parse(
             response.message.content,
@@ -1065,17 +1111,8 @@ class LLMPlanGenerator:
         if response.tool_calls or response.message.tool_calls:
             raise ValueError("planner response cannot contain tool calls")
 
-    @staticmethod
-    def _available_tools(context: RunContext) -> frozenset[str] | None:
-        raw = context.metadata.get("_moduagent_available_tools")
-        if raw is None:
-            return None
-        if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
-            raise ValueError("_moduagent_available_tools must be an array")
-        tools = tuple(str(item) for item in raw)
-        if not all(tools) or len(set(tools)) != len(tools):
-            raise ValueError("_moduagent_available_tools contains invalid names")
-        return frozenset(tools)
+    def _available_tools(self) -> frozenset[str] | None:
+        return self._configured_available_tools
 
     @staticmethod
     def _schema() -> Mapping[str, Any]:
@@ -1156,6 +1193,19 @@ class PlanAndExecutePolicy:
         self.max_step_attempts = max_step_attempts or 2
         self.max_replans = 2 if max_replans is None else max_replans
         self.max_tool_repair_attempts = 1
+        self.available_tools: frozenset[str] = frozenset()
+
+    def configure_available_tools(
+        self,
+        available_tools: frozenset[str],
+    ) -> None:
+        if not isinstance(available_tools, frozenset) or not all(
+            isinstance(name, str) and name for name in available_tools
+        ):
+            raise TypeError("available_tools must be a frozenset of Tool names")
+        self.available_tools = available_tools
+        if isinstance(self.plan_generator, ToolScopedPlanGenerator):
+            self.plan_generator.configure_available_tools(available_tools)
 
     def configure_limits(
         self,
@@ -1492,7 +1542,7 @@ class PlanAndExecutePolicy:
             if call_id in seen or call_id in records:
                 return {}, "Tool calls must use a new unique call ID"
             try:
-                fingerprint = _tool_arguments_fingerprint(call.arguments)
+                fingerprint = fingerprint_tool_arguments(call.arguments)
             except ValueError:
                 return {}, "Tool call arguments must be canonical JSON"
             records[call_id] = {
@@ -1842,7 +1892,7 @@ class PlanAndExecutePolicy:
             payload["arguments_fingerprint"] = str(active_call["arguments_fingerprint"])
             invocation_arguments = getattr(result, "invocation_arguments", None)
             payload["invocation_fingerprint"] = (
-                _tool_arguments_fingerprint(invocation_arguments)
+                fingerprint_tool_arguments(invocation_arguments)
                 if isinstance(invocation_arguments, Mapping)
                 else str(active_call["arguments_fingerprint"])
             )

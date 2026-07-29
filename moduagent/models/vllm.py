@@ -29,13 +29,20 @@ class VLLMClient(OpenAICompatibleClient):
             **dict(deployment_options or {}),
             **dict(extra_body or {}),
         }
+        resolved_capabilities = (
+            capabilities
+            if capabilities is not None
+            else ModelCapabilities(
+                tool_calling_with_structured_output=False,
+            )
+        )
         super().__init__(
             base_url=base_url,
             model=model,
             api_key=api_key,
             transport=transport,
             timeout=timeout,
-            capabilities=capabilities or ModelCapabilities(),
+            capabilities=resolved_capabilities,
             default_options=default_options,
             provider_options=provider_options,
             headers=headers,
@@ -89,7 +96,11 @@ class VLLMClient(OpenAICompatibleClient):
         return f"{base}/tokenize"
 
     def _build_payload(self, request: ModelRequest, *, stream: bool) -> dict[str, Any]:
-        if request.tools and request.output_schema is not None:
+        if (
+            request.tools
+            and request.output_schema is not None
+            and not self.capabilities.tool_calling_with_structured_output
+        ):
             raise ValueError(
                 "vLLM tool calling and structured output require separate "
                 "ACT and FINALIZE requests"

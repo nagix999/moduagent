@@ -109,8 +109,10 @@ class SkillRuntime:
             recent_messages=recent_messages,
             user_context=context.request.user_context,
             max_skills=self.limits.max_active_skills,
+            model_gateway=context.model_gateway,
         )
         selector = self._selector_for(mode)
+        usage_before_selection = context.usage
         selection = (
             SkillSelectionResult()
             if not catalog
@@ -172,7 +174,8 @@ class SkillRuntime:
         )
         context.skill_messages = render_skill_messages(artifacts)
         self._record_metadata(context)
-        context.usage = context.usage + selection.usage
+        if context.usage == usage_before_selection:
+            context.usage = context.usage + selection.usage
         return SkillActivationReport(
             catalog_count=len(catalog),
             catalog_tokens=catalog_tokens,

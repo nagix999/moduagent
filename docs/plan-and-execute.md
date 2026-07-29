@@ -1,6 +1,6 @@
 # Plan-and-Execute
 
-상태: ModuAgent 0.3.2의 `PlanAndExecutePolicy`는 검증된 단계 결과와 공개 최종 응답을 분리하는 strict 상태 머신이다. `Agent`의 기본 Policy는 계속 `StandardDecisionPolicy`이며, Plan-and-Execute가 필요한 Agent에 명시적으로 설정한다.
+상태: ModuAgent 0.4의 `PlanExecutionEngine`은 검증된 단계 결과와 공개 최종 응답을 분리하는 strict 상태 머신이다. 기존 `PlanAndExecutePolicy`는 호환 facade로 유지된다. `Agent`의 기본 실행은 계속 Standard이며, Plan-and-Execute가 필요한 Agent에 명시적으로 설정한다.
 
 ## 핵심 계약
 
@@ -245,7 +245,7 @@ ACT의 내부 출력은 다음 `StepResult` 필드만 허용한다.
 | `summary` | 기본값. `step_id`, `call_id`, `tool_name`, `success`, `attempts`, `duration_seconds`, 정제된 `error`만 저장 |
 | `arguments` | `summary`에 민감한 키를 재귀적으로 마스킹한 `arguments`와 `arguments_source`를 추가 |
 
-`arguments_source="validated"`는 validation·형 변환·기본값 적용 후 Tool에 실제 전달된 인자이고, `"requested"`는 validation 또는 실행 전에 거부된 호출의 모델 요청 인자다. `error`는 원본 메시지 대신 `type`, `retryable`과 선택적인 `reason`, `recovery`만 가진다. trace 전체 크기도 제한되며 Tool 결과 값은 어떤 모드에도 넣지 않는다. 같은 trace는 strict checkpoint의 내부 실행 metadata에 저장되므로 resume 전후의 호출 이력을 함께 확인할 수 있고 checkpoint schema는 v3를 유지한다.
+`arguments_source="validated"`는 validation·형 변환·기본값 적용 후 Tool에 실제 전달된 인자이고, `"requested"`는 validation 또는 실행 전에 거부된 호출의 모델 요청 인자다. `error`는 원본 메시지 대신 `type`, `retryable`과 선택적인 `reason`, `recovery`만 가진다. trace 전체 크기도 제한되며 Tool 결과 값은 어떤 모드에도 넣지 않는다. live `AgentResult`는 요청한 trace mode를 유지하지만 v4 checkpoint에는 raw arguments 대신 `arguments_fingerprint`만 저장한다. resume 후 trace도 fingerprint projection으로 이어진다.
 
 ```python
 agent = Agent(
@@ -264,7 +264,7 @@ for call in result.metadata.get("tool_trace", []):
     print(call["step_id"], call["tool_name"], call.get("arguments"))
 ```
 
-인자도 업무 데이터가 될 수 있으므로 일반 운영은 기본 `summary`를 권장한다. 원문 Tool 결과와 내부 model message가 필요한 일시적인 진단은 접근이 통제된 환경에서 `stream_all()`을 사용한다.
+인자도 업무 데이터가 될 수 있으므로 일반 운영은 기본 `summary`를 권장한다. `stream_all()`도 안전하게 투영된 내부 이벤트만 제공하며 원본 Tool 결과, 원본 예외, provider metadata를 공개하지 않는다. 원문 진단이 꼭 필요하면 프레임워크 외부의 별도 접근 통제 sink를 사용한다.
 
 Tool이 pandas `DataFrame` 또는 그 밖의 표 형식 값을 반환하면 런타임은 JSON-safe record 구조로 정규화한 뒤 모델과 진단 경계에 전달한다. 이 변환은 `Timestamp`, NumPy scalar, 결측값처럼 일반 JSON encoder가 직접 처리하기 어려운 셀도 JSON 호환 값으로 바꾼다. 다만 전체 DataFrame을 반환하면 prompt가 매우 커질 수 있으므로 조회 Tool 자체에서 필요한 열과 행을 제한하는 것이 좋다.
 
@@ -315,6 +315,8 @@ async for event in planning_agent.stream_all("요청을 수행해줘"):
 
 `AgentConfig(stream_visibility="all")`도 `stream()`에 internal 이벤트를 포함하지만, 사용자 응답 UI와 진단 소비자를 코드 수준에서 분리하기 위해 `stream_all()`을 명시적으로 호출하는 방식을 권장한다. 일반 `StandardDecisionPolicy`의 직접 응답 token은 기존처럼 `MODEL_DELTA`다.
 
+`stream()`은 `MODEL_DELTA`, `FINAL_DELTA`, terminal 결과만 전달한다. `stream_all()`은 phase, Tool 식별자, 복구 분류, checkpoint boundary를 추가하지만 모든 event data는 JSON-safe projection이다.
+
 ## Text와 Pydantic 최종화
 
 텍스트 출력도 ACT의 마지막 문장을 재사용하지 않고 별도 FINALIZE를 수행한다.
@@ -361,24 +363,24 @@ allowed-tools: lookup
 
 ## Checkpoint와 resume
 
-Checkpoint schema v3는 다음 strict 상태를 저장한다.
+0.4의 `RunSnapshot` outer schema v4는 공통 상태와 독립적으로 versioned Plan Engine state를 저장한다.
 
 - phase, 계획 버전, 현재 단계
 - 커밋된 `StepResult`와 결과 참조
 - 단계별 시도 횟수와 재계획 횟수
 - Tool repair 횟수, pending repair 대상, 사용된 call ID와 원문 없는 arguments hash
 - 크기와 민감 정보가 정제된 실제 `tool_trace`
-- pending 결과와 내부 Tool protocol 메시지
+- pending 결과와 원문을 제외한 Tool 복구 상태
 - FINALIZE 원문, 저장 여부, 공개 방출 여부와 호출 횟수
 - phase-scoped Skill 활성화 상태
 
-0.3.2는 기존 v3 checkpoint를 읽을 수 있지만 pending Tool repair 상태는 0.3.1 worker가 이해하지 못한다. rolling 배포 중에는 0.3.2가 생성한 in-flight checkpoint를 0.3.1 worker로 downgrade/resume하지 말고, 같은 버전의 worker로 고정하거나 기존 run을 종료한 뒤 rollback한다.
+0.4는 v1-v3 checkpoint를 copy-on-migrate 방식으로 읽고 검증된 v4 snapshot으로 변환한다. v4를 v3로 downgrade하지 않으므로 rolling 배포에서는 store/key namespace를 버전별로 분리하거나 진행 중 run을 0.4 worker에 고정한다.
 
-v3 checkpoint를 재개하면 완료 단계는 다시 실행하지 않고 현재 ACT 또는 FINALIZE 경계에서 계속한다. v1과 v2 payload도 읽을 수 있지만 strict `ExecutionState`가 없으므로 진행 중인 0.2 Plan-and-Execute를 단계 단위로 그대로 이어 주는 마이그레이션은 제공하지 않는다. 배포 전 진행 중인 run을 끝내거나, 재실행이 안전한 요청만 새 strict 계획으로 시작해야 한다.
+v3 checkpoint를 변환해 재개하면 완료 단계와 원래 실패한 repair call을 다시 실행하지 않는다. 의미가 불명확한 partial-success 또는 실행 중 Tool 상태는 자동 replay하지 않고 `manual_required`로 fail closed한다. 자세한 절차는 [0.4 마이그레이션](migration-0.4.md)을 참고한다.
 
-`tool_trace`는 정제되지만 실패한 checkpoint의 pending Tool protocol에는 모델이 만든 원본 Tool 인자, Tool 결과나 Skill resource 원문이 일시적으로 포함될 수 있다. 운영 저장소는 암호화, 접근 제어와 짧은 TTL을 적용해야 한다.
+checkpoint에는 모델이 만든 원본 Tool 인자와 결과를 복제하지 않고 call identity와 arguments fingerprint, 안전한 실패 code만 보존한다. conversation과 checkpoint 저장소에는 암호화, 접근 제어와 TTL을 적용한다.
 
-동기 Tool은 event loop를 막지 않도록 worker thread에서 실행된다. Python thread는 강제로 안전하게 취소할 수 없으므로 `pd.read_sql` 같은 blocking 호출은 Tool 또는 run timeout 결과가 반환된 뒤에도 해당 worker에서 끝날 때까지 계속될 수 있다. 0.3.2는 이런 timeout 뒤 동일-call 자동 retry가 겹치지 않게 기본 차단하지만 이미 실행 중인 작업 자체를 취소하지는 못한다. `PlanStep.status`는 이 thread의 생존 여부를 나타내지 않는다. DB driver의 query timeout, connection timeout과 서버 측 statement timeout도 함께 설정해야 한다.
+동기 Tool은 event loop를 막지 않도록 worker thread에서 실행된다. Python thread는 강제로 안전하게 취소할 수 없으므로 `pd.read_sql` 같은 blocking 호출은 Tool 또는 run timeout 결과가 반환된 뒤에도 해당 worker에서 끝날 때까지 계속될 수 있다. 0.4는 Tool 본체 호출 전에 `tool_invocation_pending` checkpoint를 `manual_required`로 저장하고, 저장 실패 시 Tool을 호출하지 않는다. 이 상태는 자동 resume되지 않는다. DB driver의 query timeout, connection timeout과 서버 측 statement timeout도 함께 설정해야 한다.
 
 새 strict run의 Planner는 같은 session에 저장된 최근 공개 대화를 함께 보므로 “그 결과를 요약해줘” 같은 후속 요청은 이전 FINALIZE 응답을 참조할 수 있다. `LLMPlanGenerator(history_limit=8)`의 기본값은 최근 8개 메시지이며 `0`으로 끌 수 있다. ACT에는 과거 대화 전체를 다시 전달하지 않고 Planner가 만든 현재 단계와 필요한 선행 결과만 전달한다.
 

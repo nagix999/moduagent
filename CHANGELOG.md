@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0
+
+- Split the common run lifecycle from Standard and strict Plan execution through explicit execution profiles and versioned Engine contracts.
+- Added immutable, secret-safe `AgentSpec` inspection with resolved model capabilities, Tool safety profiles, output contract, and persistence policy.
+- Added `ToolSafetyProfile`, `ToolFailureClassification`, `FailureProjector`, `ToolBatchOutcome`, and guarded repair contracts while retaining the 0.3.2 Tool flags and error mapping APIs.
+- Separated same-call retry in `ToolRuntime` from Plan-owned repair, replan, and terminal failure decisions.
+- Reorganized strict Plan state into plan progress, step execution, Tool recovery, and finalization state with a compatibility facade for the 0.3 API.
+- Added checkpoint schema v4 with an opaque, independently versioned Engine state envelope and validated v1-v3 read migration; v4 snapshots are not downgraded.
+- Extended the event envelope with stable identity, session, Engine, schema-version, and monotonically increasing run sequence metadata while preserving existing event types.
+- Added `StandardExecutionProfile` and `PlanExecutionProfile`; the existing `decision_policy` constructor argument remains supported through the compatibility resolver.
+- Added an explicit Tool-plus-structured-output model capability and safe staged finalization for endpoints, including vLLM, that cannot satisfy both contracts in one request.
+- Kept Standard and Plan Tool protocol transcripts internal so raw Tool arguments and results do not enter public conversation history or `AgentResult.messages`.
+- Made ambiguous v3 partial-success Tool batches fail closed during v4 checkpoint migration.
+- Split documentation into Core, Advanced, Operations, and 0.4 migration guides.
+- Kept the core dependency set unchanged and deliberately excluded Graph execution, distributed queues, peer multi-agent protocols, and general Human-in-the-loop workflows.
+
 ## 0.3.2
 
 - Added opt-in, generalized Tool failure recovery that can ask ACT to produce corrected arguments before falling back to bounded plan revision.

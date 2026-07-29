@@ -12,6 +12,7 @@ from typing import Any, TypeVar
 from moduagent.config import AgentConfig
 from moduagent.decision import DecisionKind, DecisionPolicy
 from moduagent.decision.planning import ExecutionState, RunPhase
+from moduagent.errors import CheckpointNotFoundError, PersistenceError
 from moduagent.memory import (
     ConversationMemoryPolicy,
     FullConversationMemoryPolicy,
@@ -33,6 +34,7 @@ from moduagent.runtime.context import (
     RunStatus,
 )
 from moduagent.runtime.events import AgentEvent, EventType, EventVisibility
+from moduagent.runtime.metadata import is_runtime_owned_metadata_key
 from moduagent.skills.prompting import compose_skill_prompt, is_ephemeral_message
 from moduagent.skills.runtime import SkillRuntime
 from moduagent.skills.tools import (
@@ -45,10 +47,11 @@ from moduagent.tools import (
     ToolErrorType,
     ToolExecutionContext,
     ToolExecutor,
+    ToolRepairConstraint,
     ToolRecoveryAction,
     ToolResult,
+    is_tool_argument_fingerprint,
 )
-from moduagent.tools.base import _TOOL_REPAIR_METADATA_KEY
 
 
 T = TypeVar("T")
@@ -79,6 +82,7 @@ _STRICT_FINALIZER_PROMPT = (
 )
 _RUN_ID_METADATA_KEY = "moduagent.run_id"
 _PUBLIC_FINAL_METADATA_KEY = "moduagent.public_final"
+_PERSISTENCE_BATCH_METADATA_KEY = "_moduagent_persistence_batch"
 _TOOL_TRACE_METADATA_KEY = "_moduagent_tool_trace"
 _PUBLIC_TOOL_TRACE_KEY = "tool_trace"
 _TOOL_TRACE_ARGUMENT_BYTES = 4096
@@ -119,6 +123,9 @@ class AgentRuntime:
         self.event_sink = event_sink
         self.checkpoint_store = checkpoint_store
         self.skill_runtime = skill_runtime
+        # Set by the composition layer. Direct AgentRuntime construction keeps
+        # the 0.3-compatible unbound checkpoint identity.
+        self.agent_spec: Any | None = None
         self.conversation_memory_policy = (
             conversation_memory_policy
             if conversation_memory_policy is not None
@@ -159,8 +166,68 @@ class AgentRuntime:
             else include_internal
         )
         async for event in self._events(request, stream_model=True):
-            if include_internal or event.visibility is EventVisibility.PUBLIC:
+            if include_internal:
                 yield event
+            elif event.visibility is EventVisibility.PUBLIC:
+                yield self._public_stream_event(event)
+
+    @staticmethod
+    def _public_stream_event(event: AgentEvent) -> AgentEvent:
+        """Project terminal events without internal prompts or Tool transcripts."""
+
+        if event.type in {EventType.MODEL_DELTA, EventType.FINAL_DELTA}:
+            data = {"delta": str(event.data.get("delta", ""))}
+            phase = event.data.get("phase")
+            if isinstance(phase, str) and phase:
+                data["phase"] = phase
+            return replace(event, data=data)
+        if event.type not in {EventType.RUN_COMPLETED, EventType.RUN_FAILED}:
+            return event
+        result = event.data.get("result")
+        if not isinstance(result, AgentResult):
+            return event
+
+        last_user_index = next(
+            (
+                index
+                for index in range(len(result.messages) - 1, -1, -1)
+                if result.messages[index].role is MessageRole.USER
+            ),
+            None,
+        )
+        last_user = (
+            None if last_user_index is None else result.messages[last_user_index]
+        )
+        last_assistant = (
+            None
+            if last_user_index is None
+            else next(
+                (
+                    message
+                    for message in reversed(result.messages[last_user_index + 1 :])
+                    if message.role is MessageRole.ASSISTANT
+                    and not message.tool_calls
+                    and message.tool_call_id is None
+                ),
+                None,
+            )
+        )
+        messages = tuple(
+            replace(message, metadata={})
+            for message in (last_user, last_assistant)
+            if message is not None
+        )
+        public_metadata = {
+            key: value
+            for key, value in result.metadata.items()
+            if key in {"agent", "plan_usage", "skill_usage", "error_summary"}
+        }
+        projected = replace(
+            result,
+            messages=messages,
+            metadata=public_metadata,
+        )
+        return replace(event, data={"result": projected})
 
     async def _events(
         self, request: RunRequest, *, stream_model: bool
@@ -192,11 +259,24 @@ class AgentRuntime:
                 else None
             ),
         )
-        initial_metadata = {"agent": self.config.name, **dict(self.config.metadata)}
-        # This key is runtime-owned. AgentConfig.metadata must not be able to
-        # forge persisted Tool audit entries.
-        initial_metadata.pop(_TOOL_TRACE_METADATA_KEY, None)
-        initial_metadata.pop(_PUBLIC_TOOL_TRACE_KEY, None)
+        initial_metadata = {
+            "agent": self.config.name,
+            **{
+                key: value
+                for key, value in self.config.metadata.items()
+                if not is_runtime_owned_metadata_key(key)
+            },
+        }
+        if self.agent_spec is not None:
+            initial_metadata["_moduagent_agent_fingerprint"] = (
+                self.agent_spec.agent_fingerprint
+            )
+            initial_metadata["_moduagent_engine_id"] = (
+                self.agent_spec.execution_profile.engine_id
+            )
+            initial_metadata["_moduagent_engine_state_version"] = (
+                self.agent_spec.execution_profile.state_version
+            )
         context = RunContext(
             run_id=run_id,
             request=request,
@@ -223,14 +303,34 @@ class AgentRuntime:
             if request.resume_run_id:
                 if self.checkpoint_store is None:
                     raise RuntimeError("checkpoint_store is required to resume a run")
-                checkpoint = await self._within(
+                checkpoint = await self._persistence_within(
                     deadline,
                     lambda: self.checkpoint_store.load(request.resume_run_id),
+                    operation="checkpoint",
                 )
                 if checkpoint is None:
-                    raise LookupError(f"checkpoint not found: {request.resume_run_id}")
+                    raise CheckpointNotFoundError("checkpoint not found")
                 if checkpoint.session_id != request.session_id:
                     raise ValueError("checkpoint session_id does not match the request")
+                if self.agent_spec is not None:
+                    checkpoint_fingerprint = checkpoint.agent_fingerprint
+                    if checkpoint_fingerprint not in {
+                        "legacy-unbound",
+                        self.agent_spec.agent_fingerprint,
+                    }:
+                        raise ValueError(
+                            "checkpoint Agent fingerprint does not match "
+                            "the configured Agent"
+                        )
+                    if (
+                        checkpoint_fingerprint != "legacy-unbound"
+                        and checkpoint.engine_id
+                        != self.agent_spec.execution_profile.engine_id
+                    ):
+                        raise ValueError(
+                            "checkpoint execution Engine does not match "
+                            "the configured Agent"
+                        )
                 context = checkpoint.to_context()
                 self._normalize_context_tool_trace(context)
                 event = AgentEvent(
@@ -241,9 +341,10 @@ class AgentRuntime:
                 await self._publish(event)
                 yield event
             else:
-                history = await self._within(
+                history = await self._persistence_within(
                     deadline,
                     lambda: self.conversation_store.load(request.session_id),
+                    operation="conversation",
                 )
                 context.messages = [
                     Message.system(self.config.instructions),
@@ -1681,17 +1782,31 @@ class AgentRuntime:
             if isinstance(state, ExecutionState)
             else None
         )
+        repair_constraint: ToolRepairConstraint | None = None
         if (
             isinstance(pending_failure, Mapping)
             and pending_failure.get("tool_name")
+            and pending_failure.get("call_id")
+            and pending_failure.get("arguments_fingerprint")
             and pending_failure.get("invocation_fingerprint")
         ):
-            tool_metadata[_TOOL_REPAIR_METADATA_KEY] = {
-                "tool_name": str(pending_failure["tool_name"]),
-                "invocation_fingerprint": str(
+            repair_constraint = ToolRepairConstraint(
+                failed_call_id=str(pending_failure["call_id"]),
+                expected_tool_name=str(pending_failure["tool_name"]),
+                seen_call_ids=frozenset(
+                    set(state.seen_tool_call_ids).difference(
+                        str(call.id) for call in calls
+                    )
+                    if isinstance(state, ExecutionState)
+                    else ()
+                ),
+                previous_requested_fingerprint=str(
+                    pending_failure["arguments_fingerprint"]
+                ),
+                previous_effective_fingerprint=str(
                     pending_failure["invocation_fingerprint"]
                 ),
-            }
+            )
         tool_context = ToolExecutionContext(
             run_id=context.run_id,
             session_id=context.request.session_id,
@@ -1710,6 +1825,7 @@ class AgentRuntime:
                     tool_context,
                     parallel=parallel,
                     max_parallel=self.config.limits.max_parallel_tools,
+                    repair_constraint=repair_constraint,
                 ),
                 timeout=self._remaining(deadline),
             )
@@ -2275,6 +2391,9 @@ class AgentRuntime:
             entry["recovery_of_call_id"] = self._tool_trace_text(
                 raw_entry["recovery_of_call_id"]
             )
+        raw_fingerprint = raw_entry.get("arguments_fingerprint")
+        if is_tool_argument_fingerprint(raw_fingerprint):
+            entry["arguments_fingerprint"] = raw_fingerprint
         if self.config.tool_trace_mode == "arguments":
             raw_arguments = raw_entry.get("arguments")
             if isinstance(raw_arguments, Mapping):
@@ -2391,18 +2510,42 @@ class AgentRuntime:
                 )
                 await self._publish(completed)
                 yield completed
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            raise
         except Exception as exc:
+            from moduagent.errors import SkillError as FrameworkSkillError
+            from moduagent.skills.errors import (
+                SkillDigestMismatchError,
+                SkillLimitError,
+                SkillNotFoundError,
+                SkillSelectionError,
+            )
+
+            safe_error = (
+                str(exc)
+                if isinstance(
+                    exc,
+                    (
+                        SkillDigestMismatchError,
+                        SkillLimitError,
+                        SkillNotFoundError,
+                    ),
+                )
+                else "Skill selection failed"
+                if isinstance(exc, SkillSelectionError)
+                else "Skill activation failed"
+            )
             failed = AgentEvent(
                 EventType.SKILL_ERROR,
                 context.run_id,
                 {
                     "error_type": type(exc).__name__,
-                    "error": str(exc),
+                    "error": safe_error,
                 },
             )
             await self._publish(failed)
             yield failed
-            raise
+            raise FrameworkSkillError(safe_error) from exc
 
         selected_by = {
             activation.name: activation.selected_by
@@ -2607,6 +2750,7 @@ class AgentRuntime:
             if protected_from is None
             else protected_from
         )
+        usage_before_memory = context.usage
         memory = await self._within(
             deadline,
             lambda: self.conversation_memory_policy.prepare(
@@ -2617,10 +2761,12 @@ class AgentRuntime:
                     model_request=request,
                     protected_from=protected_boundary,
                     user_context=context.request.user_context,
+                    model_gateway=context.model_gateway,
                 )
             ),
         )
-        context.usage = context.usage + memory.usage
+        if context.usage == usage_before_memory:
+            context.usage = context.usage + memory.usage
         prepared = replace(request, messages=tuple(memory.messages))
         compacted = (
             prepared.messages != request.messages
@@ -2755,9 +2901,10 @@ class AgentRuntime:
             output = self.output_codec.decode(response)
         await self._persist_pending_messages(context, deadline)
         if self.checkpoint_store is not None:
-            await self._within(
+            await self._persistence_within(
                 deadline,
                 lambda: self.checkpoint_store.delete(context.run_id),
+                operation="checkpoint",
             )
         context.status = RunStatus.COMPLETED
         return self._result(context, reason, output=output)
@@ -2829,9 +2976,10 @@ class AgentRuntime:
     async def _save_checkpoint(self, context: RunContext, deadline: float) -> None:
         if self.checkpoint_store is None:
             return
-        await self._within(
+        await self._persistence_within(
             deadline,
             lambda: self.checkpoint_store.save(context.run_id, context),
+            operation="checkpoint",
         )
 
     async def _save_checkpoint_safely(self, context: RunContext) -> None:
@@ -2851,9 +2999,32 @@ class AgentRuntime:
     ) -> None:
         if not context.new_messages:
             return
-        existing = await self._within(
+        append_once = getattr(self.conversation_store, "append_once", None)
+        supports_idempotent = getattr(
+            self.conversation_store,
+            "supports_idempotent_append",
+            callable(append_once),
+        )
+        if callable(append_once) and supports_idempotent is True:
+            raw_batch = context.metadata.get(_PERSISTENCE_BATCH_METADATA_KEY, 0)
+            if type(raw_batch) is not int or raw_batch < 0:
+                raise ValueError("conversation persistence batch is invalid")
+            await self._persistence_within(
+                deadline,
+                lambda: append_once(
+                    context.request.session_id,
+                    f"{context.run_id}:conversation:{raw_batch}",
+                    tuple(context.new_messages),
+                ),
+                operation="conversation",
+            )
+            context.metadata[_PERSISTENCE_BATCH_METADATA_KEY] = raw_batch + 1
+            context.new_messages.clear()
+            return
+        existing = await self._persistence_within(
             deadline,
             lambda: self.conversation_store.load(context.request.session_id),
+            operation="conversation",
         )
         existing_keys = {
             key
@@ -2868,12 +3039,13 @@ class AgentRuntime:
                 if key is not None:
                     existing_keys.add(key)
         if additions:
-            await self._within(
+            await self._persistence_within(
                 deadline,
                 lambda: self.conversation_store.append(
                     context.request.session_id,
                     tuple(additions),
                 ),
+                operation="conversation",
             )
         context.new_messages.clear()
 
@@ -2913,6 +3085,22 @@ class AgentRuntime:
 
     async def _within(self, deadline: float, factory: Callable[[], Awaitable[T]]) -> T:
         return await asyncio.wait_for(factory(), timeout=self._remaining(deadline))
+
+    async def _persistence_within(
+        self,
+        deadline: float,
+        factory: Callable[[], Awaitable[T]],
+        *,
+        operation: str,
+    ) -> T:
+        try:
+            return await self._within(deadline, factory)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            raise
+        except PersistenceError:
+            raise
+        except Exception as exc:
+            raise PersistenceError(f"{operation} persistence failed") from exc
 
     @staticmethod
     def _remaining(deadline: float) -> float:

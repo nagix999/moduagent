@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import time
@@ -48,6 +49,23 @@ class ConversationStore(Protocol):
     async def clear(self, session_id: str) -> None: ...
 
 
+@runtime_checkable
+class IdempotentConversationStore(Protocol):
+    """Optional durable capability used for crash-safe run persistence."""
+
+    supports_idempotent_append: bool
+
+    async def append_once(
+        self,
+        session_id: str,
+        idempotency_key: str,
+        messages: Sequence[Message],
+    ) -> bool:
+        """Atomically append once; return ``False`` for an identical replay."""
+
+        ...
+
+
 class InMemoryConversationStore:
     """Conversation storage for tests and single-process development."""
 
@@ -61,8 +79,10 @@ class InMemoryConversationStore:
         self._ttl_seconds = ttl_seconds
         self._clock = clock
         self._messages: dict[str, list[Message]] = {}
+        self._idempotency: dict[str, dict[str, str]] = {}
         self._expires_at: dict[str, float] = {}
         self._lock = asyncio.Lock()
+        self.supports_idempotent_append = True
 
     async def load(self, session_id: str) -> list[Message]:
         _validate_identifier(session_id, "session_id")
@@ -82,16 +102,45 @@ class InMemoryConversationStore:
             self._messages.setdefault(session_id, []).extend(additions)
             self._refresh_expiry(session_id)
 
+    async def append_once(
+        self,
+        session_id: str,
+        idempotency_key: str,
+        messages: Sequence[Message],
+    ) -> bool:
+        _validate_identifier(session_id, "session_id")
+        _validate_identifier(idempotency_key, "idempotency_key")
+        additions = _validated_messages(messages)
+        if not additions:
+            return False
+        digest = _message_batch_digest(additions)
+        async with self._lock:
+            self._evict_if_expired(session_id)
+            recorded = self._idempotency.setdefault(session_id, {})
+            existing = recorded.get(idempotency_key)
+            if existing is not None:
+                if existing != digest:
+                    raise ValueError(
+                        "idempotency key was reused with different messages"
+                    )
+                return False
+            self._messages.setdefault(session_id, []).extend(additions)
+            recorded[idempotency_key] = digest
+            self._refresh_expiry(session_id)
+            return True
+
     async def clear(self, session_id: str) -> None:
         _validate_identifier(session_id, "session_id")
         async with self._lock:
             self._messages.pop(session_id, None)
+            self._idempotency.pop(session_id, None)
             self._expires_at.pop(session_id, None)
 
     def _evict_if_expired(self, session_id: str) -> None:
         expires_at = self._expires_at.get(session_id)
         if expires_at is not None and expires_at <= self._clock():
             self._messages.pop(session_id, None)
+            self._idempotency.pop(session_id, None)
             self._expires_at.pop(session_id, None)
 
     def _refresh_expiry(self, session_id: str) -> None:
@@ -132,6 +181,9 @@ class RedisConversationStore:
         ):
             raise TypeError("Redis client must provide get/set or lrange/rpush")
         self._fallback_locks: dict[str, asyncio.Lock] = {}
+        self.supports_idempotent_append = bool(
+            self._use_lists and callable(getattr(client, "eval", None))
+        )
 
     async def load(self, session_id: str) -> list[Message]:
         key = self._key(session_id)
@@ -167,9 +219,44 @@ class RedisConversationStore:
                 self._ttl_seconds,
             )
 
+    async def append_once(
+        self,
+        session_id: str,
+        idempotency_key: str,
+        messages: Sequence[Message],
+    ) -> bool:
+        key = self._key(session_id)
+        _validate_identifier(idempotency_key, "idempotency_key")
+        additions = _validated_messages(messages)
+        if not additions:
+            return False
+        if not self.supports_idempotent_append:
+            raise RuntimeError(
+                "Redis append_once requires list mode and an eval-capable client"
+            )
+        rows = [_encode_message_row(message) for message in additions]
+        digest = _message_batch_digest(additions)
+        ttl = 0 if self._ttl_seconds is None else self._ttl_seconds
+        result = await _call(
+            self._client.eval,
+            _REDIS_APPEND_ONCE_SCRIPT,
+            2,
+            key,
+            f"{key}:idempotency",
+            idempotency_key,
+            digest,
+            ttl,
+            *rows,
+        )
+        numeric = int(result)
+        if numeric < 0:
+            raise ValueError("idempotency key was reused with different messages")
+        return numeric == 1
+
     async def clear(self, session_id: str) -> None:
         key = self._key(session_id)
         await _call(self._client.delete, key)
+        await _call(self._client.delete, f"{key}:idempotency")
         self._fallback_locks.pop(key, None)
 
     def _key(self, session_id: str) -> str:
@@ -211,6 +298,9 @@ class DatabaseConversationStore:
         for method in ("load_messages", "append_messages", "clear_messages"):
             if not callable(getattr(repository, method, None)):
                 raise TypeError(f"repository must provide {method}()")
+        self.supports_idempotent_append = callable(
+            getattr(repository, "append_messages_once", None)
+        )
 
     async def load(self, session_id: str) -> list[Message]:
         _validate_identifier(session_id, "session_id")
@@ -228,6 +318,29 @@ class DatabaseConversationStore:
                 session_id,
                 [_encode_message_row(message) for message in additions],
             )
+
+    async def append_once(
+        self,
+        session_id: str,
+        idempotency_key: str,
+        messages: Sequence[Message],
+    ) -> bool:
+        _validate_identifier(session_id, "session_id")
+        _validate_identifier(idempotency_key, "idempotency_key")
+        additions = _validated_messages(messages)
+        method = getattr(self._repository, "append_messages_once", None)
+        if not callable(method):
+            raise RuntimeError("repository must provide atomic append_messages_once()")
+        result = await _call(
+            method,
+            session_id,
+            idempotency_key,
+            [_encode_message_row(message) for message in additions],
+            _message_batch_digest(additions),
+        )
+        if not isinstance(result, bool):
+            raise TypeError("append_messages_once() must return a bool")
+        return result
 
     async def clear(self, session_id: str) -> None:
         _validate_identifier(session_id, "session_id")
@@ -248,6 +361,18 @@ def _decode_message_row(row: str | bytes | bytearray | Mapping[str, Any]) -> Mes
     if not isinstance(value, Mapping):
         raise ValueError("stored message must be a JSON object")
     return Message.from_dict(value)
+
+
+def _validated_messages(messages: Sequence[Message]) -> list[Message]:
+    additions = list(messages)
+    if not all(isinstance(message, Message) for message in additions):
+        raise TypeError("messages must contain Message instances")
+    return additions
+
+
+def _message_batch_digest(messages: Sequence[Message]) -> str:
+    payload = serialize_messages(messages).encode("utf-8")
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
 async def _redis_set(
@@ -290,7 +415,29 @@ __all__ = [
     "ConversationStore",
     "DatabaseConversationStore",
     "InMemoryConversationStore",
+    "IdempotentConversationStore",
     "RedisConversationStore",
     "deserialize_messages",
     "serialize_messages",
 ]
+
+
+_REDIS_APPEND_ONCE_SCRIPT = """
+local existing = redis.call('HGET', KEYS[2], ARGV[1])
+if existing then
+  if existing == ARGV[2] then
+    return 0
+  end
+  return -1
+end
+for index = 4, #ARGV do
+  redis.call('RPUSH', KEYS[1], ARGV[index])
+end
+redis.call('HSET', KEYS[2], ARGV[1], ARGV[2])
+local ttl = tonumber(ARGV[3])
+if ttl and ttl > 0 then
+  redis.call('EXPIRE', KEYS[1], ttl)
+  redis.call('EXPIRE', KEYS[2], ttl)
+end
+return 1
+"""

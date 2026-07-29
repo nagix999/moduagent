@@ -1,4 +1,7 @@
-class SkillError(Exception):
+from moduagent.errors import SkillError as FrameworkSkillError
+
+
+class SkillError(FrameworkSkillError):
     """Base class for all skill subsystem failures."""
 
 

@@ -248,7 +248,6 @@ def test_no_tool_text_two_steps_finalize_and_hide_step_deltas_by_default() -> No
             if event.type is EventType.FINAL_DELTA
         ] == ["최종 ", "공개 답변"]
         assert [message.content for message in result.messages] == [
-            "정확히 답한다.",
             "두 단계로 검토해줘",
             "최종 공개 답변",
         ]
@@ -744,7 +743,7 @@ def test_pending_tool_repair_resumes_without_replaying_original_call() -> None:
         assert invocations == ["status =="]
         checkpoint = await checkpoints.load(interrupted.run_id)
         assert checkpoint is not None
-        checkpoint_state = checkpoint.to_dict()["execution_state"]
+        checkpoint_state = checkpoint.execution_state
         assert checkpoint_state["phase"] == "act"
         assert checkpoint_state["tool_repair_counts"] == {"search": 1}
         assert checkpoint_state["total_tool_repairs"] == 1
@@ -1033,11 +1032,11 @@ def test_finalize_failure_resume_does_not_repeat_act_or_tool_execution() -> None
         )
 
         assert failed.finish_reason is FinishReason.ERROR
-        assert failed.error == "finalizer unavailable"
+        assert failed.error == "model invocation failed"
         assert executions == [(2, 3)]
         checkpoint = await checkpoints.load(failed.run_id)
         assert checkpoint is not None
-        assert checkpoint.to_dict()["execution_state"]["phase"] == "finalize"
+        assert checkpoint.execution_state["phase"] == "finalize"
         assert [
             message.content
             for message in await conversations.load("strict-finalize-resume")
@@ -1108,7 +1107,7 @@ def test_done_checkpoint_resume_does_not_call_model_or_duplicate_final() -> None
         assert completed.finish_reason is FinishReason.COMPLETED
         assert completed.output == "최종 답변"
         assert checkpoint is not None
-        checkpoint_state = checkpoint.to_dict()["execution_state"]
+        checkpoint_state = checkpoint.execution_state
         assert checkpoint_state["phase"] == "done"
         assert checkpoint_state["final_emitted"] is True
         assert len(model.requests) == 2

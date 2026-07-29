@@ -6,7 +6,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
 
 from moduagent.messages import Message, Usage
-from moduagent.models import ModelClient, ModelRequest
+from moduagent.models import ModelClient, ModelGateway, ModelRequest
 from moduagent.skills.errors import SkillSelectionError
 from moduagent.skills.models import SkillDescriptor, freeze_mapping
 
@@ -23,6 +23,7 @@ class SkillSelectionRequest:
     recent_messages: tuple[Message, ...] = ()
     user_context: Mapping[str, Any] = field(default_factory=dict)
     max_skills: int = 3
+    model_gateway: ModelGateway | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.max_skills < 1:
@@ -144,7 +145,15 @@ class ModelSkillSelector:
             options=self.options,
             provider_options=self.provider_options,
         )
-        response = await self.model.complete(model_request)
+        response = (
+            await self.model.complete(model_request)
+            if request.model_gateway is None
+            else await request.model_gateway.complete(
+                self.model,
+                model_request,
+                phase="skill_selection",
+            )
+        )
         names = _parse_model_selection(response.message.content)
         _validate_selection(names, request.catalog, limit)
         return SkillSelectionResult(

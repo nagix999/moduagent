@@ -84,6 +84,24 @@ def test_conversation_stores_round_trip_json_and_expire_independently() -> None:
     asyncio.run(scenario())
 
 
+def test_in_memory_conversation_append_once_is_atomic_and_detects_key_reuse() -> None:
+    async def scenario() -> None:
+        store = InMemoryConversationStore()
+        messages = [Message.user("question"), Message.assistant("answer")]
+
+        assert await store.append_once("session", "run:batch:0", messages) is True
+        assert await store.append_once("session", "run:batch:0", messages) is False
+        assert await store.load("session") == messages
+        with pytest.raises(ValueError, match="different messages"):
+            await store.append_once(
+                "session",
+                "run:batch:0",
+                [Message.assistant("different")],
+            )
+
+    asyncio.run(scenario())
+
+
 def test_database_conversation_store_uses_json_repository_rows() -> None:
     async def scenario() -> None:
         repository = FakeConversationRepository()
@@ -133,8 +151,12 @@ def test_checkpoint_json_context_and_stores_round_trip() -> None:
         assert context.current_run_start == 1
         assert RunCheckpoint.from_context(context).messages == checkpoint.messages
 
-        legacy_payload = checkpoint.to_dict()
-        legacy_payload.pop("current_run_start")
+        legacy_payload = {
+            "version": 1,
+            "run_id": checkpoint.run_id,
+            "session_id": checkpoint.session_id,
+            "messages": [message.to_dict() for message in checkpoint.messages],
+        }
         legacy = RunCheckpoint.from_dict(legacy_payload)
         assert legacy.current_run_start == 1
 
@@ -150,7 +172,7 @@ def test_checkpoint_json_context_and_stores_round_trip() -> None:
         store = RedisCheckpointStore(redis, ttl_seconds=5)
         await store.save("run-1", checkpoint)
         assert await store.load("run-1") == checkpoint
-        assert redis.expirations["moduagent:checkpoint:run-1"] == 5
+        assert redis.expirations["moduagent:checkpoint:v4:run-1"] == 5
         assert redis.expirations.get("moduagent:conversation:session-1") is None
 
     asyncio.run(scenario())
@@ -241,14 +263,42 @@ def test_logging_and_audit_sinks_mask_sensitive_keys(
 
         await logging_sink.publish(event)
         await audit_sink.publish(event)
+        terminal = AgentEvent(
+            EventType.RUN_COMPLETED,
+            "run-secret",
+            {
+                "result": AgentResult(
+                    run_id="run-secret",
+                    output="customer_ssn=123-45-6789",
+                    messages=(
+                        Message.assistant(
+                            None,
+                            (
+                                ToolCall(
+                                    "call-secret",
+                                    "lookup",
+                                    {"query": "private-query"},
+                                ),
+                            ),
+                        ),
+                        Message.tool(
+                            "customer_ssn=123-45-6789",
+                            call_id="call-secret",
+                            name="lookup",
+                        ),
+                    ),
+                    usage=Usage(1, 1, 2),
+                    finish_reason=FinishReason.COMPLETED,
+                )
+            },
+        )
+        await logging_sink.publish(terminal)
 
         assert "must-not-leak" not in caplog.text
         assert "also-secret" not in caplog.text
-        assert "[REDACTED]" in caplog.text
-        arguments = audit_sink.records[0]["data"]["arguments"]
-        assert arguments["api_key"] == "[REDACTED]"
-        assert arguments["nested"]["access_token"] == "[REDACTED]"
-        assert arguments["input_tokens"] == 11
+        assert "private-query" not in caplog.text
+        assert "customer_ssn=123-45-6789" not in caplog.text
+        assert "arguments" not in audit_sink.records[0]["data"]
 
     with caplog.at_level(logging.INFO, logger="test.moduagent.audit"):
         asyncio.run(scenario())

@@ -20,6 +20,7 @@ from .state import (
 )
 from .summarizer import (
     ConversationSummarizer,
+    GatewayConversationSummarizer,
     ModelConversationSummarizer,
     SummaryResult,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "ConversationMemoryOverflowError",
     "ConversationMemoryPolicy",
     "ConversationSummarizer",
+    "GatewayConversationSummarizer",
     "FullConversationMemoryPolicy",
     "InMemoryMemoryStateStore",
     "MemoryIntegrityError",

@@ -230,13 +230,14 @@ def test_step_validator_requires_evidence_for_every_criterion() -> None:
 def test_llm_plan_generator_fails_closed_on_invalid_plan(content: str) -> None:
     async def scenario() -> None:
         context = _context()
-        context.metadata["_moduagent_available_tools"] = ["lookup"]
         model = QueueModel(
             [ModelResponse(Message.assistant(content), finish_reason="stop")]
         )
+        generator = LLMPlanGenerator(model)
+        generator.configure_available_tools(frozenset({"lookup"}))
 
         with pytest.raises(ValueError, match="invalid plan response"):
-            await LLMPlanGenerator(model).create(context)
+            await generator.create(context)
 
     asyncio.run(scenario())
 
@@ -244,7 +245,6 @@ def test_llm_plan_generator_fails_closed_on_invalid_plan(content: str) -> None:
 def test_llm_plan_generator_rejects_incomplete_valid_json() -> None:
     async def scenario() -> None:
         context = _context()
-        context.metadata["_moduagent_available_tools"] = ["lookup"]
         model = QueueModel(
             [
                 ModelResponse(
@@ -257,9 +257,11 @@ def test_llm_plan_generator_rejects_incomplete_valid_json() -> None:
                 )
             ]
         )
+        generator = LLMPlanGenerator(model)
+        generator.configure_available_tools(frozenset({"lookup"}))
 
         with pytest.raises(ValueError, match="incomplete plan response"):
-            await LLMPlanGenerator(model).create(context)
+            await generator.create(context)
 
     asyncio.run(scenario())
 
@@ -284,7 +286,6 @@ def test_llm_plan_generator_includes_only_bounded_public_history() -> None:
         context.internal_messages = [
             Message.assistant("private tool transcript"),
         ]
-        context.metadata["_moduagent_available_tools"] = ["lookup"]
         model = QueueModel(
             [
                 ModelResponse(
@@ -298,8 +299,10 @@ def test_llm_plan_generator_includes_only_bounded_public_history() -> None:
                 )
             ]
         )
+        generator = LLMPlanGenerator(model, history_limit=2)
+        generator.configure_available_tools(frozenset({"lookup"}))
 
-        await LLMPlanGenerator(model, history_limit=2).create(context)
+        await generator.create(context)
 
         contents = [message.content for message in model.requests[0].messages]
         assert "earlier question" in contents

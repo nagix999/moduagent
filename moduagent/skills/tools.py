@@ -61,6 +61,7 @@ class SkillReadTool:
                 "required": ["skill_name", "path"],
                 "additionalProperties": False,
             },
+            counts_toward_tool_limit=False,
         )
 
     def validate_arguments(self, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -173,6 +174,7 @@ class SkillSearchTool:
                 "required": ["skill_name", "query"],
                 "additionalProperties": False,
             },
+            counts_toward_tool_limit=False,
         )
 
     def validate_arguments(self, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
