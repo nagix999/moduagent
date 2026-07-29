@@ -4,6 +4,7 @@ import asyncio
 import json
 from typing import Any
 
+import pytest
 from pydantic import BaseModel
 
 from moduagent import (
@@ -28,6 +29,11 @@ from moduagent import (
     RunPhase,
     StepResult,
     ToolCall,
+    ToolError,
+    ToolErrorType,
+    ToolFailureRecoveryConfig,
+    ToolRecoveryAction,
+    ToolResult,
     function_tool,
 )
 from moduagent.runtime.context import RunContext, RunRequest, RunStatus
@@ -101,6 +107,68 @@ class CompleteScriptedModel:
     async def stream(self, request: ModelRequest):
         raise AssertionError("stream should not be called")
         yield
+
+
+def test_runtime_preserves_legacy_configure_limits_signature() -> None:
+    async def scenario() -> None:
+        class LegacySignaturePolicy(PlanAndExecutePolicy):
+            configured: tuple[int, int] | None = None
+
+            def configure_limits(
+                self,
+                *,
+                max_step_attempts: int,
+                max_replans: int,
+            ) -> None:
+                self.configured = (max_step_attempts, max_replans)
+                super().configure_limits(
+                    max_step_attempts=max_step_attempts,
+                    max_replans=max_replans,
+                )
+
+        result_payload = _step_result(
+            "answer",
+            fact="done",
+            evidence="done",
+        )
+        model = CompleteScriptedModel(
+            [
+                ModelResponse(Message.assistant(result_payload)),
+                ModelResponse(Message.assistant("done")),
+            ]
+        )
+        policy = LegacySignaturePolicy(
+            StaticPlanGenerator(
+                [
+                    PlanStep(
+                        step_id="answer",
+                        objective="answer",
+                        completion_criteria=["done"],
+                    )
+                ]
+            )
+        )
+        agent = Agent(
+            config=AgentConfig(
+                "legacy-configure-limits",
+                "answer",
+                limits=RunLimits(
+                    max_step_attempts=3,
+                    max_replans=4,
+                    max_tool_repair_attempts=5,
+                ),
+            ),
+            model=model,
+            decision_policy=policy,
+        )
+
+        result = await agent.run("answer")
+
+        assert result.finish_reason is FinishReason.COMPLETED
+        assert policy.configured == (3, 4)
+        assert policy.max_tool_repair_attempts == 5
+
+    asyncio.run(scenario())
 
 
 def test_no_tool_text_two_steps_finalize_and_hide_step_deltas_by_default() -> None:
@@ -433,6 +501,477 @@ def test_tool_structured_phases_are_separate_private_and_fit_one_plan_step() -> 
         ]
         assert all(message.content != "private ACT draft: 5" for message in stored)
         assert stored[-1].metadata["moduagent.public_final"] is True
+
+    asyncio.run(scenario())
+
+
+def test_repairable_tool_failure_corrects_arguments_inside_the_same_step() -> None:
+    async def scenario() -> None:
+        calls: list[str] = []
+
+        def map_filter_error(exc: Exception) -> ToolError | None:
+            if not isinstance(exc, ValueError):
+                return None
+            return ToolError(
+                ToolErrorType.EXECUTION_ERROR,
+                "MAPPER-MESSAGE-MUST-NOT-LEAK",
+                details={"backend": "MAPPER-DETAIL-MUST-NOT-LEAK"},
+                reason="invalid_filter",
+                recovery=ToolRecoveryAction.REPAIR_CALL,
+            )
+
+        @function_tool(
+            repair_safe=True,
+            error_mapper=map_filter_error,
+        )
+        def search_catalog(filter: str) -> list[dict[str, str]]:
+            """Search a catalog with a validated filter expression."""
+
+            calls.append(filter)
+            if filter == "status ==":
+                raise ValueError("raw backend parser detail")
+            return [{"status": "active"}]
+
+        bad_call = ToolCall(
+            "search-1",
+            "search_catalog",
+            {"filter": "status =="},
+        )
+        repaired_call = ToolCall(
+            "search-2",
+            "search_catalog",
+            {"filter": "status == 'active'"},
+        )
+        step_result = _step_result(
+            "search",
+            fact="one active record was returned",
+            evidence="the catalog result contains an active record",
+        )
+        model = CompleteScriptedModel(
+            [
+                ModelResponse(
+                    Message.assistant(None, (bad_call,)),
+                    (bad_call,),
+                    finish_reason="tool_calls",
+                ),
+                ModelResponse(
+                    Message.assistant(None, (repaired_call,)),
+                    (repaired_call,),
+                    finish_reason="tool_calls",
+                ),
+                ModelResponse(Message.assistant(step_result)),
+                ModelResponse(Message.assistant("복구된 결과입니다.")),
+            ]
+        )
+        agent = Agent(
+            config=AgentConfig(
+                "repairing-catalog",
+                "Use only verified catalog results.",
+                limits=RunLimits(
+                    max_steps=1,
+                    max_tool_calls=3,
+                    max_replans=0,
+                    max_tool_repair_attempts=1,
+                ),
+            ),
+            model=model,
+            tools=[search_catalog],
+            decision_policy=PlanAndExecutePolicy(
+                StaticPlanGenerator(
+                    [
+                        PlanStep(
+                            step_id="search",
+                            objective="find active catalog records",
+                            completion_criteria=[
+                                "the catalog result contains an active record"
+                            ],
+                            allowed_tools=["search_catalog"],
+                        )
+                    ]
+                ),
+                tool_failure_recovery=ToolFailureRecoveryConfig(
+                    fallback="fail",
+                    feedback_mode="type_only",
+                ),
+            ),
+        )
+
+        events = [
+            event
+            async for event in agent.stream(
+                "활성 catalog를 조회해줘",
+                include_internal=True,
+            )
+        ]
+        result = events[-1].data["result"]
+
+        assert result.finish_reason is FinishReason.COMPLETED
+        assert result.output == "복구된 결과입니다."
+        assert calls == ["status ==", "status == 'active'"]
+        assert result.metadata["plan_usage"]["tool_repairs"] == 1
+        trace = result.metadata["tool_trace"]
+        assert [entry["call_id"] for entry in trace] == ["search-1", "search-2"]
+        assert trace[0]["error"] == {
+            "type": "execution_error",
+            "retryable": False,
+            "reason": "invalid_filter",
+            "recovery": "repair_call",
+        }
+        assert trace[1]["success"] is True
+        assert trace[1]["recovery_of_call_id"] == "search-1"
+        assert [request.tools != () for request in model.requests] == [
+            True,
+            True,
+            False,
+            False,
+        ]
+        assert all(
+            not (request.tools and request.output_schema is not None)
+            for request in model.requests
+        )
+        serialized_repair_messages = json.dumps(
+            [message.to_dict() for message in model.requests[1].messages],
+            ensure_ascii=False,
+        )
+        assert "invalid_filter" in serialized_repair_messages
+        assert "MAPPER-MESSAGE-MUST-NOT-LEAK" not in serialized_repair_messages
+        assert "MAPPER-DETAIL-MUST-NOT-LEAK" not in serialized_repair_messages
+        assert "raw backend parser detail" not in serialized_repair_messages
+        assert any(event.type is EventType.TOOL_REPAIR_SCHEDULED for event in events)
+        assert not any(
+            event.type is EventType.TOOL_REPAIR_EXHAUSTED for event in events
+        )
+
+    asyncio.run(scenario())
+
+
+def test_pending_tool_repair_resumes_without_replaying_original_call() -> None:
+    async def scenario() -> None:
+        invocations: list[str] = []
+
+        def map_filter_error(exc: Exception) -> ToolError | None:
+            if not isinstance(exc, ValueError):
+                return None
+            return ToolError(
+                ToolErrorType.EXECUTION_ERROR,
+                "The filter is invalid.",
+                reason="invalid_filter",
+                recovery=ToolRecoveryAction.REPAIR_CALL,
+            )
+
+        @function_tool(repair_safe=True, error_mapper=map_filter_error)
+        def search_catalog(filter: str) -> list[str]:
+            invocations.append(filter)
+            if filter == "status ==":
+                raise ValueError("private parser detail")
+            return ["active"]
+
+        original = ToolCall(
+            "resume-search-1",
+            "search_catalog",
+            {"filter": "status =="},
+        )
+        repaired = ToolCall(
+            "resume-search-2",
+            "search_catalog",
+            {"filter": "status == 'active'"},
+        )
+        model = CompleteScriptedModel(
+            [
+                ModelResponse(
+                    Message.assistant(None, (original,)),
+                    (original,),
+                    finish_reason="tool_calls",
+                ),
+                asyncio.TimeoutError(),
+                ModelResponse(
+                    Message.assistant(None, (repaired,)),
+                    (repaired,),
+                    finish_reason="tool_calls",
+                ),
+                ModelResponse(
+                    Message.assistant(
+                        _step_result(
+                            "search",
+                            fact="one active record was returned",
+                            evidence="the catalog result contains an active record",
+                        )
+                    )
+                ),
+                ModelResponse(Message.assistant("복구된 결과입니다.")),
+            ]
+        )
+        checkpoints = InMemoryCheckpointStore()
+        agent = Agent(
+            config=AgentConfig(
+                "repair-resume",
+                "Use only verified catalog results.",
+                limits=RunLimits(
+                    max_steps=1,
+                    max_tool_calls=3,
+                    max_replans=0,
+                    max_tool_repair_attempts=1,
+                ),
+            ),
+            model=model,
+            tools=[search_catalog],
+            decision_policy=PlanAndExecutePolicy(
+                StaticPlanGenerator(
+                    [
+                        PlanStep(
+                            step_id="search",
+                            objective="find active catalog records",
+                            completion_criteria=[
+                                "the catalog result contains an active record"
+                            ],
+                            allowed_tools=["search_catalog"],
+                        )
+                    ]
+                ),
+                tool_failure_recovery=ToolFailureRecoveryConfig(
+                    fallback="fail",
+                ),
+            ),
+            checkpoint_store=checkpoints,
+        )
+
+        interrupted = await agent.run(
+            "활성 catalog를 조회해줘",
+            session_id="repair-resume",
+        )
+
+        assert interrupted.finish_reason is FinishReason.TIMEOUT
+        assert invocations == ["status =="]
+        checkpoint = await checkpoints.load(interrupted.run_id)
+        assert checkpoint is not None
+        checkpoint_state = checkpoint.to_dict()["execution_state"]
+        assert checkpoint_state["phase"] == "act"
+        assert checkpoint_state["tool_repair_counts"] == {"search": 1}
+        assert checkpoint_state["total_tool_repairs"] == 1
+        assert checkpoint_state["seen_tool_call_ids"] == ["resume-search-1"]
+        assert checkpoint_state["pending_tool_failure"]["call_id"] == (
+            "resume-search-1"
+        )
+        assert "status ==" not in json.dumps(
+            checkpoint_state["pending_tool_failure"],
+            ensure_ascii=False,
+        )
+
+        resumed = await agent.resume(
+            interrupted.run_id,
+            session_id="repair-resume",
+        )
+
+        assert resumed.finish_reason is FinishReason.COMPLETED
+        assert resumed.output == "복구된 결과입니다."
+        assert invocations == ["status ==", "status == 'active'"]
+        assert resumed.metadata["plan_usage"]["tool_repairs"] == 1
+        assert [entry["call_id"] for entry in resumed.metadata["tool_trace"]] == [
+            "resume-search-1",
+            "resume-search-2",
+        ]
+        assert resumed.metadata["tool_trace"][1]["recovery_of_call_id"] == (
+            "resume-search-1"
+        )
+        assert len(model.requests) == 5
+        resumed_repair_request = model.requests[2]
+        assert [schema.name for schema in resumed_repair_request.tools] == [
+            "search_catalog"
+        ]
+        assert resumed_repair_request.output_schema is None
+        assert "invalid_filter" in json.dumps(
+            [message.to_dict() for message in resumed_repair_request.messages],
+            ensure_ascii=False,
+        )
+        assert "private parser detail" not in json.dumps(
+            [message.to_dict() for message in resumed_repair_request.messages],
+            ensure_ascii=False,
+        )
+        assert model.requests[3].tools == ()
+        assert model.requests[3].output_schema["title"] == "StepResult"
+
+    asyncio.run(scenario())
+
+
+def test_repair_does_not_invoke_equivalent_validated_arguments() -> None:
+    async def scenario() -> None:
+        invocations: list[int] = []
+
+        def map_query_error(exc: Exception) -> ToolError | None:
+            if not isinstance(exc, ValueError):
+                return None
+            return ToolError(
+                ToolErrorType.EXECUTION_ERROR,
+                "correct the limit",
+                reason="invalid_limit",
+                recovery=ToolRecoveryAction.REPAIR_CALL,
+            )
+
+        @function_tool(
+            repair_safe=True,
+            error_mapper=map_query_error,
+        )
+        def query_catalog(limit: int) -> list[str]:
+            invocations.append(limit)
+            raise ValueError("backend rejected the query")
+
+        first = ToolCall("query-1", "query_catalog", {"limit": 1})
+        equivalent = ToolCall("query-2", "query_catalog", {"limit": 1.0})
+        model = CompleteScriptedModel(
+            [
+                ModelResponse(
+                    Message.assistant(None, (first,)),
+                    (first,),
+                    finish_reason="tool_calls",
+                ),
+                ModelResponse(
+                    Message.assistant(None, (equivalent,)),
+                    (equivalent,),
+                    finish_reason="tool_calls",
+                ),
+            ]
+        )
+        agent = Agent(
+            config=AgentConfig(
+                "equivalent-repair",
+                "use validated results",
+                limits=RunLimits(
+                    max_steps=1,
+                    max_tool_calls=2,
+                    max_replans=0,
+                    max_tool_repair_attempts=1,
+                ),
+            ),
+            model=model,
+            tools=[query_catalog],
+            decision_policy=PlanAndExecutePolicy(
+                StaticPlanGenerator(
+                    [
+                        PlanStep(
+                            step_id="query",
+                            objective="query the catalog",
+                            completion_criteria=["a result was returned"],
+                            allowed_tools=["query_catalog"],
+                        )
+                    ]
+                ),
+                tool_failure_recovery=ToolFailureRecoveryConfig(
+                    fallback="fail",
+                ),
+            ),
+        )
+
+        result = await agent.run("query it")
+
+        assert result.finish_reason is FinishReason.ERROR
+        assert invocations == [1]
+        assert result.metadata["failure"]["reason"] == ("unchanged_repair_arguments")
+        assert result.metadata["failure"]["terminal_reason"] == (
+            "tool repair budget exhausted"
+        )
+        assert result.metadata["tool_trace"][1]["attempts"] == 0
+        assert result.metadata["tool_trace"][1]["error"]["reason"] == (
+            "unchanged_repair_arguments"
+        )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("mismatch", "expected_error"),
+    [
+        ("count", "tool executor returned mismatched results"),
+        ("identity", "tool executor returned mismatched results"),
+        ("invalid-type", "tool executor returned mismatched results"),
+        ("invalid-error", "tool executor returned mismatched results"),
+        ("invalid-attempts", "tool executor returned mismatched results"),
+        ("invalid-value", "tool executor returned mismatched results"),
+        ("none", "tool executor returned mismatched results"),
+        ("generator", "tool executor returned mismatched results"),
+        ("exception", "tool execution failed"),
+    ],
+)
+def test_strict_runtime_rejects_mismatched_tool_executor_results(
+    mismatch: str,
+    expected_error: str,
+) -> None:
+    async def scenario() -> None:
+        @function_tool
+        def lookup(query: str) -> str:
+            raise AssertionError("the replacement executor owns this test")
+
+        call = ToolCall("lookup-1", "lookup", {"query": "value"})
+        model = CompleteScriptedModel(
+            [
+                ModelResponse(
+                    Message.assistant(None, (call,)),
+                    (call,),
+                    finish_reason="tool_calls",
+                )
+            ]
+        )
+        agent = Agent(
+            config=AgentConfig("mismatched-tool-results", "use the Tool"),
+            model=model,
+            tools=[lookup],
+            decision_policy=PlanAndExecutePolicy(
+                StaticPlanGenerator(
+                    [
+                        PlanStep(
+                            step_id="lookup",
+                            objective="look up a value",
+                            completion_criteria=["a value was returned"],
+                            allowed_tools=["lookup"],
+                        )
+                    ]
+                )
+            ),
+        )
+
+        original_executor = agent.runtime.tool_executor
+
+        class MismatchedExecutor:
+            registry = original_executor.registry
+
+            async def execute_many(self, calls, context, **kwargs):
+                if mismatch == "count":
+                    return ()
+                if mismatch == "invalid-type":
+                    return (object(),)
+                if mismatch == "none":
+                    return None
+                if mismatch == "exception":
+                    raise RuntimeError("PRIVATE-EXECUTOR-DETAIL")
+                result = ToolResult.succeeded(
+                    call_id=(
+                        "different-call-id" if mismatch == "identity" else "lookup-1"
+                    ),
+                    tool_name="lookup",
+                    value="value",
+                )
+                if mismatch == "invalid-value":
+
+                    class BrokenValue:
+                        def __repr__(self) -> str:
+                            raise RuntimeError("PRIVATE-SERIALIZATION-DETAIL")
+
+                    object.__setattr__(result, "value", BrokenValue())
+                if mismatch == "invalid-error":
+                    object.__setattr__(result, "success", False)
+                    object.__setattr__(result, "error", object())
+                if mismatch == "invalid-attempts":
+                    object.__setattr__(result, "attempts", float("nan"))
+                if mismatch == "generator":
+                    return (item for item in (result,))
+                return (result,)
+
+        agent.runtime.tool_executor = MismatchedExecutor()
+        result = await agent.run("look it up")
+
+        assert result.finish_reason is FinishReason.ERROR
+        assert result.error == expected_error
+        assert "PRIVATE-EXECUTOR-DETAIL" not in (result.error or "")
+        assert result.metadata["plan"]["steps"][0]["status"] == "failed"
 
     asyncio.run(scenario())
 

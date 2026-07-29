@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.2
+
+- Added opt-in, generalized Tool failure recovery that can ask ACT to produce corrected arguments before falling back to bounded plan revision.
+- Added `ToolRecoveryAction`, `ToolFailure`, and `ToolFailureRecoveryConfig`, including `error_mapper` support for bounded model feedback.
+- Added `repair_safe` Tool declarations and the independent `RunLimits.max_tool_repair_attempts` budget so corrected-argument repair does not change identical-call retry or step-validation limits.
+- Added internal recovery lifecycle events and checkpointed recovery state without exposing raw Tool failures in public result metadata.
+- Enforced same-Tool, single-call, new-ID, changed effective-arguments repair; partial-success Tool batches now fail closed instead of replaying side effects through replan.
+- Kept strict repair transcripts type-only by default and suppressed overlapping automatic retries after uncancellable synchronous Tool timeouts.
+- Preserved third-party strict Policy compatibility by configuring the additive Tool-repair budget through an optional capability hook.
+
 ## 0.3.1
 
 - Updated strict Plan-and-Execute terminal policy transitions so exhausted validation, Tool recovery, or replanning marks the current step `failed` instead of leaving it `in_progress`.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import warnings
 from typing import Any
 
@@ -8,7 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from moduagent.agent import Agent
-from moduagent.config import AgentConfig
+from moduagent.config import AgentConfig, RunLimits
 from moduagent.decision import (
     DecisionKind,
     ExecutionState,
@@ -22,6 +23,7 @@ from moduagent.decision import (
     StepResult,
     StepValidation,
     StepValidator,
+    ToolFailureRecoveryConfig,
     ValidationKind,
 )
 from moduagent.messages import Message, ToolCall
@@ -33,6 +35,7 @@ from moduagent.runtime.context import RunContext, RunRequest
 from moduagent.tools import (
     ToolError,
     ToolErrorType,
+    ToolRecoveryAction,
     ToolResult,
     function_tool,
 )
@@ -107,6 +110,43 @@ def _step(*, criteria: int = 1) -> PlanStep:
         expected_output="verified facts",
         allowed_tools=["lookup"],
     )
+
+
+def _repairable_tool_failure(
+    *,
+    call_id: str = "call-1",
+    message: str = "SQL syntax error\nnear SELECT",
+    repair_safe: bool = True,
+    recovery: ToolRecoveryAction = ToolRecoveryAction.REPAIR_CALL,
+) -> ToolResult:
+    return ToolResult.failed(
+        call_id=call_id,
+        tool_name="lookup",
+        error=ToolError(
+            ToolErrorType.EXECUTION_ERROR,
+            message,
+            reason="sql_syntax_error",
+            recovery=recovery,
+        ),
+        attempts=1,
+        repair_safe=repair_safe,
+    )
+
+
+async def _authorize_tool_calls(
+    policy: PlanAndExecutePolicy,
+    context: RunContext,
+    *calls: ToolCall,
+) -> None:
+    decision = await policy.decide(
+        context,
+        ModelResponse(
+            Message.assistant(None, tuple(calls)),
+            tuple(calls),
+            finish_reason="tool_calls",
+        ),
+    )
+    assert decision.kind is DecisionKind.CALL_TOOLS
 
 
 def test_plan_step_keeps_positional_description_compatibility() -> None:
@@ -323,6 +363,61 @@ def test_execution_state_round_trip_preserves_exactly_once_fields() -> None:
     assert restored.final_persisted is True
     assert restored.final_emitted is True
     assert restored.committed_results["S1"].status == "completed"
+
+
+def test_tool_repair_limits_and_recovery_config_are_validated() -> None:
+    assert RunLimits().max_tool_repair_attempts == 1
+    with pytest.raises(ValueError, match="max_tool_repair_attempts"):
+        RunLimits(max_tool_repair_attempts=-1)
+    with pytest.raises(ValueError, match="fallback"):
+        ToolFailureRecoveryConfig(fallback="retry")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="require_repair_safe"):
+        ToolFailureRecoveryConfig(require_repair_safe=0)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feedback_mode"):
+        ToolFailureRecoveryConfig(feedback_mode="raw")  # type: ignore[arg-type]
+
+
+def test_execution_state_round_trip_preserves_tool_recovery_fields() -> None:
+    plan = Plan([_step()])
+    plan.start_current()
+    state = ExecutionState(
+        phase=RunPhase.ACT,
+        plan=plan,
+        current_step_id="S1",
+        tool_repair_counts={"S1": 1},
+        pending_tool_failure={
+            "step_id": "S1",
+            "tool_name": "lookup",
+            "reason": "sql_syntax_error",
+        },
+        total_tool_repairs=1,
+        failure={"terminal_reason": "repair exhausted"},
+        active_tool_calls={
+            "call-2": {
+                "tool_name": "lookup",
+                "arguments_fingerprint": "sha256:" + ("a" * 64),
+            }
+        },
+        seen_tool_call_ids=["call-1", "call-2"],
+    )
+
+    restored = ExecutionState.from_dict(state.to_dict())
+
+    assert restored.tool_repair_counts == {"S1": 1}
+    assert restored.total_tool_repairs == 1
+    assert restored.pending_tool_failure == {
+        "step_id": "S1",
+        "tool_name": "lookup",
+        "reason": "sql_syntax_error",
+    }
+    assert restored.failure == {"terminal_reason": "repair exhausted"}
+    assert restored.active_tool_calls == {
+        "call-2": {
+            "tool_name": "lookup",
+            "arguments_fingerprint": "sha256:" + ("a" * 64),
+        }
+    }
+    assert restored.seen_tool_call_ids == ["call-1", "call-2"]
 
 
 def test_validate_pending_commits_restored_step_without_act() -> None:
@@ -827,6 +922,626 @@ def test_terminal_tool_failure_marks_current_step_failed(
         assert state.phase is RunPhase.FAILED
         assert state.plan.steps[0].status is PlanStepStatus.FAILED
         assert context.policy_state["plan"]["steps"][0]["status"] == "failed"
+
+    asyncio.run(scenario())
+
+
+def test_repairable_tool_failure_retries_same_step_with_sanitized_feedback() -> None:
+    async def scenario() -> None:
+        context = _context()
+        policy = PlanAndExecutePolicy(
+            StaticPlanGenerator(Plan([_step()])),
+            tool_failure_recovery=ToolFailureRecoveryConfig(
+                feedback_mode="safe_message"
+            ),
+        )
+        policy.configure_limits(
+            max_step_attempts=2,
+            max_replans=2,
+            max_tool_repair_attempts=1,
+        )
+        await policy.begin(context)
+        policy.prepare_step(context, has_tools=True)
+        await _authorize_tool_calls(
+            policy,
+            context,
+            ToolCall("call-1", "lookup", {"query": "SELEC id"}),
+        )
+
+        decision = await policy.observe(context, [_repairable_tool_failure()])
+
+        state = context.execution_state
+        assert decision is not None
+        assert decision.kind is DecisionKind.RETRY_TOOL
+        assert state.phase is RunPhase.ACT
+        assert state.awaiting_step_result is False
+        assert state.current_step.status is PlanStepStatus.IN_PROGRESS
+        assert state.current_step.attempt_count == 0
+        assert state.tool_repair_counts == {"S1": 1}
+        assert state.total_tool_repairs == 1
+        assert state.pending_tool_failure is not None
+        assert state.pending_tool_failure["reason"] == "sql_syntax_error"
+        assert state.pending_tool_failure["recovery"] == "repair_call"
+        assert state.pending_tool_failure["feedback"] == (
+            "Tool lookup failed (sql_syntax_error): SQL syntax error near SELECT"
+        )
+        assert decision.metadata["count_attempt"] is False
+
+    asyncio.run(scenario())
+
+
+def test_successful_repaired_tool_call_clears_pending_failure() -> None:
+    async def scenario() -> None:
+        context = _context()
+        policy = PlanAndExecutePolicy(
+            StaticPlanGenerator(Plan([_step()])),
+            tool_failure_recovery=ToolFailureRecoveryConfig(),
+        )
+        await policy.begin(context)
+        policy.prepare_step(context, has_tools=True)
+        await _authorize_tool_calls(
+            policy,
+            context,
+            ToolCall("call-1", "lookup", {"query": "SELEC id"}),
+        )
+        scheduled = await policy.observe(context, [_repairable_tool_failure()])
+        assert scheduled is not None
+        assert scheduled.kind is DecisionKind.RETRY_TOOL
+        await _authorize_tool_calls(
+            policy,
+            context,
+            ToolCall("call-2", "lookup", {"query": "SELECT id"}),
+        )
+
+        decision = await policy.observe(
+            context,
+            [
+                ToolResult.succeeded(
+                    call_id="call-2",
+                    tool_name="lookup",
+                    value=[{"id": 1}],
+                    repair_safe=True,
+                )
+            ],
+        )
+
+        state = context.execution_state
+        assert decision is None
+        assert state.pending_tool_failure is None
+        assert state.failure is None
+        assert state.validation_error is None
+        assert state.awaiting_step_result is True
+        assert state.tool_repair_counts == {"S1": 1}
+        assert state.total_tool_repairs == 1
+
+    asyncio.run(scenario())
+
+
+def test_exhausted_tool_repair_budget_fails_with_original_cause() -> None:
+    async def scenario() -> None:
+        context = _context()
+        policy = PlanAndExecutePolicy(
+            StaticPlanGenerator(Plan([_step()])),
+            tool_failure_recovery=ToolFailureRecoveryConfig(fallback="fail"),
+        )
+        policy.configure_limits(
+            max_step_attempts=2,
+            max_replans=2,
+            max_tool_repair_attempts=1,
+        )
+        await policy.begin(context)
+        policy.prepare_step(context, has_tools=True)
+        await _authorize_tool_calls(
+            policy,
+            context,
+            ToolCall("call-1", "lookup", {"query": "SELEC id"}),
+        )
+        first = await policy.observe(context, [_repairable_tool_failure()])
+        assert first is not None
+        assert first.kind is DecisionKind.RETRY_TOOL
+
+        retry_call = ToolCall("call-2", "lookup", {"query": "SELECT id FROM data"})
+        call_decision = await policy.decide(
+            context,
+            ModelResponse(
+                Message.assistant(None, (retry_call,)),
+                (retry_call,),
+                finish_reason="tool_calls",
+            ),
+        )
+        assert call_decision.kind is DecisionKind.CALL_TOOLS
+
+        terminal = await policy.observe(
+            context,
+            [_repairable_tool_failure(call_id="call-2")],
+        )
+
+        state = context.execution_state
+        assert terminal is not None
+        assert terminal.kind is DecisionKind.FAIL
+        assert state.phase is RunPhase.FAILED
+        assert state.current_step.status is PlanStepStatus.FAILED
+        assert state.tool_repair_counts == {"S1": 1}
+        assert state.total_tool_repairs == 1
+        assert state.failure is not None
+        assert state.failure["reason"] == "sql_syntax_error"
+        assert state.failure["terminal_reason"] == "tool repair budget exhausted"
+
+    asyncio.run(scenario())
+
+
+def test_unsafe_tool_failure_uses_replan_fallback_without_repair() -> None:
+    async def scenario() -> None:
+        initial = Plan([_step()])
+        revision = Plan(
+            [
+                PlanStep(
+                    step_id="S1",
+                    objective="collect evidence with a safer query",
+                    completion_criteria=["criterion 0"],
+                    allowed_tools=["lookup"],
+                )
+            ]
+        )
+        context = _context()
+        policy = PlanAndExecutePolicy(
+            RevisingPlanGenerator(initial, revision),
+            tool_failure_recovery=ToolFailureRecoveryConfig(fallback="replan"),
+        )
+        await policy.begin(context)
+        policy.prepare_step(context, has_tools=True)
+
+        decision = await policy.observe(
+            context,
+            [_repairable_tool_failure(repair_safe=False)],
+        )
+
+        state = context.execution_state
+        assert decision is not None
+        assert decision.kind is DecisionKind.REPLAN
+        assert state.phase is RunPhase.STEP_PREPARE
+        assert state.replan_count == 1
+        assert state.tool_repair_counts == {}
+        assert state.total_tool_repairs == 0
+        assert state.pending_tool_failure is None
+        assert state.failure is None
+
+    asyncio.run(scenario())
+
+
+def test_mixed_tool_batch_never_enters_same_step_repair() -> None:
+    async def scenario() -> None:
+        context = _context()
+        policy = PlanAndExecutePolicy(
+            StaticPlanGenerator(Plan([_step()])),
+            tool_failure_recovery=ToolFailureRecoveryConfig(fallback="replan"),
+        )
+        await policy.begin(context)
+        policy.prepare_step(context, has_tools=True)
+        await _authorize_tool_calls(
+            policy,
+            context,
+            ToolCall("call-success", "lookup", {"query": "first"}),
+            ToolCall("call-1", "lookup", {"query": "second"}),
+        )
+
+        decision = await policy.observe(
+            context,
+            [
+                ToolResult.succeeded(
+                    call_id="call-success",
+                    tool_name="lookup",
+                    value="done",
+                ),
+                _repairable_tool_failure(),
+            ],
+        )
+
+        state = context.execution_state
+        assert decision is not None
+        assert decision.kind is DecisionKind.FAIL
+        assert state.phase is RunPhase.FAILED
+        assert state.total_tool_repairs == 0
+        assert state.failure is not None
+        assert state.failure["terminal_reason"] == (
+            "Tool batch partially succeeded; automatic recovery is unsafe"
+        )
+        assert state.replan_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_missing_tool_call_during_repair_uses_fail_fallback() -> None:
+    async def scenario() -> None:
+        context = _context()
+        policy = PlanAndExecutePolicy(
+            StaticPlanGenerator(Plan([_step()])),
+            tool_failure_recovery=ToolFailureRecoveryConfig(fallback="fail"),
+        )
+        await policy.begin(context)
+        policy.prepare_step(context, has_tools=True)
+        await _authorize_tool_calls(
+            policy,
+            context,
+            ToolCall("call-1", "lookup", {"query": "SELEC id"}),
+        )
+        scheduled = await policy.observe(context, [_repairable_tool_failure()])
+        assert scheduled is not None
+        assert scheduled.kind is DecisionKind.RETRY_TOOL
+
+        terminal = await policy.decide(
+            context,
+            ModelResponse(
+                Message.assistant("I cannot call the tool."),
+                finish_reason="stop",
+            ),
+        )
+
+        state = context.execution_state
+        assert terminal.kind is DecisionKind.FAIL
+        assert state.phase is RunPhase.FAILED
+        assert state.failure is not None
+        assert state.failure["reason"] == "sql_syntax_error"
+        assert state.failure["terminal_reason"] == (
+            "tool repair response did not call a tool"
+        )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("repair_calls", "terminal_reason"),
+    [
+        (
+            (
+                ToolCall(
+                    "call-2",
+                    "lookup",
+                    {"query": "bad", "limit": 10},
+                ),
+            ),
+            "Tool repair must change the Tool arguments",
+        ),
+        (
+            (
+                ToolCall(
+                    "call-2",
+                    "lookup",
+                    {"limit": 10, "query": "bad"},
+                ),
+            ),
+            "Tool repair must change the Tool arguments",
+        ),
+        (
+            (
+                ToolCall(
+                    "call-2",
+                    "alternate_lookup",
+                    {"query": "fixed", "limit": 10},
+                ),
+            ),
+            "Tool repair must call the same Tool",
+        ),
+        (
+            (
+                ToolCall(
+                    "call-1",
+                    "lookup",
+                    {"query": "fixed", "limit": 10},
+                ),
+            ),
+            "Tool calls must use a new unique call ID",
+        ),
+        (
+            (
+                ToolCall(
+                    "call-2",
+                    "lookup",
+                    {"query": "fixed", "limit": 10},
+                ),
+                ToolCall(
+                    "call-3",
+                    "lookup",
+                    {"query": "also fixed", "limit": 10},
+                ),
+            ),
+            "Tool repair must contain exactly one call",
+        ),
+    ],
+    ids=[
+        "same-arguments",
+        "key-order-only",
+        "different-tool",
+        "reused-call-id",
+        "multiple-calls",
+    ],
+)
+def test_tool_repair_rejects_unsafe_call_shape_before_execution(
+    repair_calls: tuple[ToolCall, ...],
+    terminal_reason: str,
+) -> None:
+    async def scenario() -> None:
+        context = _context()
+        policy = PlanAndExecutePolicy(
+            StaticPlanGenerator(Plan([_step()])),
+            tool_failure_recovery=ToolFailureRecoveryConfig(fallback="fail"),
+        )
+        await policy.begin(context)
+        policy.prepare_step(context, has_tools=True)
+        await _authorize_tool_calls(
+            policy,
+            context,
+            ToolCall(
+                "call-1",
+                "lookup",
+                {"query": "bad", "limit": 10},
+            ),
+        )
+        scheduled = await policy.observe(context, [_repairable_tool_failure()])
+        assert scheduled is not None
+        assert scheduled.kind is DecisionKind.RETRY_TOOL
+
+        terminal = await policy.decide(
+            context,
+            ModelResponse(
+                Message.assistant(None, repair_calls),
+                repair_calls,
+                finish_reason="tool_calls",
+            ),
+        )
+
+        state = context.execution_state
+        assert terminal.kind is DecisionKind.FAIL
+        assert state.phase is RunPhase.FAILED
+        assert state.failure is not None
+        assert state.failure["terminal_reason"] == terminal_reason
+        assert state.seen_tool_call_ids == ["call-1"]
+        assert state.active_tool_calls == {}
+
+    asyncio.run(scenario())
+
+
+def test_tool_repair_argument_fingerprint_survives_checkpoint() -> None:
+    async def scenario() -> None:
+        context = _context()
+        policy = PlanAndExecutePolicy(
+            StaticPlanGenerator(Plan([_step()])),
+            tool_failure_recovery=ToolFailureRecoveryConfig(fallback="fail"),
+        )
+        await policy.begin(context)
+        policy.prepare_step(context, has_tools=True)
+        original = ToolCall(
+            "call-1",
+            "lookup",
+            {"query": "bad", "limit": 10},
+        )
+        await _authorize_tool_calls(policy, context, original)
+        scheduled = await policy.observe(context, [_repairable_tool_failure()])
+        assert scheduled is not None
+        assert scheduled.kind is DecisionKind.RETRY_TOOL
+
+        serialized = context.execution_state.to_dict()
+        assert "bad" not in json.dumps(
+            serialized["pending_tool_failure"],
+            ensure_ascii=False,
+        )
+        restored = ExecutionState.from_dict(serialized)
+        context.execution_state = restored
+        context.policy_state["execution_state"] = restored.to_dict()
+
+        terminal = await policy.decide(
+            context,
+            ModelResponse(
+                Message.assistant(
+                    None,
+                    (
+                        ToolCall(
+                            "call-2",
+                            "lookup",
+                            {"limit": 10, "query": "bad"},
+                        ),
+                    ),
+                ),
+                (
+                    ToolCall(
+                        "call-2",
+                        "lookup",
+                        {"limit": 10, "query": "bad"},
+                    ),
+                ),
+                finish_reason="tool_calls",
+            ),
+        )
+
+        assert terminal.kind is DecisionKind.FAIL
+        assert context.execution_state.failure is not None
+        assert context.execution_state.failure["terminal_reason"] == (
+            "Tool repair must change the Tool arguments"
+        )
+
+    asyncio.run(scenario())
+
+
+def test_generic_tool_error_never_exposes_message_as_repair_feedback() -> None:
+    async def scenario() -> None:
+        secret = "TOP-SECRET-DATABASE-DETAIL"
+        context = _context()
+        policy = PlanAndExecutePolicy(
+            StaticPlanGenerator(Plan([_step()])),
+            tool_failure_recovery=ToolFailureRecoveryConfig(
+                fallback="fail",
+                feedback_mode="safe_message",
+            ),
+        )
+        await policy.begin(context)
+        policy.prepare_step(context, has_tools=True)
+        generic_failure = ToolResult.failed(
+            call_id="call-1",
+            tool_name="lookup",
+            error=ToolError(
+                ToolErrorType.EXECUTION_ERROR,
+                secret,
+            ),
+            repair_safe=True,
+        )
+
+        decision = await policy.observe(context, [generic_failure])
+
+        state = context.execution_state
+        assert decision is not None
+        assert decision.kind is DecisionKind.FAIL
+        assert state.failure is not None
+        assert secret not in state.failure["feedback"]
+        assert state.failure["feedback"] == "Tool lookup failed (execution_error)"
+
+    asyncio.run(scenario())
+
+
+def test_fail_recovery_action_overrides_replan_fallback() -> None:
+    async def scenario() -> None:
+        context = _context()
+        policy = PlanAndExecutePolicy(
+            StaticPlanGenerator(Plan([_step()])),
+            tool_failure_recovery=ToolFailureRecoveryConfig(fallback="replan"),
+        )
+        await policy.begin(context)
+        policy.prepare_step(context, has_tools=True)
+
+        decision = await policy.observe(
+            context,
+            [
+                _repairable_tool_failure(
+                    recovery=ToolRecoveryAction.FAIL,
+                )
+            ],
+        )
+
+        state = context.execution_state
+        assert decision is not None
+        assert decision.kind is DecisionKind.FAIL
+        assert state.phase is RunPhase.FAILED
+        assert state.replan_count == 0
+        assert state.failure is not None
+        assert state.failure["recovery"] == "fail"
+        assert state.failure["reason"] == "sql_syntax_error"
+
+    asyncio.run(scenario())
+
+
+def test_replan_recovery_action_overrides_fail_fallback() -> None:
+    async def scenario() -> None:
+        initial = Plan([_step()])
+        revision = Plan(
+            [
+                PlanStep(
+                    step_id="S1",
+                    objective="use an alternate data source",
+                    completion_criteria=["criterion 0"],
+                    allowed_tools=["lookup"],
+                )
+            ]
+        )
+        context = _context()
+        policy = PlanAndExecutePolicy(
+            RevisingPlanGenerator(initial, revision),
+            tool_failure_recovery=ToolFailureRecoveryConfig(fallback="fail"),
+        )
+        await policy.begin(context)
+        policy.prepare_step(context, has_tools=True)
+
+        decision = await policy.observe(
+            context,
+            [
+                _repairable_tool_failure(
+                    recovery=ToolRecoveryAction.REPLAN,
+                )
+            ],
+        )
+
+        state = context.execution_state
+        assert decision is not None
+        assert decision.kind is DecisionKind.REPLAN
+        assert state.phase is RunPhase.STEP_PREPARE
+        assert state.replan_count == 1
+        assert state.failure is None
+        assert state.pending_tool_failure is None
+
+    asyncio.run(scenario())
+
+
+def test_retry_call_recovery_uses_fallback_after_executor_exhaustion() -> None:
+    async def scenario() -> None:
+        context = _context()
+        policy = PlanAndExecutePolicy(
+            StaticPlanGenerator(Plan([_step()])),
+            tool_failure_recovery=ToolFailureRecoveryConfig(fallback="fail"),
+        )
+        await policy.begin(context)
+        policy.prepare_step(context, has_tools=True)
+
+        decision = await policy.observe(
+            context,
+            [
+                _repairable_tool_failure(
+                    recovery=ToolRecoveryAction.RETRY_CALL,
+                )
+            ],
+        )
+
+        state = context.execution_state
+        assert decision is not None
+        assert decision.kind is DecisionKind.FAIL
+        assert state.phase is RunPhase.FAILED
+        assert state.tool_repair_counts == {}
+        assert state.failure is not None
+        assert state.failure["recovery"] == "retry_call"
+        assert state.failure["terminal_reason"] == "tool retry attempts exhausted"
+
+    asyncio.run(scenario())
+
+
+def test_tool_failure_checkpoint_fields_are_sanitized_and_bounded() -> None:
+    async def scenario() -> None:
+        context = _context()
+        policy = PlanAndExecutePolicy(
+            StaticPlanGenerator(Plan([_step()])),
+            tool_failure_recovery=ToolFailureRecoveryConfig(
+                feedback_mode="safe_message"
+            ),
+        )
+        await policy.begin(context)
+        policy.prepare_step(context, has_tools=True)
+        long_message = "bad\x00\nquery " + ("x" * 800)
+        await _authorize_tool_calls(
+            policy,
+            context,
+            ToolCall("call-1", "lookup", {"query": "SELEC id"}),
+        )
+        result = ToolResult.failed(
+            call_id="call-1",
+            tool_name="lookup",
+            error=ToolError(
+                ToolErrorType.EXECUTION_ERROR,
+                long_message,
+                reason=("sql\x00\n" + ("r" * 400)),
+                recovery=ToolRecoveryAction.REPAIR_CALL,
+            ),
+            repair_safe=True,
+        )
+
+        decision = await policy.observe(context, [result])
+
+        assert decision is not None
+        assert decision.kind is DecisionKind.RETRY_TOOL
+        failure = context.execution_state.pending_tool_failure
+        assert failure is not None
+        for field in ("call_id", "tool_name", "error_type", "reason", "recovery"):
+            value = failure[field]
+            assert value is None or len(value) <= 256
+            assert value is None or ("\x00" not in value and "\n" not in value)
+        assert len(failure["feedback"]) <= 512
+        assert "\x00" not in failure["feedback"]
+        assert "\n" not in failure["feedback"]
 
     asyncio.run(scenario())
 

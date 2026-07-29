@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import math
 from collections.abc import Awaitable, Callable, Iterator, Mapping
@@ -14,6 +15,9 @@ from typing import Any, Protocol, TypeVar, runtime_checkable
 from uuid import UUID
 
 from pydantic import BaseModel
+
+
+_TOOL_REPAIR_METADATA_KEY = "_moduagent_tool_repair"
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,19 +110,52 @@ ToolErrorCode = ToolErrorType
 ToolErrorKind = ToolErrorType
 
 
+class ToolRecoveryAction(str, Enum):
+    """The next safe action after a classified tool failure."""
+
+    RETRY_CALL = "retry_call"
+    REPAIR_CALL = "repair_call"
+    REPLAN = "replan"
+    FAIL = "fail"
+
+
 @dataclass(frozen=True, slots=True)
 class ToolError:
     type: ToolErrorType
     message: str
     retryable: bool = False
     details: Mapping[str, Any] = field(default_factory=dict)
+    reason: str | None = None
+    recovery: ToolRecoveryAction | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.type, ToolErrorType):
             object.__setattr__(self, "type", ToolErrorType(str(self.type)))
+        if not isinstance(self.message, str):
+            raise TypeError("tool error message must be a string")
+        if not isinstance(self.retryable, bool):
+            raise TypeError("tool error retryable must be a bool")
+        if not isinstance(self.details, Mapping):
+            raise TypeError("tool error details must be a mapping")
+        object.__setattr__(self, "details", dict(self.details))
+        if self.reason is not None:
+            reason = str(self.reason).strip()
+            if not reason:
+                raise ValueError("tool error reason cannot be empty")
+            object.__setattr__(self, "reason", reason)
+        if self.recovery is not None and not isinstance(
+            self.recovery, ToolRecoveryAction
+        ):
+            object.__setattr__(
+                self,
+                "recovery",
+                ToolRecoveryAction(str(self.recovery)),
+            )
 
     @property
     def code(self) -> ToolErrorType:
+        """Backward-compatible alias for the broad ToolErrorType."""
+
         return self.type
 
     @property
@@ -131,9 +168,27 @@ class ToolError:
             "message": self.message,
             "retryable": self.retryable,
         }
+        if self.reason is not None:
+            value["reason"] = self.reason
+        if self.recovery is not None:
+            value["recovery"] = self.recovery.value
         if self.details:
             value["details"] = _json_safe(dict(self.details))
         return value
+
+
+class ToolFailure(Exception):
+    """Raise a pre-classified, model-safe ToolError from a tool implementation.
+
+    ``ToolError.message`` and ``details`` remain model-visible outside the
+    strict recovery projection. Never wrap a raw backend exception here.
+    """
+
+    def __init__(self, error: ToolError) -> None:
+        if not isinstance(error, ToolError):
+            raise TypeError("error must be a ToolError")
+        super().__init__(error.message)
+        self.error = error
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,16 +204,36 @@ class ToolResult:
     # Deliberately omitted from to_dict()/model_content() to avoid widening the
     # public Tool result and model-visible payload with potentially sensitive data.
     invocation_arguments: Mapping[str, Any] | None = None
+    # Internal safety capability used by orchestrators before attempting an
+    # argument-repair loop. It is not model-visible or publicly serialized.
+    repair_safe: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.call_id, str) or not self.call_id.strip():
+            raise ValueError("tool result call_id cannot be empty")
+        if not isinstance(self.tool_name, str) or not self.tool_name.strip():
+            raise ValueError("tool result tool_name cannot be empty")
+        if not isinstance(self.success, bool):
+            raise TypeError("tool result success must be a bool")
+        if self.error is not None and not isinstance(self.error, ToolError):
+            raise TypeError("error must be a ToolError")
         if self.success and self.error is not None:
             raise ValueError("a successful tool result cannot contain an error")
         if not self.success and self.error is None:
             raise ValueError("a failed tool result must contain an error")
+        if type(self.attempts) is not int:
+            raise TypeError("attempts must be an integer")
         if self.attempts < 0:
             raise ValueError("attempts cannot be negative")
+        if type(self.duration_seconds) not in (int, float):
+            raise TypeError("duration_seconds must be a number")
+        if not math.isfinite(self.duration_seconds):
+            raise ValueError("duration_seconds must be finite")
         if self.duration_seconds < 0:
             raise ValueError("duration_seconds cannot be negative")
+        object.__setattr__(self, "duration_seconds", float(self.duration_seconds))
+        if not isinstance(self.repair_safe, bool):
+            raise TypeError("repair_safe must be a bool")
         if self.invocation_arguments is not None:
             if not isinstance(self.invocation_arguments, Mapping):
                 raise TypeError("invocation_arguments must be a mapping")
@@ -178,6 +253,7 @@ class ToolResult:
         attempts: int = 1,
         duration_seconds: float = 0.0,
         invocation_arguments: Mapping[str, Any] | None = None,
+        repair_safe: bool = False,
     ) -> "ToolResult":
         return cls(
             call_id=call_id,
@@ -187,6 +263,7 @@ class ToolResult:
             attempts=attempts,
             duration_seconds=duration_seconds,
             invocation_arguments=invocation_arguments,
+            repair_safe=repair_safe,
         )
 
     @classmethod
@@ -199,6 +276,7 @@ class ToolResult:
         attempts: int = 0,
         duration_seconds: float = 0.0,
         invocation_arguments: Mapping[str, Any] | None = None,
+        repair_safe: bool = False,
     ) -> "ToolResult":
         return cls(
             call_id=call_id,
@@ -208,6 +286,7 @@ class ToolResult:
             attempts=attempts,
             duration_seconds=duration_seconds,
             invocation_arguments=invocation_arguments,
+            repair_safe=repair_safe,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -401,6 +480,20 @@ def _json_safe(value: Any) -> Any:
         return json.loads(json.dumps(normalized, ensure_ascii=False, allow_nan=False))
     except (TypeError, ValueError, OverflowError):
         return repr(value)
+
+
+def _tool_arguments_fingerprint(arguments: Mapping[str, Any]) -> str:
+    """Hash canonical Tool arguments without retaining their raw values."""
+
+    normalized = _json_safe(dict(arguments))
+    payload = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
 def _serialized_size(value: Any) -> int:

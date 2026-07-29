@@ -7,6 +7,7 @@ from typing import Any, TypeVar, get_type_hints, overload
 from pydantic import BaseModel, ConfigDict, create_model
 
 from moduagent.tools.base import (
+    ToolError,
     ToolExecutionContext,
     ToolSchema,
     _await_if_needed,
@@ -19,7 +20,11 @@ F = TypeVar("F", bound=Function)
 
 
 class FunctionTool:
-    """Adapt a typed Python function to the Tool contract."""
+    """Adapt a typed Python function to the Tool contract.
+
+    ``error_mapper`` results become model-visible ToolError payloads, so their
+    message and details must already be sanitized by the caller.
+    """
 
     def __init__(
         self,
@@ -32,6 +37,9 @@ class FunctionTool:
         idempotent: bool = False,
         timeout_seconds: float | None = None,
         max_result_bytes: int | None = None,
+        repair_safe: bool = False,
+        timeout_retry_safe: bool | None = None,
+        error_mapper: Callable[[Exception], ToolError | None] | None = None,
     ) -> None:
         if input_model is not None and args_schema is not None:
             raise ValueError("use either input_model or args_schema, not both")
@@ -39,6 +47,15 @@ class FunctionTool:
             raise ValueError("timeout_seconds must be positive")
         if max_result_bytes is not None and max_result_bytes < 1:
             raise ValueError("max_result_bytes must be at least 1")
+        if not isinstance(repair_safe, bool):
+            raise TypeError("repair_safe must be a bool")
+        if timeout_retry_safe is not None and not isinstance(
+            timeout_retry_safe,
+            bool,
+        ):
+            raise TypeError("timeout_retry_safe must be a bool")
+        if error_mapper is not None and not callable(error_mapper):
+            raise TypeError("error_mapper must be callable")
 
         self.function = function
         self.name = name or function.__name__
@@ -48,6 +65,16 @@ class FunctionTool:
         self.idempotent = idempotent
         self.timeout_seconds = timeout_seconds
         self.max_result_bytes = max_result_bytes
+        self.repair_safe = repair_safe
+        # A coroutine can be cancelled by asyncio.wait_for. A daemon-backed
+        # synchronous function keeps running after timeout, so overlapping retry
+        # is unsafe unless the integration explicitly guarantees cancellation.
+        self.timeout_retry_safe = (
+            inspect.iscoroutinefunction(function)
+            if timeout_retry_safe is None
+            else timeout_retry_safe
+        )
+        self.error_mapper = error_mapper
         self._context_parameter: str | None = None
         explicit_model = input_model or args_schema
         if explicit_model is not None:
@@ -166,6 +193,9 @@ def function_tool(
     idempotent: bool = False,
     timeout_seconds: float | None = None,
     max_result_bytes: int | None = None,
+    repair_safe: bool = False,
+    timeout_retry_safe: bool | None = None,
+    error_mapper: Callable[[Exception], ToolError | None] | None = None,
 ) -> Callable[[F], FunctionTool]: ...
 
 
@@ -180,6 +210,9 @@ def function_tool(
     idempotent: bool = False,
     timeout_seconds: float | None = None,
     max_result_bytes: int | None = None,
+    repair_safe: bool = False,
+    timeout_retry_safe: bool | None = None,
+    error_mapper: Callable[[Exception], ToolError | None] | None = None,
 ) -> FunctionTool | Callable[[F], FunctionTool]:
     """Create a FunctionTool, usable both directly and as a decorator."""
 
@@ -193,6 +226,9 @@ def function_tool(
             idempotent=idempotent,
             timeout_seconds=timeout_seconds,
             max_result_bytes=max_result_bytes,
+            repair_safe=repair_safe,
+            timeout_retry_safe=timeout_retry_safe,
+            error_mapper=error_mapper,
         )
 
     if function is None:

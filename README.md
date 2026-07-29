@@ -409,7 +409,7 @@ if failed.error and await checkpoints.load(failed.run_id) is not None:
 
 ## Plan-and-Execute
 
-복수 단계 작업은 `LLMPlanGenerator`와 strict `PlanAndExecutePolicy`를 조합합니다. 0.3.1의 `PlanAndExecutePolicy`는 일반 ACT 응답을 단계 완료로 간주하지 않고, strict `StepResult`의 검증과 명시적 커밋을 요구합니다.
+복수 단계 작업은 `LLMPlanGenerator`와 strict `PlanAndExecutePolicy`를 조합합니다. 0.3.2의 `PlanAndExecutePolicy`는 일반 ACT 응답을 단계 완료로 간주하지 않고, strict `StepResult`의 검증과 명시적 커밋을 요구합니다.
 
 ```python
 from moduagent import (
@@ -453,7 +453,84 @@ PLAN → ACT_TOOL → STEP_RESULT → STEP_VALIDATE/COMMIT → VERIFY → FINALI
 
 vLLM에도 Tool과 출력 schema를 한 요청에 함께 전달하지 않습니다. `RunLimits.max_steps`는 strict 정책에서 모델 호출 수가 아니라 계획 단계 수이며, `max_step_attempts`와 `max_replans`가 재시도와 재계획을 별도로 제한합니다. 모든 호출과 저장 작업은 하나의 `timeout_seconds`를 공유합니다.
 
-`result.metadata["plan"]["steps"][].allowed_tools`는 해당 단계에서 호출할 수 있었던 Tool 목록이며 실제 호출 이력이 아닙니다. 0.3.1부터 실제 호출 시도는 순서가 보존된 `result.metadata["tool_trace"]`에서 확인할 수 있습니다. 기본 `tool_trace_mode="summary"`는 단계·call ID·Tool 이름·성공 여부·시도 횟수·실행 시간과 정제된 오류 분류만 남깁니다. `off`는 trace를 만들지 않고, `arguments`는 민감한 키를 재귀적으로 마스킹한 호출 인자를 추가합니다. 실행된 Tool은 validation·형 변환·기본값 적용 후 실제 인자를 `arguments_source="validated"`로 기록하고, 실행 전에 거부된 호출은 요청 인자를 `requested`로 기록합니다.
+### Tool 실패 복구
+
+0.3.2의 corrected-arguments repair는 명시적으로 활성화하는 일반화된 기능입니다. DB 조회뿐 아니라 검색식, 파일 선택 조건, 외부 API query parameter처럼 모델이 Tool 인자를 고쳐 다시 호출할 수 있는 오류에 적용할 수 있습니다.
+
+```python
+from moduagent import (
+    RetryConfig,
+    ToolError,
+    ToolErrorType,
+    ToolFailureRecoveryConfig,
+    ToolRecoveryAction,
+    function_tool,
+)
+
+
+def map_query_error(exc: Exception) -> ToolError | None:
+    # 운영 코드에서는 교정 가능한 예외 타입만 allowlist로 분류합니다.
+    if not isinstance(exc, ValueError):
+        return None
+    return ToolError(
+        type=ToolErrorType.EXECUTION_ERROR,
+        reason="invalid_query_syntax",
+        message="The query syntax is invalid; correct the Tool arguments.",
+        retryable=False,
+        recovery=ToolRecoveryAction.REPAIR_CALL,
+    )
+
+
+@function_tool(
+    idempotent=True,
+    repair_safe=True,
+    error_mapper=map_query_error,
+)
+def search_records(query: str, limit: int = 100) -> dict:
+    return backend.search(query=query, limit=limit)
+
+
+planning_agent = Agent(
+    config=AgentConfig(
+        name="repairing-agent",
+        instructions="Tool 오류 피드백을 반영해 안전한 인자만 교정한다.",
+        retry=RetryConfig(max_attempts=2),
+        limits=RunLimits(
+            max_tool_repair_attempts=1,
+            max_replans=1,
+            max_tool_calls=8,
+        ),
+    ),
+    model=model,
+    tools=[search_records],
+    decision_policy=PlanAndExecutePolicy(
+        LLMPlanGenerator(model),
+        tool_failure_recovery=ToolFailureRecoveryConfig(
+            fallback="replan",
+            require_repair_safe=True,
+            feedback_mode="safe_message",
+        ),
+    ),
+)
+```
+
+세 제한은 서로 다른 동작입니다.
+
+- `RetryConfig`, `idempotent=True`, `ToolError.retryable=True`: 분류된 일시적 오류에 동일한 Tool call과 동일 인자를 다시 실행합니다.
+- `max_tool_repair_attempts`와 `repair_safe=True`: `REPAIR_CALL` 오류를 받은 ACT가 같은 Tool을 정확히 한 번, 새 call ID와 교정된 인자로 다시 호출합니다.
+- `max_replans`: repair가 불가능하거나 소진됐을 때 미완료 계획을 수정합니다.
+
+`repair_safe`는 `idempotent`와 같은 뜻이 아닙니다. 전자는 달라진 인자로 모델이 다시 호출해도 안전하다는 선언이고, 후자는 같은 호출을 그대로 재실행해도 안전하다는 선언입니다. 기본 Tool은 repair-safe가 아니며 `ToolFailureRecoveryConfig`도 지정하지 않으면 기존 `revise_on_tool_failure` 동작을 유지합니다.
+
+`error_mapper: Callable[[Exception], ToolError | None]`는 예상한 예외만 `RETRY_CALL`, `REPAIR_CALL`, `REPLAN`, `FAIL` 중 하나로 분류합니다. `RETRY_CALL`은 `idempotent=True`, `retryable=True`, 남은 `RetryConfig` 시도가 모두 충족될 때만 같은 호출을 다시 실행합니다. 단, 취소할 수 없는 동기 Tool timeout은 daemon 작업이 계속 실행되므로 기본적으로 재시도하지 않고 `FAIL`로 분류합니다. DB driver의 statement timeout·취소 완료를 보장하는 통합만 `timeout_retry_safe=True`를 명시할 수 있습니다. `REPAIR_CALL`은 opt-in repair, `REPLAN`은 즉시 계획 수정, `FAIL`은 terminal 실패를 요청합니다. `None`을 반환하면 generic 오류 처리로 돌아갑니다. Tool 구현이 이미 안전한 오류를 구성할 수 있다면 `raise ToolFailure(ToolError(...))`로 같은 계약을 전달할 수도 있습니다.
+
+repair 응답은 실행 전에 동일 Tool 1개, 새 call ID, 이전과 다른 canonical JSON 인자인지 검사하고, Tool validation·기본값 적용 뒤의 유효 인자 hash도 다시 비교합니다. 키 순서나 숫자 표현만 바꾸거나 같은 유효 인자를 반복하거나 다른 Tool을 선택하면 Tool 본체를 실행하지 않고 fallback합니다. 여러 Tool을 병렬 호출한 batch가 부분 성공한 경우에는 이미 발생한 side effect를 자동 재실행하지 않도록 `fallback="replan"`이어도 terminal 실패로 끝냅니다.
+
+`feedback_mode`의 기본값은 `"type_only"`이며 strict repair 요청에는 오류 type과 `reason`만 넣습니다. `"safe_message"`는 호출자가 모델 공개에 안전하다고 보증한 `ToolError.message`를 제어문자 제거·길이 제한 후 추가하며, 비밀정보를 자동 탐지하거나 redaction하는 옵션은 아닙니다. strict 실패 Tool 메시지에서는 항상 `message`와 `details`를 제외하지만, 공개 `ToolResult.model_content()`와 non-strict 경로의 호환성은 유지되므로 `error_mapper`와 `ToolFailure`에는 원본 예외, SQL, 접속 문자열, 토큰, 고객 데이터, 내부 경로·schema를 넣지 마세요. 공개 `tool_trace`와 recovery 이벤트에도 원본 오류 메시지나 Tool 결과가 포함되지 않습니다.
+
+`result.metadata["plan"]["steps"][].allowed_tools`는 해당 단계에서 호출할 수 있었던 Tool 목록이며 실제 호출 이력이 아닙니다. 0.3.1부터 실제 호출 시도는 순서가 보존된 `result.metadata["tool_trace"]`에서 확인할 수 있습니다. 기본 `tool_trace_mode="summary"`는 단계·call ID·Tool 이름·성공 여부·시도 횟수·실행 시간과 정제된 오류 분류만 남깁니다. 오류에는 `type`, `retryable`과 선택적인 `reason`, `recovery`가 들어가며, 교정 호출에는 `recovery_of_call_id`가 추가됩니다. `off`는 trace를 만들지 않고, `arguments`는 민감한 키를 재귀적으로 마스킹한 호출 인자를 추가합니다. 실행된 Tool은 validation·형 변환·기본값 적용 후 실제 인자를 `arguments_source="validated"`로 기록하고, 실행 전에 거부된 호출은 요청 인자를 `requested`로 기록합니다.
+
+Tool repair가 발생하면 `result.metadata["plan_usage"]["tool_repairs"]`에 전체 교정 횟수가 추가됩니다. 복구가 terminal 실패로 끝나면 `result.metadata["failure"]`에 정제·길이 제한된 step/Tool 식별자, 오류 분류, fallback 원인만 보존하며 원본 예외나 Tool 결과는 포함하지 않습니다.
 
 ```python
 planning_agent = Agent(

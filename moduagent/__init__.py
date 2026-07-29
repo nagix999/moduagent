@@ -18,6 +18,7 @@ from moduagent.decision import (
     StepStatus,
     StepValidation,
     StepValidator,
+    ToolFailureRecoveryConfig,
     ValidationKind,
     step_result_ref,
 )
@@ -134,15 +135,17 @@ from moduagent.tools import (
     ToolAuthorizer,
     ToolError,
     ToolErrorType,
+    ToolFailure,
     ToolExecutionContext,
     ToolExecutor,
+    ToolRecoveryAction,
     ToolRegistry,
     ToolResult,
     ToolSchema,
     function_tool,
 )
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 __all__ = [
     "__version__",
@@ -261,8 +264,11 @@ __all__ = [
     "ToolCall",
     "ToolError",
     "ToolErrorType",
+    "ToolFailure",
+    "ToolFailureRecoveryConfig",
     "ToolExecutionContext",
     "ToolExecutor",
+    "ToolRecoveryAction",
     "ToolRegistry",
     "ToolResult",
     "ToolSchema",

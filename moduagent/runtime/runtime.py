@@ -18,7 +18,7 @@ from moduagent.memory import (
     MemoryPhase,
     MemoryRequest,
 )
-from moduagent.messages import FinishReason, Message
+from moduagent.messages import FinishReason, Message, MessageRole
 from moduagent.models import ModelClient, ModelRequest, ModelResponse
 from moduagent.observability import EventSink, mask_sensitive
 from moduagent.output import OutputCodec
@@ -45,8 +45,10 @@ from moduagent.tools import (
     ToolErrorType,
     ToolExecutionContext,
     ToolExecutor,
+    ToolRecoveryAction,
     ToolResult,
 )
+from moduagent.tools.base import _TOOL_REPAIR_METADATA_KEY
 
 
 T = TypeVar("T")
@@ -84,6 +86,10 @@ _TOOL_TRACE_TEXT_CHARS = 256
 
 
 class _StrictToolCallLimitError(RuntimeError):
+    pass
+
+
+class _StrictToolResultProtocolError(RuntimeError):
     pass
 
 
@@ -264,6 +270,19 @@ class AgentRuntime:
                 configure_limits(
                     max_step_attempts=self.config.limits.max_step_attempts,
                     max_replans=self.config.limits.max_replans,
+                )
+            configure_repair_limits = getattr(
+                self.decision_policy,
+                "configure_tool_repair_limits",
+                None,
+            )
+            if strict_execution and callable(configure_repair_limits):
+                configure_repair_limits(
+                    max_tool_repair_attempts=getattr(
+                        self.config.limits,
+                        "max_tool_repair_attempts",
+                        1,
+                    )
                 )
             creating_plan = strict_execution and context.execution_state is None
             await self._within(deadline, lambda: self.decision_policy.begin(context))
@@ -782,10 +801,20 @@ class AgentRuntime:
             context.status = RunStatus.FAILED
             await self._persist_safely(context)
             await self._save_checkpoint_safely(context)
+            error_message = str(exc) or exc.__class__.__name__
+            if (
+                strict_execution
+                and isinstance(context.execution_state, ExecutionState)
+                and context.execution_state.phase is RunPhase.FAILED
+            ):
+                error_message = self._strict_failure_message(
+                    context.execution_state,
+                    error_message,
+                )
             result = self._result(
                 context,
                 FinishReason.ERROR,
-                error=str(exc) or exc.__class__.__name__,
+                error=error_message,
             )
             event = AgentEvent(EventType.RUN_FAILED, run_id, {"result": result})
             await self._publish(event)
@@ -856,7 +885,7 @@ class AgentRuntime:
                 yield completed
                 return
             if state.phase is RunPhase.FAILED:
-                raise RuntimeError("strict Plan-and-Execute execution failed")
+                raise RuntimeError(self._strict_failure_message(state))
             if state.phase is RunPhase.DONE:
                 raise RuntimeError("DONE cannot transition to another execution phase")
 
@@ -1060,14 +1089,127 @@ class AgentRuntime:
                     yield completed
                     return
                 before_replans = state.replan_count
-                await self._within(
+                was_repairing = isinstance(
+                    getattr(state, "pending_tool_failure", None),
+                    Mapping,
+                )
+                tool_decision = await self._within(
                     deadline,
                     lambda: policy.observe(context, tuple(result_box)),
                 )
                 state = context.execution_state
                 if not isinstance(state, ExecutionState):
                     raise RuntimeError("strict execution state was lost after tools")
-                if state.replan_count > before_replans:
+                if tool_decision is not None:
+                    observed = AgentEvent(
+                        EventType.POLICY_DECISION,
+                        context.run_id,
+                        {
+                            "kind": tool_decision.kind.value,
+                            "metadata": dict(tool_decision.metadata),
+                            "source": "tool_results",
+                        },
+                        visibility=EventVisibility.INTERNAL,
+                    )
+                    await self._publish(observed)
+                    yield observed
+
+                if (
+                    tool_decision is not None
+                    and tool_decision.kind is DecisionKind.RETRY_TOOL
+                ):
+                    failure = tool_decision.metadata.get("tool_failure", {})
+                    scheduled = AgentEvent(
+                        EventType.TOOL_REPAIR_SCHEDULED,
+                        context.run_id,
+                        {
+                            "step_id": step.step_id,
+                            "tool_name": failure.get("tool_name"),
+                            "failed_call_id": failure.get("call_id"),
+                            "error_type": failure.get("error_type"),
+                            "reason": failure.get("reason"),
+                            "repair_attempt": tool_decision.metadata.get(
+                                "repair_attempt"
+                            ),
+                            "max_attempts": getattr(
+                                policy,
+                                "max_tool_repair_attempts",
+                                None,
+                            ),
+                        },
+                        visibility=EventVisibility.INTERNAL,
+                    )
+                    await self._publish(scheduled)
+                    yield scheduled
+                    await self._save_checkpoint(context, deadline)
+                    continue
+
+                repair_requested = any(
+                    str(
+                        getattr(
+                            getattr(result.error, "recovery", None),
+                            "value",
+                            getattr(result.error, "recovery", ""),
+                        )
+                    )
+                    == "repair_call"
+                    for result in result_box
+                    if result.error is not None
+                )
+                if (
+                    tool_decision is not None
+                    and tool_decision.kind
+                    in {
+                        DecisionKind.REPLAN,
+                        DecisionKind.FAIL,
+                    }
+                    and (was_repairing or repair_requested)
+                ):
+                    exhausted = AgentEvent(
+                        EventType.TOOL_REPAIR_EXHAUSTED,
+                        context.run_id,
+                        {
+                            "step_id": step.step_id,
+                            "reason": tool_decision.metadata.get("reason"),
+                            "fallback": tool_decision.kind.value,
+                            "repair_attempts": getattr(
+                                state,
+                                "tool_repair_counts",
+                                {},
+                            ).get(step.step_id, 0),
+                        },
+                        visibility=EventVisibility.INTERNAL,
+                    )
+                    await self._publish(exhausted)
+                    yield exhausted
+
+                if (
+                    tool_decision is not None
+                    and tool_decision.kind is DecisionKind.FAIL
+                ):
+                    failed = AgentEvent(
+                        EventType.STEP_FAILED,
+                        context.run_id,
+                        {
+                            "step_id": step.step_id,
+                            "reason": tool_decision.metadata.get("reason"),
+                        },
+                        visibility=EventVisibility.INTERNAL,
+                    )
+                    await self._publish(failed)
+                    yield failed
+                    await self._save_checkpoint(context, deadline)
+                    raise RuntimeError(
+                        self._strict_failure_message(
+                            state,
+                            tool_decision.error_message,
+                        )
+                    )
+
+                if (
+                    tool_decision is not None
+                    and tool_decision.kind is DecisionKind.REPLAN
+                ) or state.replan_count > before_replans:
                     revised = AgentEvent(
                         EventType.PLAN_REVISED,
                         context.run_id,
@@ -1081,6 +1223,25 @@ class AgentRuntime:
                     await self._publish(revised)
                     yield revised
                     context.clear_internal_messages()
+                if state.phase is RunPhase.FAILED:
+                    failed = AgentEvent(
+                        EventType.STEP_FAILED,
+                        context.run_id,
+                        {
+                            "step_id": step.step_id,
+                            "reason": state.validation_error,
+                        },
+                        visibility=EventVisibility.INTERNAL,
+                    )
+                    await self._publish(failed)
+                    yield failed
+                    await self._save_checkpoint(context, deadline)
+                    raise RuntimeError(
+                        self._strict_failure_message(
+                            state,
+                            "Tool execution failed",
+                        )
+                    )
                 await self._save_checkpoint(context, deadline)
                 continue
 
@@ -1166,10 +1327,118 @@ class AgentRuntime:
                 continue
 
             if decision.kind is DecisionKind.FAIL:
-                raise RuntimeError(
-                    decision.error_message or "strict plan execution failed"
+                failure_message = self._strict_failure_message(
+                    state,
+                    decision.error_message,
                 )
+                failure = self._normalized_execution_failure(
+                    getattr(state, "failure", None)
+                )
+                if (
+                    failure is not None
+                    and failure.get("recovery") == "repair_call"
+                    and getattr(state, "total_tool_repairs", 0) > 0
+                ):
+                    exhausted = AgentEvent(
+                        EventType.TOOL_REPAIR_EXHAUSTED,
+                        context.run_id,
+                        {
+                            "step_id": step.step_id,
+                            "reason": failure.get("terminal_reason"),
+                            "fallback": "fail",
+                            "repair_attempts": getattr(
+                                state,
+                                "tool_repair_counts",
+                                {},
+                            ).get(step.step_id, 0),
+                        },
+                        visibility=EventVisibility.INTERNAL,
+                    )
+                    await self._publish(exhausted)
+                    yield exhausted
+                failed = AgentEvent(
+                    EventType.STEP_FAILED,
+                    context.run_id,
+                    {
+                        "step_id": step.step_id,
+                        "reason": failure_message,
+                    },
+                    visibility=EventVisibility.INTERNAL,
+                )
+                await self._publish(failed)
+                yield failed
+                await self._save_checkpoint(context, deadline)
+                raise RuntimeError(failure_message)
             raise RuntimeError(f"unsupported strict decision: {decision.kind.value}")
+
+    @classmethod
+    def _strict_failure_message(
+        cls,
+        state: ExecutionState,
+        fallback: str | None = None,
+    ) -> str:
+        failure = cls._normalized_execution_failure(getattr(state, "failure", None))
+        if failure is not None:
+            feedback = failure.get("feedback") or failure.get("message")
+            terminal_reason = failure.get("terminal_reason")
+            if feedback and terminal_reason and terminal_reason not in str(feedback):
+                return f"{feedback}; {terminal_reason}"
+            if feedback:
+                return str(feedback)
+            if terminal_reason:
+                return str(terminal_reason)
+        # validation_error may contain provider, validator, or backend details.
+        # Only an explicit public fallback or the sanitized failure contract may
+        # cross into AgentResult.error.
+        return str(fallback or "strict Plan-and-Execute execution failed")
+
+    @classmethod
+    def _normalized_execution_failure(
+        cls,
+        raw: Any,
+    ) -> dict[str, Any] | None:
+        if not isinstance(raw, Mapping):
+            return None
+        normalized: dict[str, Any] = {}
+        short_text_fields = {
+            "step_id",
+            "call_id",
+            "tool_name",
+            "error_type",
+            "reason",
+            "recovery",
+        }
+        message_fields = {
+            "feedback",
+            "fallback_reason",
+            "terminal_reason",
+            "message",
+        }
+        for key in short_text_fields:
+            value = raw.get(key)
+            if value is not None:
+                normalized[key] = cls._tool_trace_text(value)
+        for key in message_fields:
+            value = raw.get(key)
+            if value is not None:
+                text = str(value)
+                normalized[key] = text if len(text) <= 512 else f"{text[:509]}..."
+        for key in ("retryable", "repair_safe"):
+            if key in raw:
+                normalized[key] = bool(raw[key])
+        for key in (
+            "failure_count",
+            "success_count",
+            "result_count",
+            "repair_attempts",
+        ):
+            if key in raw:
+                try:
+                    count = int(raw[key])
+                except (TypeError, ValueError, OverflowError):
+                    count = 0
+                normalized[key] = min(max(count, 0), 1_000_000)
+        return normalized or None
 
     def _strict_step_messages(
         self,
@@ -1194,7 +1463,7 @@ class AgentRuntime:
             Message.system(self.config.instructions),
             Message.system(_STRICT_EXECUTOR_PROMPT),
             Message.user(self._json(payload)),
-            *context.internal_messages,
+            *self._strict_internal_messages(context, state),
         ]
         if extracting:
             feedback = (
@@ -1203,6 +1472,32 @@ class AgentRuntime:
                 else f"\nValidation feedback: {state.validation_error}"
             )
             messages.append(Message.user(f"{_STRICT_STEP_RESULT_PROMPT}{feedback}"))
+        elif isinstance(
+            getattr(state, "pending_tool_failure", None),
+            Mapping,
+        ):
+            failure = (
+                self._normalized_execution_failure(state.pending_tool_failure) or {}
+            )
+            repair_context = {
+                key: failure.get(key)
+                for key in (
+                    "tool_name",
+                    "error_type",
+                    "reason",
+                    "feedback",
+                )
+                if failure.get(key) is not None
+            }
+            messages.append(
+                Message.user(
+                    "The previous allowed Tool call failed. Call exactly the same "
+                    "Tool once with corrected arguments and a new call ID. Do not "
+                    "repeat identical arguments, select another Tool, add another "
+                    "Tool call, return a StepResult, or claim completion until the "
+                    "Tool succeeds.\n" + self._json(repair_context)
+                )
+            )
         else:
             messages.append(
                 Message.user(
@@ -1212,6 +1507,78 @@ class AgentRuntime:
                 )
             )
         return tuple(messages)
+
+    def _strict_internal_messages(
+        self,
+        context: RunContext,
+        state: ExecutionState,
+    ) -> tuple[Message, ...]:
+        """Project legacy checkpoints without replaying raw failure details."""
+
+        pending = self._normalized_execution_failure(
+            getattr(state, "pending_tool_failure", None)
+        )
+        if pending is None or not pending.get("call_id"):
+            return tuple(context.internal_messages)
+        failed_call_id = str(pending["call_id"])
+        projected: list[Message] = []
+        for message in context.internal_messages:
+            if (
+                message.role is MessageRole.TOOL
+                and message.tool_call_id == failed_call_id
+            ):
+                projected.append(
+                    Message.tool(
+                        self._strict_failure_protocol_content(pending),
+                        call_id=failed_call_id,
+                        name=message.name or str(pending.get("tool_name", "")),
+                        metadata=message.metadata,
+                    )
+                )
+            else:
+                projected.append(message)
+        return tuple(projected)
+
+    @classmethod
+    def _strict_failure_protocol_content(
+        cls,
+        failure: Mapping[str, Any],
+    ) -> str:
+        error: dict[str, Any] = {
+            "type": cls._tool_trace_text(
+                failure.get("error_type", ToolErrorType.EXECUTION_ERROR.value)
+            ),
+            "retryable": bool(failure.get("retryable", False)),
+        }
+        if failure.get("reason"):
+            error["reason"] = cls._tool_trace_text(failure["reason"])
+        if failure.get("recovery"):
+            error["recovery"] = cls._tool_trace_text(failure["recovery"])
+        return cls._json({"success": False, "error": error})
+
+    @classmethod
+    def _strict_tool_result_content(cls, result: ToolResult) -> str:
+        if result.success:
+            for method_name in ("model_content", "to_message_content"):
+                method = getattr(result, method_name, None)
+                if callable(method):
+                    return str(method())
+            return cls._json({"success": True, "value": result.value})
+        error = result.error
+        failure: dict[str, Any] = {
+            "error_type": (
+                ToolErrorType.EXECUTION_ERROR.value
+                if error is None
+                else error.type.value
+            ),
+            "retryable": bool(error.retryable) if error is not None else False,
+        }
+        if error is not None and error.reason:
+            failure["reason"] = error.reason
+        recovery = None if error is None else error.recovery
+        if recovery is not None:
+            failure["recovery"] = getattr(recovery, "value", recovery)
+        return cls._strict_failure_protocol_content(failure)
 
     @staticmethod
     def _strict_step_tool_schemas(
@@ -1302,17 +1669,34 @@ class AgentRuntime:
             await self._publish(started)
             yield started
 
+        tool_metadata: dict[str, Any] = {
+            "agent": self.config.name,
+            "active_skills": [
+                activation.to_dict() for activation in context.skill_state.active_skills
+            ],
+        }
+        state = context.execution_state
+        pending_failure = (
+            getattr(state, "pending_tool_failure", None)
+            if isinstance(state, ExecutionState)
+            else None
+        )
+        if (
+            isinstance(pending_failure, Mapping)
+            and pending_failure.get("tool_name")
+            and pending_failure.get("invocation_fingerprint")
+        ):
+            tool_metadata[_TOOL_REPAIR_METADATA_KEY] = {
+                "tool_name": str(pending_failure["tool_name"]),
+                "invocation_fingerprint": str(
+                    pending_failure["invocation_fingerprint"]
+                ),
+            }
         tool_context = ToolExecutionContext(
             run_id=context.run_id,
             session_id=context.request.session_id,
             user_context=dict(context.request.user_context),
-            metadata={
-                "agent": self.config.name,
-                "active_skills": [
-                    activation.to_dict()
-                    for activation in context.skill_state.active_skills
-                ],
-            },
+            metadata=tool_metadata,
         )
         try:
             capabilities = getattr(self.model, "capabilities", None)
@@ -1320,7 +1704,7 @@ class AgentRuntime:
                 self.config.limits.parallel_tool_calls
                 and getattr(capabilities, "parallel_tool_calling", True)
             )
-            raw_results = await asyncio.wait_for(
+            returned_results = await asyncio.wait_for(
                 self.tool_executor.execute_many(
                     calls,
                     tool_context,
@@ -1329,65 +1713,144 @@ class AgentRuntime:
                 ),
                 timeout=self._remaining(deadline),
             )
+            # Strict execution accepts only the bounded collection contract used
+            # by ToolExecutor. Materializing an arbitrary iterable here could
+            # block the event loop forever after the run timeout has expired.
+            if type(returned_results) not in (list, tuple):
+                raise _StrictToolResultProtocolError
+            if len(returned_results) != len(calls):
+                raise _StrictToolResultProtocolError
+            raw_results = tuple(returned_results)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            error_message = (
-                "tool execution timed out"
-                if isinstance(exc, asyncio.TimeoutError)
-                else (str(exc) or exc.__class__.__name__)
+        except asyncio.TimeoutError:
+            self._fail_strict_tool_calls(
+                context,
+                calls,
+                "tool execution timed out",
             )
-            self._record_internal_rejected_calls(
+            raise
+        except _StrictToolResultProtocolError as exc:
+            error_message = "tool executor returned mismatched results"
+            self._fail_strict_tool_calls(
                 context,
                 calls,
                 error_message,
             )
-            if isinstance(exc, asyncio.TimeoutError):
-                raise
+            raise RuntimeError(error_message) from exc
+        except Exception as exc:
+            self._fail_strict_tool_calls(
+                context,
+                calls,
+                "tool execution failed",
+            )
             raise RuntimeError("tool execution failed") from exc
+
+        if any(
+            not isinstance(result, ToolResult)
+            or type(result.call_id) is not str
+            or type(result.tool_name) is not str
+            or result.call_id != call.id
+            or result.tool_name != call.name
+            or type(result.success) is not bool
+            or (result.success and result.error is not None)
+            or (not result.success and not isinstance(result.error, ToolError))
+            or type(result.attempts) is not int
+            or result.attempts < 0
+            or type(result.duration_seconds) not in (int, float)
+            or not math.isfinite(result.duration_seconds)
+            or result.duration_seconds < 0
+            or type(result.repair_safe) is not bool
+            or (
+                result.invocation_arguments is not None
+                and type(result.invocation_arguments) is not dict
+            )
+            or (
+                result.error is not None
+                and (
+                    type(result.error.type) is not ToolErrorType
+                    or type(result.error.message) is not str
+                    or type(result.error.retryable) is not bool
+                    or type(result.error.details) is not dict
+                    or (
+                        result.error.reason is not None
+                        and type(result.error.reason) is not str
+                    )
+                    or (
+                        result.error.recovery is not None
+                        and type(result.error.recovery) is not ToolRecoveryAction
+                    )
+                )
+            )
+            for call, result in zip(calls, raw_results)
+        ):
+            error_message = "tool executor returned mismatched results"
+            self._fail_strict_tool_calls(
+                context,
+                calls,
+                error_message,
+            )
+            raise RuntimeError(error_message)
 
         effective: list[ToolResult] = []
         for call, raw_result in zip(calls, raw_results):
-            result = raw_result
-            is_skill_resource = call.name in SKILL_RESOURCE_TOOL_NAMES
-            if is_skill_resource and result.success and self.skill_runtime is not None:
-                added_tokens = self._resource_tokens(result.value)
-                next_resource_tokens = (
-                    context.skill_state.resource_tokens + added_tokens
-                )
-                total_skill_tokens = (
-                    context.skill_state.instruction_tokens + next_resource_tokens
-                )
+            try:
+                result = raw_result
+                is_skill_resource = call.name in SKILL_RESOURCE_TOOL_NAMES
                 if (
-                    next_resource_tokens > self.skill_runtime.limits.max_resource_tokens
-                    or total_skill_tokens
-                    > self.skill_runtime.limits.max_total_skill_tokens
+                    is_skill_resource
+                    and result.success
+                    and self.skill_runtime is not None
                 ):
-                    result = ToolResult.failed(
+                    added_tokens = self._resource_tokens(result.value)
+                    next_resource_tokens = (
+                        context.skill_state.resource_tokens + added_tokens
+                    )
+                    total_skill_tokens = (
+                        context.skill_state.instruction_tokens + next_resource_tokens
+                    )
+                    if (
+                        next_resource_tokens
+                        > self.skill_runtime.limits.max_resource_tokens
+                        or total_skill_tokens
+                        > self.skill_runtime.limits.max_total_skill_tokens
+                    ):
+                        result = ToolResult.failed(
+                            call_id=call.id,
+                            tool_name=call.name,
+                            error=ToolError(
+                                ToolErrorType.RESULT_TOO_LARGE,
+                                "Skill resource token budget exceeded",
+                            ),
+                            attempts=result.attempts,
+                            duration_seconds=result.duration_seconds,
+                        )
+                    else:
+                        context.skill_state = replace(
+                            context.skill_state,
+                            resource_tokens=next_resource_tokens,
+                        )
+                content = self._strict_tool_result_content(result)
+                self._record_tool_trace(context, call, result)
+                context.add_internal_message(
+                    Message.tool(
+                        content,
                         call_id=call.id,
-                        tool_name=call.name,
-                        error=ToolError(
-                            ToolErrorType.RESULT_TOO_LARGE,
-                            "Skill resource token budget exceeded",
-                        ),
-                        attempts=result.attempts,
-                        duration_seconds=result.duration_seconds,
+                        name=call.name,
+                        metadata={"moduagent.ephemeral": True},
                     )
-                else:
-                    context.skill_state = replace(
-                        context.skill_state,
-                        resource_tokens=next_resource_tokens,
-                    )
-            effective.append(result)
-            self._record_tool_trace(context, call, result)
-            context.add_internal_message(
-                Message.tool(
-                    self._tool_result_content(result),
-                    call_id=call.id,
-                    name=call.name,
-                    metadata={"moduagent.ephemeral": True},
                 )
-            )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                error_message = "tool executor returned mismatched results"
+                self._fail_strict_tool_calls(
+                    context,
+                    calls,
+                    error_message,
+                )
+                raise RuntimeError(error_message) from exc
+            effective.append(result)
             completed = AgentEvent(
                 EventType.TOOL_COMPLETED,
                 context.run_id,
@@ -1612,6 +2075,23 @@ class AgentRuntime:
         await self._publish(completed)
         yield completed
 
+    def _fail_strict_tool_calls(
+        self,
+        context: RunContext,
+        calls: tuple[Any, ...],
+        error_message: str,
+    ) -> None:
+        state = context.execution_state
+        if isinstance(state, ExecutionState):
+            state.validation_error = error_message
+            state.fail_current_step()
+            self._sync_execution_state(context, state)
+        self._record_internal_rejected_calls(
+            context,
+            calls,
+            error_message,
+        )
+
     def _record_internal_rejected_calls(
         self,
         context: RunContext,
@@ -1663,6 +2143,7 @@ class AgentRuntime:
         state = context.execution_state
         step_id = state.current_step_id if isinstance(state, ExecutionState) else None
         error = result.error
+        recovery = getattr(error, "recovery", None) if error is not None else None
         entry: dict[str, Any] = {
             "step_id": step_id,
             "call_id": str(call.id),
@@ -1676,9 +2157,24 @@ class AgentRuntime:
                 else {
                     "type": error.type.value,
                     "retryable": bool(error.retryable),
+                    **(
+                        {"reason": str(error.reason)}
+                        if getattr(error, "reason", None)
+                        else {}
+                    ),
+                    **(
+                        {"recovery": str(getattr(recovery, "value", recovery))}
+                        if recovery is not None
+                        else {}
+                    ),
                 }
             ),
         }
+        pending_failure = getattr(state, "pending_tool_failure", None)
+        if isinstance(pending_failure, Mapping):
+            recovery_of_call_id = pending_failure.get("call_id")
+            if recovery_of_call_id:
+                entry["recovery_of_call_id"] = str(recovery_of_call_id)
         if self.config.tool_trace_mode == "arguments":
             invocation_arguments = getattr(result, "invocation_arguments", None)
             entry["arguments"] = (
@@ -1759,6 +2255,10 @@ class AgentRuntime:
                 ),
                 "retryable": bool(raw_error.get("retryable", False)),
             }
+            if raw_error.get("reason"):
+                error["reason"] = self._tool_trace_text(raw_error["reason"])
+            if raw_error.get("recovery"):
+                error["recovery"] = self._tool_trace_text(raw_error["recovery"])
         raw_step_id = raw_entry.get("step_id")
         entry: dict[str, Any] = {
             "step_id": (
@@ -1771,6 +2271,10 @@ class AgentRuntime:
             "duration_seconds": duration,
             "error": error,
         }
+        if raw_entry.get("recovery_of_call_id"):
+            entry["recovery_of_call_id"] = self._tool_trace_text(
+                raw_entry["recovery_of_call_id"]
+            )
         if self.config.tool_trace_mode == "arguments":
             raw_arguments = raw_entry.get("arguments")
             if isinstance(raw_arguments, Mapping):
@@ -2287,6 +2791,14 @@ class AgentRuntime:
                 "replans": state.replan_count,
                 "finalization_calls": state.finalization_count,
             }
+            total_tool_repairs = int(getattr(state, "total_tool_repairs", 0) or 0)
+            if total_tool_repairs:
+                metadata["plan_usage"]["tool_repairs"] = total_tool_repairs
+            failure = self._normalized_execution_failure(
+                getattr(state, "failure", None)
+            )
+            if failure is not None:
+                metadata["failure"] = mask_sensitive(failure)
         tool_trace = self._normalized_tool_trace(
             context.metadata.get(_TOOL_TRACE_METADATA_KEY)
         )

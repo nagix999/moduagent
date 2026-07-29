@@ -10,8 +10,9 @@ from typing import TYPE_CHECKING, Any, Literal, Mapping, Protocol, Sequence
 from pydantic import BaseModel, ConfigDict, Field
 
 from moduagent.decision.base import DecisionKind, ExecutionDecision
-from moduagent.messages import Message
+from moduagent.messages import Message, ToolCall
 from moduagent.models import ModelClient, ModelRequest, ModelResponse
+from moduagent.tools.base import ToolRecoveryAction, _tool_arguments_fingerprint
 
 if TYPE_CHECKING:
     from moduagent.runtime.context import RunContext
@@ -45,6 +46,16 @@ StepStatus = PlanStepStatus
 def _stable_step_id(objective: str) -> str:
     digest = hashlib.sha256(objective.encode("utf-8")).hexdigest()[:12]
     return f"step-{digest}"
+
+
+def _is_tool_arguments_fingerprint(value: Any) -> bool:
+    text = str(value)
+    digest = text.removeprefix("sha256:")
+    return (
+        text.startswith("sha256:")
+        and len(digest) == 64
+        and all(character in "0123456789abcdef" for character in digest)
+    )
 
 
 def _string_list(value: Sequence[str], field_name: str) -> list[str]:
@@ -231,6 +242,28 @@ class StepValidation:
             unmet_criteria=tuple(str(item) for item in value.get("unmet_criteria", ())),
             metadata=dict(value.get("metadata", {})),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ToolFailureRecoveryConfig:
+    """Opt-in policy for repairing a failed Tool call inside the current step.
+
+    Omitting this configuration preserves the original strict 0.3 behavior:
+    Tool failures either revise the plan or fail the run according to
+    ``revise_on_tool_failure``.
+    """
+
+    fallback: Literal["replan", "fail"] = "replan"
+    require_repair_safe: bool = True
+    feedback_mode: Literal["type_only", "safe_message"] = "type_only"
+
+    def __post_init__(self) -> None:
+        if self.fallback not in {"replan", "fail"}:
+            raise ValueError("fallback must be 'replan' or 'fail'")
+        if not isinstance(self.require_repair_safe, bool):
+            raise TypeError("require_repair_safe must be a bool")
+        if self.feedback_mode not in {"type_only", "safe_message"}:
+            raise ValueError("feedback_mode must be 'type_only' or 'safe_message'")
 
 
 class StepValidator:
@@ -457,13 +490,88 @@ class ExecutionState:
     final_response: str | None = None
     final_persisted: bool = False
     final_emitted: bool = False
+    # Appended fields keep old positional construction and v3 checkpoint reads
+    # compatible while making Tool repair budgets durable across resume.
+    tool_repair_counts: dict[str, int] = field(default_factory=dict)
+    pending_tool_failure: dict[str, Any] | None = None
+    total_tool_repairs: int = 0
+    failure: dict[str, Any] | None = None
+    # Only names and one-way argument hashes are checkpointed. Raw Tool
+    # arguments remain in the provider transcript and are never duplicated here.
+    active_tool_calls: dict[str, dict[str, str]] = field(default_factory=dict)
+    seen_tool_call_ids: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.replan_count < 0:
             raise ValueError("replan_count cannot be negative")
         if self.finalization_count < 0:
             raise ValueError("finalization_count cannot be negative")
+        if self.total_tool_repairs < 0:
+            raise ValueError("total_tool_repairs cannot be negative")
         self.committed_results = dict(self.committed_results)
+        if not isinstance(self.tool_repair_counts, Mapping):
+            raise TypeError("tool_repair_counts must be a mapping")
+        repair_counts = {
+            str(step_id): int(count)
+            for step_id, count in self.tool_repair_counts.items()
+        }
+        if any(count < 0 for count in repair_counts.values()):
+            raise ValueError("tool repair counts cannot be negative")
+        self.tool_repair_counts = repair_counts
+        if self.pending_tool_failure is not None:
+            if not isinstance(self.pending_tool_failure, Mapping):
+                raise TypeError("pending_tool_failure must be a mapping")
+            self.pending_tool_failure = dict(self.pending_tool_failure)
+            for field_name in (
+                "arguments_fingerprint",
+                "invocation_fingerprint",
+            ):
+                fingerprint = self.pending_tool_failure.get(field_name)
+                if fingerprint is not None and not _is_tool_arguments_fingerprint(
+                    fingerprint
+                ):
+                    raise ValueError(
+                        f"pending Tool failure {field_name} must use sha256"
+                    )
+        if self.failure is not None:
+            if not isinstance(self.failure, Mapping):
+                raise TypeError("failure must be a mapping")
+            self.failure = dict(self.failure)
+        if not isinstance(self.active_tool_calls, Mapping):
+            raise TypeError("active_tool_calls must be a mapping")
+        active_tool_calls: dict[str, dict[str, str]] = {}
+        for call_id, raw_call in self.active_tool_calls.items():
+            if not isinstance(raw_call, Mapping):
+                raise TypeError("active_tool_calls values must be mappings")
+            normalized_call_id = str(call_id).strip()
+            tool_name = str(raw_call.get("tool_name", "")).strip()
+            fingerprint = str(raw_call.get("arguments_fingerprint", "")).strip()
+            if not normalized_call_id or not tool_name:
+                raise ValueError("active Tool call identity cannot be empty")
+            if not _is_tool_arguments_fingerprint(fingerprint):
+                raise ValueError(
+                    "active Tool call arguments_fingerprint must use sha256"
+                )
+            active_tool_calls[normalized_call_id] = {
+                "tool_name": tool_name,
+                "arguments_fingerprint": fingerprint,
+            }
+        self.active_tool_calls = active_tool_calls
+        if isinstance(self.seen_tool_call_ids, (str, bytes)) or not isinstance(
+            self.seen_tool_call_ids,
+            Sequence,
+        ):
+            raise TypeError("seen_tool_call_ids must be an array")
+        seen_tool_call_ids = [
+            str(call_id).strip() for call_id in self.seen_tool_call_ids
+        ]
+        if not all(seen_tool_call_ids):
+            raise ValueError("seen Tool call IDs cannot be empty")
+        if len(set(seen_tool_call_ids)) != len(seen_tool_call_ids):
+            raise ValueError("seen Tool call IDs cannot contain duplicates")
+        if not set(active_tool_calls).issubset(seen_tool_call_ids):
+            raise ValueError("active Tool call IDs must be present in seen IDs")
+        self.seen_tool_call_ids = seen_tool_call_ids
         if self.current_step_id is None and self.plan.current is not None:
             self.current_step_id = self.plan.current.step_id
         steps_by_id = {step.step_id: step for step in self.plan.steps}
@@ -514,6 +622,8 @@ class ExecutionState:
         self.current_step_id = None if step is None else step.step_id
         self.pending_step_result = None
         self.validation_error = None
+        self.pending_tool_failure = None
+        self.active_tool_calls = {}
         # With no tools, ACT can be a schema-only request immediately. With
         # tools, the first turn must remain tool-only for vLLM compatibility.
         self.awaiting_step_result = not has_tools
@@ -552,6 +662,7 @@ class ExecutionState:
             PlanStepStatus.SKIPPED,
         }:
             step.status = PlanStepStatus.FAILED
+        self.active_tool_calls = {}
         self.phase = RunPhase.FAILED
         return step
 
@@ -563,6 +674,9 @@ class ExecutionState:
         self.committed_results[result.step_id] = result
         self.pending_step_result = None
         self.validation_error = None
+        self.pending_tool_failure = None
+        self.failure = None
+        self.active_tool_calls = {}
         self.awaiting_step_result = False
         self.current_step_id = (
             None if self.plan.current is None else self.plan.current.step_id
@@ -615,6 +729,18 @@ class ExecutionState:
             "final_response": self.final_response,
             "final_persisted": self.final_persisted,
             "final_emitted": self.final_emitted,
+            "tool_repair_counts": dict(self.tool_repair_counts),
+            "pending_tool_failure": (
+                None
+                if self.pending_tool_failure is None
+                else dict(self.pending_tool_failure)
+            ),
+            "total_tool_repairs": self.total_tool_repairs,
+            "failure": None if self.failure is None else dict(self.failure),
+            "active_tool_calls": {
+                call_id: dict(call) for call_id, call in self.active_tool_calls.items()
+            },
+            "seen_tool_call_ids": list(self.seen_tool_call_ids),
         }
 
     @classmethod
@@ -625,6 +751,26 @@ class ExecutionState:
         if not isinstance(raw_results, Mapping):
             raise ValueError("committed_results must be an object")
         raw_pending = value.get("pending_step_result")
+        raw_repair_counts = value.get("tool_repair_counts", {})
+        if not isinstance(raw_repair_counts, Mapping):
+            raise ValueError("tool_repair_counts must be an object")
+        raw_tool_failure = value.get("pending_tool_failure")
+        if raw_tool_failure is not None and not isinstance(raw_tool_failure, Mapping):
+            raise ValueError("pending_tool_failure must be an object")
+        raw_failure = value.get("failure")
+        if raw_failure is not None and not isinstance(raw_failure, Mapping):
+            raise ValueError("failure must be an object")
+        raw_active_calls = value.get("active_tool_calls", {})
+        if not isinstance(raw_active_calls, Mapping):
+            raise ValueError("active_tool_calls must be an object")
+        if any(not isinstance(call, Mapping) for call in raw_active_calls.values()):
+            raise ValueError("active_tool_calls values must be objects")
+        raw_seen_call_ids = value.get("seen_tool_call_ids", ())
+        if isinstance(raw_seen_call_ids, (str, bytes)) or not isinstance(
+            raw_seen_call_ids,
+            Sequence,
+        ):
+            raise ValueError("seen_tool_call_ids must be an array")
         return cls(
             phase=RunPhase(value.get("phase", RunPhase.PLAN.value)),
             plan=Plan.from_dict(value.get("plan", {})),
@@ -655,6 +801,18 @@ class ExecutionState:
             ),
             final_persisted=bool(value.get("final_persisted", False)),
             final_emitted=bool(value.get("final_emitted", False)),
+            tool_repair_counts={
+                str(step_id): int(count) for step_id, count in raw_repair_counts.items()
+            },
+            pending_tool_failure=(
+                None if raw_tool_failure is None else dict(raw_tool_failure)
+            ),
+            total_tool_repairs=int(value.get("total_tool_repairs", 0)),
+            failure=None if raw_failure is None else dict(raw_failure),
+            active_tool_calls={
+                str(call_id): dict(call) for call_id, call in raw_active_calls.items()
+            },
+            seen_tool_call_ids=[str(call_id) for call_id in raw_seen_call_ids],
         )
 
 
@@ -981,6 +1139,7 @@ class PlanAndExecutePolicy:
         revise_on_tool_failure: bool = True,
         max_step_attempts: int | None = None,
         max_replans: int | None = None,
+        tool_failure_recovery: ToolFailureRecoveryConfig | None = None,
     ) -> None:
         if max_step_attempts is not None and max_step_attempts < 1:
             raise ValueError("max_step_attempts must be at least 1")
@@ -989,23 +1148,28 @@ class PlanAndExecutePolicy:
         self.plan_generator = plan_generator
         self.step_validator = step_validator or StepValidator()
         self.revise_on_tool_failure = revise_on_tool_failure
+        self.tool_failure_recovery = tool_failure_recovery
         self._max_step_attempts_override = max_step_attempts
         self._max_replans_override = max_replans
         # Safe standalone defaults; AgentRuntime calls configure_limits() with
         # RunLimits before begin().
         self.max_step_attempts = max_step_attempts or 2
         self.max_replans = 2 if max_replans is None else max_replans
+        self.max_tool_repair_attempts = 1
 
     def configure_limits(
         self,
         *,
         max_step_attempts: int,
         max_replans: int,
+        max_tool_repair_attempts: int | None = None,
     ) -> None:
         if max_step_attempts < 1:
             raise ValueError("max_step_attempts must be at least 1")
         if max_replans < 0:
             raise ValueError("max_replans cannot be negative")
+        if max_tool_repair_attempts is not None and max_tool_repair_attempts < 0:
+            raise ValueError("max_tool_repair_attempts cannot be negative")
         self.max_step_attempts = (
             max_step_attempts
             if self._max_step_attempts_override is None
@@ -1016,6 +1180,19 @@ class PlanAndExecutePolicy:
             if self._max_replans_override is None
             else min(max_replans, self._max_replans_override)
         )
+        if max_tool_repair_attempts is not None:
+            self.max_tool_repair_attempts = max_tool_repair_attempts
+
+    def configure_tool_repair_limits(
+        self,
+        *,
+        max_tool_repair_attempts: int,
+    ) -> None:
+        """Configure the additive repair budget without widening old hooks."""
+
+        if max_tool_repair_attempts < 0:
+            raise ValueError("max_tool_repair_attempts cannot be negative")
+        self.max_tool_repair_attempts = max_tool_repair_attempts
 
     async def begin(self, context: RunContext) -> None:
         state = getattr(context, "execution_state", None)
@@ -1101,8 +1278,55 @@ class PlanAndExecutePolicy:
                 ),
             )
         )
-        messages.extend(tuple(getattr(context, "internal_messages", ())))
+        internal_messages = tuple(getattr(context, "internal_messages", ()))
+        if state.pending_tool_failure is not None:
+            internal_messages = self._project_repair_internal_messages(
+                internal_messages,
+                state.pending_tool_failure,
+            )
+        messages.extend(internal_messages)
         return tuple(messages)
+
+    @staticmethod
+    def _project_repair_internal_messages(
+        messages: Sequence[Message],
+        pending: Mapping[str, Any],
+    ) -> tuple[Message, ...]:
+        failed_call_id = str(pending.get("call_id", ""))
+        if not failed_call_id:
+            return tuple(messages)
+        error: dict[str, Any] = {
+            "type": str(
+                pending.get(
+                    "error_type",
+                    "execution_error",
+                )
+            ),
+            "retryable": bool(pending.get("retryable", False)),
+        }
+        if pending.get("reason"):
+            error["reason"] = str(pending["reason"])
+        if pending.get("recovery"):
+            error["recovery"] = str(pending["recovery"])
+        content = json.dumps(
+            {"success": False, "error": error},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        projected: list[Message] = []
+        for message in messages:
+            if message.role.value == "tool" and message.tool_call_id == failed_call_id:
+                projected.append(
+                    Message.tool(
+                        content,
+                        call_id=failed_call_id,
+                        name=message.name or str(pending.get("tool_name", "")),
+                        metadata=message.metadata,
+                    )
+                )
+            else:
+                projected.append(message)
+        return tuple(projected)
 
     def act_tool_names(self, context: RunContext) -> frozenset[str] | None:
         step = self._state(context).current_step
@@ -1129,13 +1353,19 @@ class PlanAndExecutePolicy:
         # Providers can surface a partial tool call together with an incomplete
         # finish reason. Never authorize side effects from such a response.
         if finish_reason in {"timeout", "length", "max_tokens"}:
+            if state.pending_tool_failure is not None:
+                return await self._fallback_tool_failure(
+                    context,
+                    state,
+                    f"incomplete tool repair response ({finish_reason})",
+                )
             return self._retry_invalid_result(
                 context,
                 state,
                 f"incomplete StepResult response ({finish_reason})",
             )
 
-        tool_calls = response.tool_calls or response.message.tool_calls
+        tool_calls = tuple(response.tool_calls or response.message.tool_calls)
         if tool_calls:
             if state.awaiting_step_result:
                 state.fail_current_step()
@@ -1148,6 +1378,36 @@ class PlanAndExecutePolicy:
                     error_message=state.validation_error,
                     metadata=self._metadata(state),
                 )
+            call_records, call_error = self._tool_call_records(
+                state,
+                tool_calls,
+            )
+            if call_error is not None:
+                if state.pending_tool_failure is not None:
+                    return await self._fallback_tool_failure(
+                        context,
+                        state,
+                        call_error,
+                    )
+                return self._retry_invalid_result(
+                    context,
+                    state,
+                    call_error,
+                )
+            if state.pending_tool_failure is not None:
+                repair_error = self._repair_tool_call_error(
+                    state.pending_tool_failure,
+                    tool_calls,
+                    call_records,
+                )
+                if repair_error is not None:
+                    return await self._fallback_tool_failure(
+                        context,
+                        state,
+                        repair_error,
+                    )
+            state.active_tool_calls = call_records
+            state.seen_tool_call_ids.extend(call_records)
             state.mark_tool_round_complete()
             self._sync(context, state)
             return ExecutionDecision(
@@ -1157,6 +1417,13 @@ class PlanAndExecutePolicy:
                     **self._metadata(state),
                     "requires_step_result": True,
                 },
+            )
+
+        if state.pending_tool_failure is not None:
+            return await self._fallback_tool_failure(
+                context,
+                state,
+                "tool repair response did not call a tool",
             )
 
         # A tool-enabled ACT turn that did not call a tool is not evidence of
@@ -1207,6 +1474,58 @@ class PlanAndExecutePolicy:
 
         state.set_pending_result(result)
         return await self.validate_pending(context)
+
+    @staticmethod
+    def _tool_call_records(
+        state: ExecutionState,
+        calls: Sequence[ToolCall],
+    ) -> tuple[dict[str, dict[str, str]], str | None]:
+        records: dict[str, dict[str, str]] = {}
+        seen = set(state.seen_tool_call_ids)
+        for call in calls:
+            call_id = str(call.id).strip()
+            tool_name = str(call.name).strip()
+            if not call_id or not tool_name:
+                return {}, "Tool call ID and name cannot be empty"
+            if len(call_id) > 256 or len(tool_name) > 256:
+                return {}, "Tool call ID or name exceeds the protocol limit"
+            if call_id in seen or call_id in records:
+                return {}, "Tool calls must use a new unique call ID"
+            try:
+                fingerprint = _tool_arguments_fingerprint(call.arguments)
+            except ValueError:
+                return {}, "Tool call arguments must be canonical JSON"
+            records[call_id] = {
+                "tool_name": tool_name,
+                "arguments_fingerprint": fingerprint,
+            }
+        return records, None
+
+    @staticmethod
+    def _repair_tool_call_error(
+        pending: Mapping[str, Any],
+        calls: Sequence[ToolCall],
+        records: Mapping[str, Mapping[str, str]],
+    ) -> str | None:
+        if len(calls) != 1 or len(records) != 1:
+            return "Tool repair must contain exactly one call"
+        call = calls[0]
+        failed_tool = str(pending.get("tool_name", ""))
+        if call.name != failed_tool:
+            return "Tool repair must call the same Tool"
+        failed_call_id = str(pending.get("call_id", ""))
+        if call.id == failed_call_id:
+            return "Tool repair must use a new call ID"
+        previous_fingerprint = str(pending.get("arguments_fingerprint", ""))
+        current_fingerprint = next(iter(records.values())).get(
+            "arguments_fingerprint",
+            "",
+        )
+        if not previous_fingerprint:
+            return "Tool repair cannot verify the failed call arguments"
+        if current_fingerprint == previous_fingerprint:
+            return "Tool repair must change the Tool arguments"
+        return None
 
     async def validate_pending(
         self,
@@ -1273,19 +1592,111 @@ class PlanAndExecutePolicy:
             },
         )
 
-    async def observe(self, context: RunContext, results: Sequence[ToolResult]) -> None:
+    async def observe(
+        self,
+        context: RunContext,
+        results: Sequence[ToolResult],
+    ) -> ExecutionDecision | None:
         failures = [result for result in results if not result.success]
         state = self._state(context)
         if not failures:
             # A tool round-trip never consumes a step attempt. The next turn is
             # the schema-only StepResult extraction established by decide().
+            state.pending_tool_failure = None
+            state.failure = None
+            state.validation_error = None
+            state.active_tool_calls = {}
             state.awaiting_step_result = True
             self._sync(context, state)
             return
+
+        recovery = self.tool_failure_recovery
+        if recovery is not None:
+            # A mixed batch may already contain successful side effects. Do not
+            # let an argument-repair turn accidentally repeat those calls.
+            candidate = (
+                failures[0] if len(failures) == 1 and len(results) == 1 else None
+            )
+            fallback_override: Literal["replan", "fail"] | None = None
+            fallback_reason: str
+            partial_success = len(failures) < len(results)
+            if partial_success:
+                # At least one call may already have produced a side effect. A
+                # non-transactional batch cannot be replayed or replanned safely.
+                fallback_override = "fail"
+                fallback_reason = (
+                    "Tool batch partially succeeded; automatic recovery is unsafe"
+                )
+            elif candidate is not None:
+                action = self._tool_recovery_action(candidate)
+                if action is ToolRecoveryAction.REPAIR_CALL:
+                    if self._can_repair_tool_failure(
+                        state,
+                        candidate,
+                        recovery,
+                    ):
+                        return self._schedule_tool_repair(
+                            context,
+                            state,
+                            candidate,
+                            recovery,
+                        )
+                    fallback_reason = (
+                        "tool repair budget exhausted"
+                        if self._repair_count(state) >= self.max_tool_repair_attempts
+                        else "tool failure is not safe for same-step repair"
+                    )
+                elif action is ToolRecoveryAction.FAIL:
+                    fallback_override = "fail"
+                    fallback_reason = "tool recovery action requires failure"
+                elif action is ToolRecoveryAction.REPLAN:
+                    fallback_override = "replan"
+                    fallback_reason = "tool recovery action requires replanning"
+                elif action is ToolRecoveryAction.RETRY_CALL:
+                    # ToolExecutor owns same-argument retries. A failed result
+                    # reaching the policy means that retry budget was consumed.
+                    fallback_reason = "tool retry attempts exhausted"
+                else:
+                    fallback_reason = "tool failure has no recovery action"
+            else:
+                actions = {
+                    action
+                    for failure in failures
+                    if (action := self._tool_recovery_action(failure)) is not None
+                }
+                if ToolRecoveryAction.FAIL in actions:
+                    fallback_override = "fail"
+                    fallback_reason = "tool recovery action requires failure"
+                elif ToolRecoveryAction.REPLAN in actions:
+                    fallback_override = "replan"
+                    fallback_reason = "tool recovery action requires replanning"
+                else:
+                    fallback_reason = (
+                        "tool batches with multiple results cannot be repaired "
+                        "in the same step"
+                    )
+
+            primary = failures[0]
+            payload = self._tool_failure_payload(state, primary, recovery)
+            if len(failures) > 1:
+                payload["failure_count"] = len(failures)
+            if partial_success:
+                payload["success_count"] = len(results) - len(failures)
+                payload["result_count"] = len(results)
+            state.pending_tool_failure = payload
+            return await self._fallback_tool_failure(
+                context,
+                state,
+                fallback_reason,
+                fallback=fallback_override,
+            )
+
+        # No recovery configuration means legacy 0.3 behavior.
         feedback = "; ".join(
             result.error.message if result.error else "tool failed"
             for result in failures
         )
+        state.active_tool_calls = {}
         if not self.revise_on_tool_failure:
             state.validation_error = "tool execution failed"
             state.fail_current_step()
@@ -1297,6 +1708,239 @@ class PlanAndExecutePolicy:
             self._sync(context, state)
             return
         await self._apply_replan(context, state, feedback)
+        return None
+
+    @staticmethod
+    def _enum_value(value: Any) -> str | None:
+        if value is None:
+            return None
+        raw = getattr(value, "value", value)
+        text = str(raw).strip()
+        return text or None
+
+    @classmethod
+    def _tool_recovery_action(cls, result: ToolResult) -> ToolRecoveryAction | None:
+        error = result.error
+        raw = None if error is None else getattr(error, "recovery", None)
+        if isinstance(raw, ToolRecoveryAction):
+            return raw
+        value = cls._enum_value(raw)
+        if value is None:
+            return None
+        try:
+            return ToolRecoveryAction(value)
+        except ValueError:
+            return None
+
+    @classmethod
+    def _is_repair_call(cls, result: ToolResult) -> bool:
+        return cls._tool_recovery_action(result) is ToolRecoveryAction.REPAIR_CALL
+
+    @staticmethod
+    def _sanitize_tool_failure_message(message: Any, *, limit: int = 512) -> str:
+        text = "".join(
+            character if character.isprintable() else " " for character in str(message)
+        )
+        text = " ".join(text.split())
+        if len(text) <= limit:
+            return text
+        return f"{text[: limit - 3]}..."
+
+    def _repair_count(self, state: ExecutionState) -> int:
+        step = state.current_step
+        if step is None:
+            return self.max_tool_repair_attempts
+        return state.tool_repair_counts.get(step.step_id, 0)
+
+    def _can_repair_tool_failure(
+        self,
+        state: ExecutionState,
+        result: ToolResult,
+        recovery: ToolFailureRecoveryConfig,
+    ) -> bool:
+        if state.current_step is None or not self._is_repair_call(result):
+            return False
+        if recovery.require_repair_safe and not bool(
+            getattr(result, "repair_safe", False)
+        ):
+            return False
+        active_call = state.active_tool_calls.get(result.call_id)
+        if (
+            not isinstance(active_call, Mapping)
+            or active_call.get("tool_name") != result.tool_name
+            or not active_call.get("arguments_fingerprint")
+        ):
+            return False
+        return self._repair_count(state) < self.max_tool_repair_attempts
+
+    def _tool_failure_payload(
+        self,
+        state: ExecutionState,
+        result: ToolResult,
+        recovery: ToolFailureRecoveryConfig,
+    ) -> dict[str, Any]:
+        error = result.error
+        error_type = (
+            None if error is None else self._enum_value(getattr(error, "type", None))
+        )
+        reason = (
+            None if error is None else self._enum_value(getattr(error, "reason", None))
+        )
+        recovery_action = self._tool_recovery_action(result)
+        error_type = (
+            None
+            if error_type is None
+            else self._sanitize_tool_failure_message(error_type, limit=256)
+        )
+        reason = (
+            None
+            if reason is None
+            else self._sanitize_tool_failure_message(reason, limit=256)
+        )
+        recovery_name = self._enum_value(recovery_action)
+        recovery_name = (
+            None
+            if recovery_name is None
+            else self._sanitize_tool_failure_message(recovery_name, limit=256)
+        )
+        tool_name = self._sanitize_tool_failure_message(result.tool_name, limit=256)
+        label = reason or error_type or "tool_failure"
+        feedback = f"Tool {tool_name} failed ({label})"
+        if (
+            recovery.feedback_mode == "safe_message"
+            and recovery_action is ToolRecoveryAction.REPAIR_CALL
+            and error is not None
+        ):
+            message = self._sanitize_tool_failure_message(error.message)
+            if message:
+                feedback = f"{feedback}: {message}"
+        step = state.current_step
+        payload = {
+            "step_id": (
+                None
+                if step is None
+                else self._sanitize_tool_failure_message(step.step_id, limit=256)
+            ),
+            "call_id": self._sanitize_tool_failure_message(
+                result.call_id,
+                limit=256,
+            ),
+            "tool_name": tool_name,
+            "error_type": error_type,
+            "reason": reason,
+            "recovery": recovery_name,
+            "retryable": bool(error.retryable) if error is not None else False,
+            "repair_safe": bool(getattr(result, "repair_safe", False)),
+            "feedback": self._sanitize_tool_failure_message(feedback, limit=512),
+        }
+        active_call = state.active_tool_calls.get(result.call_id)
+        if (
+            isinstance(active_call, Mapping)
+            and active_call.get("tool_name") == result.tool_name
+            and active_call.get("arguments_fingerprint")
+        ):
+            payload["arguments_fingerprint"] = str(active_call["arguments_fingerprint"])
+            invocation_arguments = getattr(result, "invocation_arguments", None)
+            payload["invocation_fingerprint"] = (
+                _tool_arguments_fingerprint(invocation_arguments)
+                if isinstance(invocation_arguments, Mapping)
+                else str(active_call["arguments_fingerprint"])
+            )
+        return payload
+
+    def _schedule_tool_repair(
+        self,
+        context: RunContext,
+        state: ExecutionState,
+        result: ToolResult,
+        recovery: ToolFailureRecoveryConfig,
+    ) -> ExecutionDecision:
+        payload = self._tool_failure_payload(state, result, recovery)
+        step = state.current_step
+        if step is None:
+            raise RuntimeError("cannot repair a Tool failure without a current step")
+        repair_count = state.tool_repair_counts.get(step.step_id, 0) + 1
+        state.tool_repair_counts[step.step_id] = repair_count
+        state.total_tool_repairs += 1
+        state.pending_tool_failure = payload
+        state.failure = None
+        state.active_tool_calls = {}
+        state.pending_step_result = None
+        state.validation_error = str(payload["feedback"])
+        state.awaiting_step_result = False
+        state.phase = RunPhase.ACT
+        self._sync(context, state)
+        return ExecutionDecision(
+            DecisionKind.RETRY_TOOL,
+            metadata={
+                **self._metadata(state),
+                "reason": payload["feedback"],
+                "tool_failure": dict(payload),
+                "repair_attempt": repair_count,
+                "count_attempt": False,
+            },
+        )
+
+    async def _fallback_tool_failure(
+        self,
+        context: RunContext,
+        state: ExecutionState,
+        reason: str,
+        *,
+        fallback: Literal["replan", "fail"] | None = None,
+    ) -> ExecutionDecision:
+        recovery = self.tool_failure_recovery
+        if recovery is None:
+            raise RuntimeError("Tool failure fallback requires recovery configuration")
+        effective_fallback = recovery.fallback if fallback is None else fallback
+        pending = dict(state.pending_tool_failure or {})
+        pending["fallback_reason"] = reason
+        state.pending_tool_failure = pending
+        state.active_tool_calls = {}
+        feedback = str(pending.get("feedback") or "Tool execution failed")
+        if reason not in feedback:
+            feedback = f"{feedback}; {reason}"
+        state.validation_error = feedback
+
+        if effective_fallback == "replan":
+            decision = await self._replan(context, state, feedback)
+            if decision.kind is DecisionKind.FAIL:
+                state.failure = {
+                    **pending,
+                    "terminal_reason": decision.error_message
+                    or "maximum replans exceeded",
+                }
+                state.pending_step_result = None
+                state.awaiting_step_result = False
+                self._sync(context, state)
+                return ExecutionDecision(
+                    DecisionKind.FAIL,
+                    error_message=decision.error_message,
+                    metadata={
+                        **self._metadata(state),
+                        "reason": reason,
+                        "tool_failure": dict(state.failure),
+                    },
+                )
+            return decision
+
+        state.failure = {
+            **pending,
+            "terminal_reason": reason,
+        }
+        state.pending_step_result = None
+        state.awaiting_step_result = False
+        state.fail_current_step()
+        self._sync(context, state)
+        return ExecutionDecision(
+            DecisionKind.FAIL,
+            error_message="Tool execution failed",
+            metadata={
+                **self._metadata(state),
+                "reason": reason,
+                "tool_failure": dict(state.failure),
+            },
+        )
 
     def should_stop(self, context: RunContext) -> bool:
         state = getattr(context, "execution_state", None)
@@ -1459,6 +2103,11 @@ class PlanAndExecutePolicy:
             # A failed revision cannot leave a checkpoint that looks resumable
             # from ACT/STEP_VALIDATE, where stale tool output or a pending
             # StepResult might otherwise be committed after recovery.
+            if state.pending_tool_failure is not None:
+                state.failure = {
+                    **state.pending_tool_failure,
+                    "terminal_reason": "plan revision failed",
+                }
             state.fail_current_step()
             state.validation_error = "plan revision failed"
             state.pending_step_result = None
@@ -1498,6 +2147,9 @@ class PlanAndExecutePolicy:
         state.plan = merged
         state.replan_count += 1
         state.pending_step_result = None
+        state.pending_tool_failure = None
+        state.failure = None
+        state.active_tool_calls = {}
         state.validation_error = feedback
         state.awaiting_step_result = False
         state.phase = RunPhase.STEP_PREPARE

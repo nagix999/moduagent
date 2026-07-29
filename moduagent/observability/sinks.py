@@ -209,6 +209,12 @@ class MetricsEventSink:
                 await self._increment("plan.steps.committed")
             if event.type is EventType.STEP_RETRY:
                 await self._increment("plan.steps.retried")
+            if event.type is EventType.TOOL_REPAIR_SCHEDULED:
+                await self._increment("tool_repairs.scheduled")
+            if event.type is EventType.TOOL_REPAIR_EXHAUSTED:
+                await self._increment("tool_repairs.exhausted")
+            if event.type is EventType.STEP_FAILED:
+                await self._increment("plan.steps.failed")
             if event.type is EventType.PLAN_REVISED:
                 await self._increment("plan.replans")
             if event.type is EventType.FINALIZATION_STARTED:
@@ -292,6 +298,9 @@ class AuditEventSink:
             EventType.RUN_STARTED,
             EventType.TOOL_STARTED,
             EventType.TOOL_COMPLETED,
+            EventType.TOOL_REPAIR_SCHEDULED,
+            EventType.TOOL_REPAIR_EXHAUSTED,
+            EventType.STEP_FAILED,
             EventType.RUN_COMPLETED,
             EventType.RUN_FAILED,
         }

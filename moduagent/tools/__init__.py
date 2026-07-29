@@ -12,6 +12,8 @@ from moduagent.tools.base import (
     ToolErrorKind,
     ToolErrorType,
     ToolExecutionContext,
+    ToolFailure,
+    ToolRecoveryAction,
     ToolResult,
     ToolSchema,
 )
@@ -34,6 +36,8 @@ __all__ = [
     "ToolErrorType",
     "ToolExecutionContext",
     "ToolExecutor",
+    "ToolFailure",
+    "ToolRecoveryAction",
     "ToolRegistry",
     "ToolResult",
     "ToolSchema",

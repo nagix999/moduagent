@@ -16,6 +16,7 @@ class DecisionKind(str, Enum):
     # CONTINUE is retained for policies written against ModuAgent 0.2.x.
     CONTINUE = "continue"
     CALL_TOOLS = "call_tools"
+    RETRY_TOOL = "retry_tool"
     COMMIT_STEP = "commit_step"
     RETRY_STEP = "retry_step"
     REPLAN = "replan"
@@ -42,6 +43,6 @@ class DecisionPolicy(Protocol):
 
     async def observe(
         self, context: "RunContext", results: Sequence["ToolResult"]
-    ) -> None: ...
+    ) -> ExecutionDecision | None: ...
 
     def should_stop(self, context: "RunContext") -> bool: ...

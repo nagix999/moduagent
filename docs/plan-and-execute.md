@@ -1,6 +1,6 @@
 # Plan-and-Execute
 
-상태: ModuAgent 0.3.1의 `PlanAndExecutePolicy`는 검증된 단계 결과와 공개 최종 응답을 분리하는 strict 상태 머신이다. `Agent`의 기본 Policy는 계속 `StandardDecisionPolicy`이며, Plan-and-Execute가 필요한 Agent에 명시적으로 설정한다.
+상태: ModuAgent 0.3.2의 `PlanAndExecutePolicy`는 검증된 단계 결과와 공개 최종 응답을 분리하는 strict 상태 머신이다. `Agent`의 기본 Policy는 계속 `StandardDecisionPolicy`이며, Plan-and-Execute가 필요한 Agent에 명시적으로 설정한다.
 
 ## 핵심 계약
 
@@ -81,11 +81,106 @@ result = await planning_agent.run(
 | 설정 | 의미 |
 |---|---|
 | `max_step_attempts` | schema 오류 또는 검증 실패로 같은 단계를 다시 만들 수 있는 최대 시도 수 |
+| `max_tool_repair_attempts` | 모델이 실패한 Tool call의 인자를 교정해 새 call을 만들 수 있는 최대 횟수 |
 | `max_replans` | 미완료 계획을 수정할 수 있는 최대 횟수 |
 | `max_tool_calls` | 한 run에서 실행할 business Tool 호출 수 |
 | `timeout_seconds` | PLAN, 모든 ACT/검증, 재계획, FINALIZE, 저장 작업을 포함한 전체 시간 |
 
 Tool 왕복 자체는 단계 시도 횟수를 증가시키지 않는다. Tool 실패 시 `revise_on_tool_failure=True`이면 완료된 단계와 결과를 보존한 채 미완료 범위를 재계획하며 `max_replans`를 소비한다.
+
+## Tool 실패 복구
+
+Tool 실패에는 서로 다른 세 가지 복구 경계가 있다.
+
+| 경계 | 설정 | 동작 |
+|---|---|---|
+| 동일-call retry | `RetryConfig`, `idempotent=True`, `retryable=True` | 같은 call ID의 validation 완료 인자를 그대로 다시 실행 |
+| corrected-arguments repair | `ToolFailureRecoveryConfig`, `repair_safe=True`, `max_tool_repair_attempts` | 모델이 같은 Tool에 새 call ID와 교정된 인자를 생성 |
+| replan | `max_replans`, recovery의 `fallback="replan"` | 완료 결과를 보존하고 미완료 계획을 수정 |
+
+corrected-arguments repair는 기본적으로 꺼져 있다. `PlanAndExecutePolicy.tool_failure_recovery`를 생략하면 0.3.1과 같은 `revise_on_tool_failure` 동작을 유지한다. 활성화할 때는 Tool이 교정된 다른 인자로 다시 실행되어도 안전한지 검토하고 `repair_safe=True`를 명시한다. `require_repair_safe=True`가 기본이므로 선언되지 않은 Tool은 repair하지 않고 fallback한다.
+
+```python
+from moduagent import (
+    Agent,
+    AgentConfig,
+    LLMPlanGenerator,
+    PlanAndExecutePolicy,
+    RetryConfig,
+    RunLimits,
+    ToolError,
+    ToolErrorType,
+    ToolFailure,
+    ToolFailureRecoveryConfig,
+    ToolRecoveryAction,
+    function_tool,
+)
+
+
+def map_filter_error(exc: Exception) -> ToolError | None:
+    # 예상하고 안전하게 설명할 수 있는 오류만 모델 repair 대상으로 분류한다.
+    if not isinstance(exc, ValueError):
+        return None
+    return ToolError(
+        type=ToolErrorType.EXECUTION_ERROR,
+        reason="invalid_filter",
+        message="The filter expression is invalid; correct the Tool arguments.",
+        retryable=False,
+        recovery=ToolRecoveryAction.REPAIR_CALL,
+    )
+
+
+@function_tool(
+    idempotent=True,
+    repair_safe=True,
+    error_mapper=map_filter_error,
+)
+def search_catalog(filter: str, limit: int = 100) -> dict:
+    return catalog.search(filter=filter, limit=limit)
+
+
+agent = Agent(
+    config=AgentConfig(
+        name="catalog-agent",
+        instructions="검증된 catalog 결과만 사용한다.",
+        retry=RetryConfig(max_attempts=2),
+        limits=RunLimits(
+            max_tool_repair_attempts=1,
+            max_replans=1,
+            max_tool_calls=8,
+        ),
+    ),
+    model=model,
+    tools=[search_catalog],
+    decision_policy=PlanAndExecutePolicy(
+        LLMPlanGenerator(model),
+        tool_failure_recovery=ToolFailureRecoveryConfig(
+            fallback="replan",
+            require_repair_safe=True,
+            feedback_mode="safe_message",
+        ),
+    ),
+)
+```
+
+`error_mapper`의 계약은 `Callable[[Exception], ToolError | None]`이다. 알려진 오류에는 `ToolError.recovery`로 `RETRY_CALL`, `REPAIR_CALL`, `REPLAN`, `FAIL` 중 하나를 지정하고, 분류하지 않은 예외에는 `None`을 반환해 generic 처리로 되돌린다. Tool 내부에서 이미 typed failure를 알 수 있으면 `raise ToolFailure(ToolError(...))`를 사용해 mapper 없이 전달할 수 있다. 두 경로 모두 raw exception을 전달하는 통로가 아니라 모델 공개용 오류를 구성하는 계약이다.
+
+| `ToolRecoveryAction` | 의미 |
+|---|---|
+| `RETRY_CALL` | `idempotent=True`, `retryable=True`, 남은 `RetryConfig` 시도가 모두 충족되면 동일 call과 동일 인자를 executor가 다시 실행 |
+| `REPAIR_CALL` | opt-in recovery가 동일 Tool 1개에 교정된 새 인자와 새 call ID를 요청 |
+| `REPLAN` | call repair 없이 미완료 계획을 즉시 수정 |
+| `FAIL` | 복구하지 않고 run을 terminal 실패로 전이 |
+
+`RETRY_CALL`은 같은 인자의 executor retry이고 `REPAIR_CALL`은 모델이 다른 인자를 만들도록 요청하는 복구다. 단, 취소할 수 없는 동기 Tool timeout은 worker가 백그라운드에서 계속 실행되므로 동일-call retry를 막고 `FAIL`로 분류한다. DB driver의 statement timeout·취소 완료를 보장하는 통합만 `function_tool(timeout_retry_safe=True)`를 명시할 수 있다.
+
+`REPAIR_CALL` 응답은 실행 전에 정확히 하나의 동일 Tool, 이전에 쓰지 않은 call ID, 이전과 다른 canonical JSON arguments인지 검사한다. 실행기는 validation·형 변환·기본값 적용 후의 유효 arguments hash도 비교하므로 `1`을 `1.0`으로 바꾸는 식의 표현상 차이는 Tool 본체를 다시 실행하지 않는다. 키 순서만 바꾼 동일 인자, 다른 Tool, 복수 호출도 실행하지 않고 fallback한다. 단계 검증의 `max_step_attempts`는 소비하지 않지만 `max_tool_repair_attempts`, 전체 `max_tool_calls`와 run timeout은 적용받는다. repair가 불가능하거나 한도를 소진하면 config의 `fallback`에 따라 `replan` 또는 `fail`로 전이한다. 여러 Tool batch가 부분 성공한 경우에는 이미 발생한 side effect의 중복 실행을 막기 위해 fallback 설정과 무관하게 terminal 실패한다.
+
+이 기능은 DB 전용이 아니다. 검색 문법, 변환 옵션, 파일 선택 조건, 외부 API parameter처럼 모델이 인자를 안전하게 교정할 수 있는 Tool에 적용한다. 반대로 결제·삭제·전송 같은 변경 Tool은 `repair_safe=True`로 선언하지 않는 것이 기본이며, 원 시스템의 idempotency와 중복 방지 없이 자동 복구를 켜면 안 된다.
+
+`feedback_mode="type_only"`가 기본이며 strict repair prompt에는 오류 type과 `reason`만 전달한다. `"safe_message"`는 호출자가 모델 공개에 안전하다고 보증한 `ToolError.message`를 제어문자 제거·길이 제한 후 추가한다. 이는 secret redaction 기능이 아니다. strict 실패 Tool 메시지는 `message`와 `details`를 항상 제외하지만, 공개 `ToolResult.model_content()`와 non-strict 경로의 호환성은 유지되므로 `error_mapper`와 `ToolFailure`에는 원본 예외, SQL, 접속 문자열, 인증정보, 고객 데이터, 내부 경로·schema를 넣지 않는다. `TOOL_REPAIR_SCHEDULED`, `TOOL_REPAIR_EXHAUSTED`, `STEP_FAILED`는 internal 이벤트이며 공개 결과에는 원본 오류나 Tool 결과를 추가하지 않는다.
+
+공개 `tool_trace.error`에는 `type`, `retryable`과 선택적인 `reason`, `recovery`가 기록된다. 교정된 호출에는 `recovery_of_call_id`가 붙는다. repair가 한 번 이상 예약되면 `plan_usage.tool_repairs`가 추가되고, terminal 복구 실패에는 정제된 `metadata.failure`이 추가된다. 두 metadata 모두 원본 예외 메시지와 Tool 결과는 저장하지 않는다.
 
 한 계획 단계는 모델이 한 응답에서 선택한 Tool call batch를 실행한 뒤 `STEP_RESULT`로 넘어간다. 두 번째 Tool의 인자를 첫 번째 Tool 결과로 정해야 하는 순차 작업은 Planner가 각각 독립적으로 검증 가능한 의존 단계로 나눠야 한다. 같은 batch의 여러 호출은 `parallel_tool_calls` 설정에 따라 병렬 또는 순차 실행할 수 있지만 서로의 결과를 인자로 참조할 수는 없다.
 
@@ -150,7 +245,7 @@ ACT의 내부 출력은 다음 `StepResult` 필드만 허용한다.
 | `summary` | 기본값. `step_id`, `call_id`, `tool_name`, `success`, `attempts`, `duration_seconds`, 정제된 `error`만 저장 |
 | `arguments` | `summary`에 민감한 키를 재귀적으로 마스킹한 `arguments`와 `arguments_source`를 추가 |
 
-`arguments_source="validated"`는 validation·형 변환·기본값 적용 후 Tool에 실제 전달된 인자이고, `"requested"`는 validation 또는 실행 전에 거부된 호출의 모델 요청 인자다. `error`는 원본 메시지 대신 `type`과 `retryable`만 가진다. trace 전체 크기도 제한되며 Tool 결과 값은 어떤 모드에도 넣지 않는다. 같은 trace는 strict checkpoint의 내부 실행 metadata에 저장되므로 resume 전후의 호출 이력을 함께 확인할 수 있고 checkpoint schema는 v3를 유지한다.
+`arguments_source="validated"`는 validation·형 변환·기본값 적용 후 Tool에 실제 전달된 인자이고, `"requested"`는 validation 또는 실행 전에 거부된 호출의 모델 요청 인자다. `error`는 원본 메시지 대신 `type`, `retryable`과 선택적인 `reason`, `recovery`만 가진다. trace 전체 크기도 제한되며 Tool 결과 값은 어떤 모드에도 넣지 않는다. 같은 trace는 strict checkpoint의 내부 실행 metadata에 저장되므로 resume 전후의 호출 이력을 함께 확인할 수 있고 checkpoint schema는 v3를 유지한다.
 
 ```python
 agent = Agent(
@@ -271,16 +366,19 @@ Checkpoint schema v3는 다음 strict 상태를 저장한다.
 - phase, 계획 버전, 현재 단계
 - 커밋된 `StepResult`와 결과 참조
 - 단계별 시도 횟수와 재계획 횟수
+- Tool repair 횟수, pending repair 대상, 사용된 call ID와 원문 없는 arguments hash
 - 크기와 민감 정보가 정제된 실제 `tool_trace`
 - pending 결과와 내부 Tool protocol 메시지
 - FINALIZE 원문, 저장 여부, 공개 방출 여부와 호출 횟수
 - phase-scoped Skill 활성화 상태
 
+0.3.2는 기존 v3 checkpoint를 읽을 수 있지만 pending Tool repair 상태는 0.3.1 worker가 이해하지 못한다. rolling 배포 중에는 0.3.2가 생성한 in-flight checkpoint를 0.3.1 worker로 downgrade/resume하지 말고, 같은 버전의 worker로 고정하거나 기존 run을 종료한 뒤 rollback한다.
+
 v3 checkpoint를 재개하면 완료 단계는 다시 실행하지 않고 현재 ACT 또는 FINALIZE 경계에서 계속한다. v1과 v2 payload도 읽을 수 있지만 strict `ExecutionState`가 없으므로 진행 중인 0.2 Plan-and-Execute를 단계 단위로 그대로 이어 주는 마이그레이션은 제공하지 않는다. 배포 전 진행 중인 run을 끝내거나, 재실행이 안전한 요청만 새 strict 계획으로 시작해야 한다.
 
 `tool_trace`는 정제되지만 실패한 checkpoint의 pending Tool protocol에는 모델이 만든 원본 Tool 인자, Tool 결과나 Skill resource 원문이 일시적으로 포함될 수 있다. 운영 저장소는 암호화, 접근 제어와 짧은 TTL을 적용해야 한다.
 
-동기 Tool은 event loop를 막지 않도록 worker thread에서 실행된다. Python thread는 강제로 안전하게 취소할 수 없으므로 `pd.read_sql` 같은 blocking 호출은 Tool 또는 run timeout 결과가 반환된 뒤에도 해당 worker에서 끝날 때까지 계속될 수 있다. `PlanStep.status`는 이 thread의 생존 여부를 나타내지 않는다. DB driver의 query timeout, connection timeout과 서버 측 statement timeout도 함께 설정해야 한다.
+동기 Tool은 event loop를 막지 않도록 worker thread에서 실행된다. Python thread는 강제로 안전하게 취소할 수 없으므로 `pd.read_sql` 같은 blocking 호출은 Tool 또는 run timeout 결과가 반환된 뒤에도 해당 worker에서 끝날 때까지 계속될 수 있다. 0.3.2는 이런 timeout 뒤 동일-call 자동 retry가 겹치지 않게 기본 차단하지만 이미 실행 중인 작업 자체를 취소하지는 못한다. `PlanStep.status`는 이 thread의 생존 여부를 나타내지 않는다. DB driver의 query timeout, connection timeout과 서버 측 statement timeout도 함께 설정해야 한다.
 
 새 strict run의 Planner는 같은 session에 저장된 최근 공개 대화를 함께 보므로 “그 결과를 요약해줘” 같은 후속 요청은 이전 FINALIZE 응답을 참조할 수 있다. `LLMPlanGenerator(history_limit=8)`의 기본값은 최근 8개 메시지이며 `0`으로 끌 수 있다. ACT에는 과거 대화 전체를 다시 전달하지 않고 Planner가 만든 현재 단계와 필요한 선행 결과만 전달한다.
 

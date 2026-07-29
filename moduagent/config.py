@@ -15,6 +15,7 @@ class RunLimits:
     # its meaning. New code should still prefer keyword arguments.
     max_step_attempts: int = 2
     max_replans: int = 2
+    max_tool_repair_attempts: int = 1
 
     def __post_init__(self) -> None:
         if self.max_steps < 1:
@@ -23,6 +24,8 @@ class RunLimits:
             raise ValueError("max_step_attempts must be at least 1")
         if self.max_replans < 0:
             raise ValueError("max_replans cannot be negative")
+        if self.max_tool_repair_attempts < 0:
+            raise ValueError("max_tool_repair_attempts cannot be negative")
         if self.max_tool_calls < 0:
             raise ValueError("max_tool_calls cannot be negative")
         if self.timeout_seconds <= 0:

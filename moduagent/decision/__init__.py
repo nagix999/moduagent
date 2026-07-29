@@ -17,6 +17,7 @@ from moduagent.decision.planning import (
     StepStatus,
     StepValidation,
     StepValidator,
+    ToolFailureRecoveryConfig,
     ValidationKind,
     step_result_ref,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "StepStatus",
     "StepValidation",
     "StepValidator",
+    "ToolFailureRecoveryConfig",
     "ValidationKind",
     "step_result_ref",
 ]
