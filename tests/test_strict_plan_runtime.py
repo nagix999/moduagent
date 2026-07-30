@@ -1247,7 +1247,7 @@ def test_tool_call_limit_marks_current_step_failed() -> None:
     asyncio.run(scenario())
 
 
-def test_invalid_step_result_details_do_not_leak_to_public_metadata() -> None:
+def test_invalid_step_result_fails_immediately_without_public_detail_leak() -> None:
     async def scenario() -> None:
         secret = "TOP-SECRET-123"
         invalid = json.dumps(
@@ -1258,16 +1258,9 @@ def test_invalid_step_result_details_do_not_leak_to_public_metadata() -> None:
                 "final_answer": secret,
             }
         )
-        valid = _step_result(
-            "inspect",
-            fact="inspection completed",
-            evidence="inspection result exists",
-        )
         model = CompleteScriptedModel(
             [
                 ModelResponse(Message.assistant(invalid)),
-                ModelResponse(Message.assistant(valid)),
-                ModelResponse(Message.assistant("public final")),
             ]
         )
         agent = Agent(
@@ -1289,7 +1282,11 @@ def test_invalid_step_result_details_do_not_leak_to_public_metadata() -> None:
         events = [event async for event in agent.stream("inspect")]
         result = events[-1].data["result"]
 
-        assert result.finish_reason is FinishReason.COMPLETED
+        assert result.finish_reason is FinishReason.ERROR
+        assert result.metadata["error_summary"]["code"] == (
+            "step_result_schema_invalid"
+        )
+        assert len(model.requests) == 1
         assert secret not in json.dumps(
             [
                 {

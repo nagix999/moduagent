@@ -45,7 +45,7 @@ from moduagent.memory import (
     ConversationMemoryOverflowError,
     MemoryIntegrityError,
 )
-from moduagent.models import ModelCapabilities
+from moduagent.models import ModelCapabilities, classify_model_error
 from moduagent.observability._background import run_in_daemon_thread
 from moduagent.observability.sinks import (
     _event_sink_is_noop,
@@ -65,6 +65,11 @@ from moduagent.runtime.events import (
     EventVisibility,
 )
 from moduagent.runtime.metadata import is_runtime_owned_metadata_key
+from moduagent.runtime.model_guard import (
+    ModelGuardTripped,
+    ModelNoProgressError,
+    ModelTurnBudgetExceeded,
+)
 from moduagent.runtime.runtime import AgentRuntime
 from moduagent.runtime.services import RuntimeServices
 from moduagent.skills.tools import SKILL_RESOURCE_TOOL_NAMES
@@ -74,6 +79,12 @@ _RUN_ID_METADATA_KEY = "moduagent.run_id"
 _ENGINE_SNAPSHOT_POLICY_KEY = "_moduagent_engine_snapshot"
 _ENGINE_INITIALIZED_POLICY_KEY = "_moduagent_engine_initialized"
 _TERMINAL_EVENT_TYPES = frozenset({EventType.RUN_COMPLETED, EventType.RUN_FAILED})
+_NON_RESUMABLE_GUARD_REASONS = frozenset(
+    {
+        FinishReason.MAX_MODEL_TURNS,
+        FinishReason.NO_PROGRESS,
+    }
+)
 _ENGINE_OUTCOME_RUNTIME_METADATA_KEYS = frozenset(
     {"failure", "plan", "plan_usage", "validation_failure"}
 )
@@ -137,6 +148,7 @@ _DESCRIPTOR_SENSITIVE_SUFFIXES = (
     "_token",
 )
 _DESCRIPTOR_HEADER_KEYS = frozenset({"header", "headers", "http_headers"})
+_PRIMARY_FAILURE_LABEL = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 
 def _consume_task_result(task: asyncio.Task[Any]) -> None:
@@ -148,6 +160,39 @@ def _consume_task_result(task: asyncio.Task[Any]) -> None:
         task.exception()
     except BaseException:
         pass
+
+
+def _project_primary_failure(value: Any) -> dict[str, Any]:
+    """Return only bounded, structured fields from an internal failure summary."""
+
+    if not isinstance(value, Mapping):
+        return {}
+    projected: dict[str, Any] = {}
+    for key in ("component", "operation", "phase", "category", "code"):
+        item = value.get(key)
+        if isinstance(item, str) and _PRIMARY_FAILURE_LABEL.fullmatch(item):
+            projected[key] = item
+    failure_id = value.get("failure_id")
+    if (
+        isinstance(failure_id, str)
+        and 0 < len(failure_id) <= 256
+        and all(character.isprintable() for character in failure_id)
+    ):
+        projected["failure_id"] = failure_id
+    step_id = value.get("step_id")
+    if (
+        isinstance(step_id, str)
+        and 0 < len(step_id) <= 256
+        and all(character.isprintable() for character in step_id)
+    ):
+        projected["step_id"] = step_id
+    attempt = value.get("attempt")
+    if type(attempt) is int and 0 <= attempt <= 1_000_000:
+        projected["attempt"] = attempt
+    retryable = value.get("retryable")
+    if type(retryable) is bool:
+        projected["retryable"] = retryable
+    return projected
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,15 +444,21 @@ class RunCoordinator(AgentRuntime):
             if setup_error is not None:
                 raise setup_error
 
-            # A Skill failure may happen before the Engine can create its first
-            # snapshot. Persist an explicit bootstrap marker so a later resume
-            # retries initialization instead of decoding the compatibility
-            # checkpoint as an initialized Engine state.
             if resumed_snapshot is None:
+                # Skill selection and Plan creation may invoke a Model before
+                # the Engine can produce its first state. Keep initialization
+                # false while RuntimeServices lazily writes an empty bootstrap
+                # together with the first provider-attempt reservation. A hard
+                # crash must re-run initialization, never decode that empty
+                # state as an initialized Engine.
                 context.policy_state.setdefault(
                     _ENGINE_INITIALIZED_POLICY_KEY,
                     False,
                 )
+            else:
+                # RuntimeServices is per-process. Rehydrate its write-ahead
+                # snapshot pointer before resumed Skill or Plan model calls.
+                services.restore_engine_snapshot(resumed_snapshot.engine)
 
             if resumed_snapshot is not None:
                 loaded = await self._publish(
@@ -440,12 +491,23 @@ class RunCoordinator(AgentRuntime):
                 or context.policy_state.get(_ENGINE_INITIALIZED_POLICY_KEY) is False
             )
             if needs_initialization:
-                context.policy_state[_ENGINE_INITIALIZED_POLICY_KEY] = True
+                context.policy_state[_ENGINE_INITIALIZED_POLICY_KEY] = False
                 try:
                     state = await self.engine.initialize(
                         engine_context,
                         services,
                     )
+                    context.policy_state[_ENGINE_INITIALIZED_POLICY_KEY] = True
+                    if services.checkpointing_enabled:
+                        await services.checkpoint(
+                            engine_context,
+                            EngineSnapshot(
+                                engine_id=self.engine.engine_id,
+                                state_version=self.engine.state_version,
+                                state=self.engine.encode_state(state),
+                            ),
+                            boundary=DurableBoundary.INITIALIZED,
+                        )
                 except BaseException:
                     context.policy_state[_ENGINE_INITIALIZED_POLICY_KEY] = False
                     raise
@@ -643,8 +705,17 @@ class RunCoordinator(AgentRuntime):
                 )
             yield terminal
         except Exception as exc:
+            finish_reason = (
+                FinishReason.MAX_MODEL_TURNS
+                if isinstance(exc, ModelTurnBudgetExceeded)
+                else FinishReason.NO_PROGRESS
+                if isinstance(exc, ModelNoProgressError)
+                else FinishReason.ERROR
+            )
             context.status = RunStatus.FAILED
-            context.metadata["_moduagent_terminal_reason"] = FinishReason.ERROR.value
+            context.metadata["_moduagent_terminal_reason"] = finish_reason.value
+            if finish_reason in _NON_RESUMABLE_GUARD_REASONS:
+                context.metadata["_moduagent_resume_safety"] = "not_resumable"
             diagnostic = await self._capture_terminal_failure(context, exc)
             self._normalize_skill_resource_messages(context)
             if cleanup_writes_allowed:
@@ -657,7 +728,7 @@ class RunCoordinator(AgentRuntime):
                     )
             result = self._result(
                 context,
-                FinishReason.ERROR,
+                finish_reason,
                 error=self._public_error(exc),
             )
             summary = dict(self._error_summary(exc, context=context))
@@ -827,6 +898,8 @@ class RunCoordinator(AgentRuntime):
             FinishReason.CANCELLED,
             FinishReason.MAX_STEPS,
             FinishReason.MAX_TOOL_CALLS,
+            FinishReason.MAX_MODEL_TURNS,
+            FinishReason.NO_PROGRESS,
         }
         context.run.status = (
             RunStatus.CANCELLED
@@ -836,6 +909,8 @@ class RunCoordinator(AgentRuntime):
             else RunStatus.COMPLETED
         )
         context.run.metadata["_moduagent_terminal_reason"] = outcome.finish_reason.value
+        if outcome.finish_reason in _NON_RESUMABLE_GUARD_REASONS:
+            context.run.metadata["_moduagent_resume_safety"] = "not_resumable"
         if outcome.metadata:
             context.run.metadata.update(dict(outcome.metadata))
 
@@ -864,9 +939,9 @@ class RunCoordinator(AgentRuntime):
         metadata.update(dict(outcome.metadata))
         if failed:
             summary = dict(self._outcome_error_summary(outcome, context=context.run))
-            primary_failure = context.run.primary_failure
-            if isinstance(primary_failure, Mapping):
-                summary.update(dict(primary_failure))
+            primary_failure = _project_primary_failure(context.run.primary_failure)
+            if primary_failure:
+                summary.update(primary_failure)
             else:
                 tool_failure = outcome.metadata.get("failure")
                 if isinstance(tool_failure, Mapping):
@@ -1152,9 +1227,14 @@ class RunCoordinator(AgentRuntime):
         elif isinstance(error, PersistenceError):
             category, code = "persistence", "persistence_failed"
             retryable = True
+        elif isinstance(error, ModelTurnBudgetExceeded):
+            category, code = "limit", error.code
+        elif isinstance(error, ModelNoProgressError):
+            category, code = "model_progress", error.code
         elif isinstance(error, ModelInvocationError):
-            category, code = "model_invocation", "model_invocation_failed"
-            retryable = True
+            classification = classify_model_error(error)
+            category, code = classification.category, classification.code
+            retryable = classification.retryable
         elif isinstance(error, OutputValidationError):
             category, code = "output_validation", "output_validation_failed"
         elif isinstance(error, ToolAuthorizationError):
@@ -1178,37 +1258,67 @@ class RunCoordinator(AgentRuntime):
             category, code = "cancellation", "run_cancelled"
         resumable = (
             False
-            if isinstance(error, (CheckpointNotFoundError, StateMigrationError))
+            if isinstance(
+                error,
+                (
+                    CheckpointNotFoundError,
+                    StateMigrationError,
+                    ModelGuardTripped,
+                ),
+            )
             else self._is_safely_resumable(context)
         )
-        return {
+        summary = {
             "category": category,
             "code": code,
             "retryable": retryable,
             "resumable": resumable,
         }
+        if isinstance(error, ModelGuardTripped):
+            snapshot = error.snapshot
+            summary.update(
+                {
+                    "model_turns": snapshot.model_turns,
+                    "max_model_turns": snapshot.max_model_turns,
+                    "no_progress_model_turns": snapshot.no_progress_model_turns,
+                    "no_progress_model_turn_threshold": (
+                        snapshot.no_progress_model_turn_threshold
+                    ),
+                }
+            )
+        return summary
 
     async def _capture_terminal_failure(
         self,
         context: RunContext,
         error: BaseException,
     ) -> Mapping[str, Any]:
-        existing = context.primary_failure
-        if (
-            isinstance(existing, Mapping)
-            and isinstance(existing.get("failure_id"), str)
-            and existing["failure_id"]
-        ):
-            return dict(existing)
+        existing = _project_primary_failure(context.primary_failure)
+        if existing.get("failure_id"):
+            return existing
 
         reporter = self.diagnostic_reporter
         capture = getattr(reporter, "capture_exception", None)
         if not callable(capture):
-            return {}
+            return existing
 
-        component, operation = self._diagnostic_operation(error)
-        phase, step_id, attempt = self._diagnostic_location(context)
-        summary = dict(self._error_summary_for_diagnostic(error, context))
+        default_component, default_operation = self._diagnostic_operation(error)
+        default_phase, default_step_id, default_attempt = self._diagnostic_location(
+            context
+        )
+        component = str(existing.get("component", default_component))
+        operation = str(existing.get("operation", default_operation))
+        phase = existing.get("phase", default_phase)
+        step_id = existing.get("step_id", default_step_id)
+        attempt = existing.get("attempt", default_attempt)
+        summary = {
+            **dict(self._error_summary_for_diagnostic(error, context)),
+            **{
+                key: existing[key]
+                for key in ("category", "code", "retryable")
+                if key in existing
+            },
+        }
         capture_options: dict[str, Any] = {}
         if isinstance(error, OutputValidationError):
             validation_fields = self._output_validation_fields()
@@ -1230,18 +1340,27 @@ class RunCoordinator(AgentRuntime):
                 **capture_options,
             )
         except Exception:
-            return {}
+            return existing
         if not isinstance(failure_id, str) or not failure_id:
-            return {}
+            return existing
 
-        return {
-            "failure_id": failure_id,
-            "component": component,
-            "operation": operation,
-            **({} if phase is None else {"phase": phase}),
-            **({} if step_id is None else {"step_id": step_id}),
-            **({} if attempt is None else {"attempt": attempt}),
-        }
+        captured = _project_primary_failure(
+            {
+                **existing,
+                "failure_id": failure_id,
+                "component": component,
+                "operation": operation,
+                **({} if phase is None else {"phase": phase}),
+                **({} if step_id is None else {"step_id": step_id}),
+                **({} if attempt is None else {"attempt": attempt}),
+                "category": summary["category"],
+                "code": summary["code"],
+                "retryable": summary["retryable"],
+            }
+        )
+        if "failure_id" not in captured:
+            return existing
+        return captured
 
     def _output_validation_fields(self) -> frozenset[str]:
         try:
@@ -1292,6 +1411,8 @@ class RunCoordinator(AgentRuntime):
 
     @staticmethod
     def _diagnostic_operation(error: BaseException) -> tuple[str, str]:
+        if isinstance(error, ModelGuardTripped):
+            return "model", "guard"
         if isinstance(error, ModelInvocationError):
             return "model", "invoke"
         if isinstance(error, OutputValidationError):
@@ -1350,6 +1471,16 @@ class RunCoordinator(AgentRuntime):
                 "max_tool_calls_exceeded",
                 False,
             ),
+            FinishReason.MAX_MODEL_TURNS: (
+                "limit",
+                "max_model_turns_exceeded",
+                False,
+            ),
+            FinishReason.NO_PROGRESS: (
+                "model_progress",
+                "model_no_progress",
+                False,
+            ),
             FinishReason.ERROR: ("execution", "execution_failed", False),
         }
         category, code, retryable = codes.get(
@@ -1400,7 +1531,11 @@ class RunCoordinator(AgentRuntime):
             "category": category,
             "code": code,
             "retryable": retryable,
-            "resumable": self._is_safely_resumable(context),
+            "resumable": (
+                False
+                if outcome.finish_reason in _NON_RESUMABLE_GUARD_REASONS
+                else self._is_safely_resumable(context)
+            ),
         }
 
     def _is_safely_resumable(self, context: RunContext | None) -> bool:

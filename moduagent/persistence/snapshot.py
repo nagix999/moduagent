@@ -11,7 +11,7 @@ from moduagent.execution.state import EngineSnapshot, EngineStateCodec
 
 SNAPSHOT_SCHEMA_VERSION = 4
 DEFAULT_ENGINE_STATE_VERSION = 1
-SNAPSHOT_RUNTIME_VERSION = "0.4.0"
+SNAPSHOT_RUNTIME_VERSION = "0.5.0"
 StateT = TypeVar("StateT")
 
 
@@ -375,10 +375,10 @@ def current_runtime_version() -> str:
     except PackageNotFoundError:
         return SNAPSHOT_RUNTIME_VERSION
     # An editable source checkout can coexist with stale installed metadata.
-    # Only trust distribution metadata from the same 0.4 release line.
+    # Only trust distribution metadata from the same 0.5 release line.
     return (
         detected
-        if detected == "0.4" or detected.startswith("0.4.")
+        if detected == "0.5" or detected.startswith("0.5.")
         else SNAPSHOT_RUNTIME_VERSION
     )
 

@@ -7,6 +7,7 @@ from moduagent.composition import (
     ToolSpec,
 )
 from moduagent.config import AgentConfig, RetryConfig, RunLimits
+from moduagent.errors import AgentRunError
 from moduagent.decision import (
     DecisionKind,
     DecisionPolicy,
@@ -66,6 +67,7 @@ from moduagent.models import (
     ModelCapabilities,
     ModelChunk,
     ModelClient,
+    ModelProtocolError,
     ModelRequest,
     ModelResponse,
     OllamaClient,
@@ -181,9 +183,10 @@ from moduagent.tools import (
     fingerprint_tool_arguments,
     function_tool,
     is_tool_argument_fingerprint,
+    tool,
 )
 
-__version__ = "0.4.2"
+__version__ = "0.5.0"
 
 __all__ = [
     "__version__",
@@ -191,6 +194,7 @@ __all__ = [
     "AgentConfig",
     "AgentEvent",
     "AgentResult",
+    "AgentRunError",
     "AgentRuntime",
     "AgentSpec",
     "AgentTool",
@@ -256,6 +260,7 @@ __all__ = [
     "ModelCapabilities",
     "ModelChunk",
     "ModelClient",
+    "ModelProtocolError",
     "ModelRequest",
     "ModelResponse",
     "ModelSkillSelector",
@@ -351,4 +356,5 @@ __all__ = [
     "function_tool",
     "is_tool_argument_fingerprint",
     "step_result_ref",
+    "tool",
 ]

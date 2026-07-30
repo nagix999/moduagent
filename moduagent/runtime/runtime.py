@@ -13,7 +13,11 @@ from typing import Any, TypeVar
 from moduagent.config import AgentConfig
 from moduagent.decision import DecisionKind, DecisionPolicy
 from moduagent.decision.planning import ExecutionState, RunPhase
-from moduagent.errors import CheckpointNotFoundError, PersistenceError
+from moduagent.errors import (
+    CheckpointNotFoundError,
+    ExecutionInvariantError,
+    PersistenceError,
+)
 from moduagent.memory import (
     ConversationMemoryPolicy,
     FullConversationMemoryPolicy,
@@ -21,7 +25,13 @@ from moduagent.memory import (
     MemoryRequest,
 )
 from moduagent.messages import FinishReason, Message, MessageRole
-from moduagent.models import ModelClient, ModelRequest, ModelResponse
+from moduagent.models import (
+    ModelClient,
+    ModelProtocolError,
+    ModelRequest,
+    ModelResponse,
+    classify_model_error,
+)
 from moduagent.observability import DiagnosticReporter, EventSink, mask_sensitive
 from moduagent.output import OutputCodec
 from moduagent.persistence import (
@@ -36,6 +46,11 @@ from moduagent.runtime.context import (
 )
 from moduagent.runtime.events import AgentEvent, EventType, EventVisibility
 from moduagent.runtime.metadata import is_runtime_owned_metadata_key
+from moduagent.runtime.model_guard import (
+    ModelGuardTripped,
+    ModelTurnBudgetExceeded,
+    NoProgressCircuitBreaker,
+)
 from moduagent.skills.prompting import compose_skill_prompt, is_ephemeral_message
 from moduagent.skills.runtime import SkillRuntime
 from moduagent.skills.tools import (
@@ -92,6 +107,7 @@ _TOOL_TRACE_METADATA_KEY = "_moduagent_tool_trace"
 _PUBLIC_TOOL_TRACE_KEY = "tool_trace"
 _TOOL_TRACE_ARGUMENT_BYTES = 4096
 _TOOL_TRACE_TEXT_CHARS = 256
+_MODEL_GUARD_POLICY_KEY = "_moduagent_model_guard"
 
 
 class _StrictToolCallLimitError(RuntimeError):
@@ -103,7 +119,15 @@ class _StrictToolResultProtocolError(RuntimeError):
 
 
 class AgentRuntime:
-    """Provider-neutral model/tool loop and execution lifecycle."""
+    """Provider-neutral model/tool loop and execution lifecycle.
+
+    Direct construction is retained as a legacy compatibility path. Its model
+    guard covers provider attempts made by the main model loop, but auxiliary
+    planner, memory, and Skill model clients are not routed through the same
+    turn budget. Use the public :class:`moduagent.Agent` composition (backed by
+    ``RunCoordinator``) when ``max_model_turns`` must cover every model client
+    used by a run.
+    """
 
     def __init__(
         self,
@@ -380,6 +404,11 @@ class AgentRuntime:
                             "the configured Agent"
                         )
                 context = checkpoint.to_context()
+                if checkpoint.resume_safety not in {"resumable", "terminal"}:
+                    raise ValueError(
+                        "checkpoint is not safely resumable: "
+                        f"{checkpoint.resume_safety}"
+                    )
                 self._normalize_context_tool_trace(context)
                 event = AgentEvent(
                     EventType.CHECKPOINT_LOADED,
@@ -942,6 +971,28 @@ class AgentRuntime:
                 context,
                 FinishReason.TIMEOUT,
                 error="run timed out",
+            )
+            event = AgentEvent(EventType.RUN_FAILED, run_id, {"result": result})
+            await self._publish(event)
+            yield event
+        except ModelGuardTripped as exc:
+            reason = (
+                FinishReason.MAX_MODEL_TURNS
+                if isinstance(exc, ModelTurnBudgetExceeded)
+                else FinishReason.NO_PROGRESS
+            )
+            context.status = RunStatus.FAILED
+            context.metadata["_moduagent_terminal_reason"] = reason.value
+            context.metadata["_moduagent_resume_safety"] = "not_resumable"
+            context.metadata["error_summary"] = dict(
+                self._legacy_model_guard_summary(exc)
+            )
+            await self._persist_safely(context)
+            await self._save_checkpoint_safely(context)
+            result = self._result(
+                context,
+                reason,
+                error=str(exc),
             )
             event = AgentEvent(EventType.RUN_FAILED, run_id, {"result": result})
             await self._publish(event)
@@ -2558,7 +2609,11 @@ class AgentRuntime:
                 )
                 await self._publish(completed)
                 yield completed
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+        except (
+            asyncio.TimeoutError,
+            asyncio.CancelledError,
+            ModelGuardTripped,
+        ):
             raise
         except Exception as exc:
             from moduagent.errors import SkillError as FrameworkSkillError
@@ -2646,6 +2701,90 @@ class AgentRuntime:
                 selected.add(SKILL_SEARCH_TOOL_NAME)
         return tuple(self.tool_executor.registry.schemas(selected))
 
+    def _legacy_model_guard(
+        self,
+        context: RunContext,
+    ) -> NoProgressCircuitBreaker:
+        """Restore the direct-AgentRuntime guard for one model operation.
+
+        The coordinator path binds its own run-scoped guard through
+        ``RuntimeServices`` and does not call this helper.
+        """
+
+        raw_state = context.policy_state.get(_MODEL_GUARD_POLICY_KEY)
+        limits = self.config.limits
+        try:
+            if raw_state is None:
+                guard = NoProgressCircuitBreaker(
+                    max_model_turns=limits.max_model_turns,
+                    no_progress_model_turn_threshold=(
+                        limits.no_progress_model_turn_threshold
+                    ),
+                )
+            else:
+                guard = NoProgressCircuitBreaker.from_state(
+                    raw_state,
+                    max_model_turns=limits.max_model_turns,
+                    no_progress_model_turn_threshold=(
+                        limits.no_progress_model_turn_threshold
+                    ),
+                )
+        except (TypeError, ValueError) as exc:
+            raise ExecutionInvariantError(
+                "checkpoint model guard state is invalid"
+            ) from exc
+        self._sync_legacy_model_guard(context, guard)
+        return guard
+
+    @staticmethod
+    def _sync_legacy_model_guard(
+        context: RunContext,
+        guard: NoProgressCircuitBreaker,
+    ) -> None:
+        context.policy_state[_MODEL_GUARD_POLICY_KEY] = dict(guard.to_state())
+        snapshot = guard.snapshot
+        context.metadata["_moduagent_model_turns"] = snapshot.model_turns
+        context.metadata["_moduagent_no_progress_model_turns"] = (
+            snapshot.no_progress_model_turns
+        )
+
+    @staticmethod
+    def _legacy_model_semantic_state(
+        context: RunContext,
+        *,
+        phase: str,
+    ) -> Mapping[str, Any]:
+        state = context.execution_state
+        step_id = state.current_step_id if isinstance(state, ExecutionState) else None
+        return {
+            "engine_id": "legacy",
+            "phase": phase,
+            "step_id": step_id,
+        }
+
+    @staticmethod
+    def _legacy_model_guard_summary(
+        error: ModelGuardTripped,
+    ) -> Mapping[str, Any]:
+        snapshot = error.snapshot
+        return {
+            "category": (
+                "limit"
+                if isinstance(error, ModelTurnBudgetExceeded)
+                else "model_progress"
+            ),
+            "code": error.code,
+            "retryable": False,
+            # A persisted tripped guard deterministically rejects a resume.
+            "resumable": False,
+            "model_turns": snapshot.model_turns,
+            "max_model_turns": snapshot.max_model_turns,
+            "no_progress_model_turns": snapshot.no_progress_model_turns,
+            "no_progress_model_turn_threshold": (
+                snapshot.no_progress_model_turn_threshold
+            ),
+        }
+
     async def _model_events(
         self,
         context: RunContext,
@@ -2663,15 +2802,34 @@ class AgentRuntime:
         response: ModelResponse | None = None
         emitted_delta = False
         buffered_deltas: list[str] = []
+        guard = self._legacy_model_guard(context)
         for attempt in range(1, self.config.retry.max_attempts + 1):
+            try:
+                guard_snapshot = guard.before_model_attempt(
+                    self._legacy_model_semantic_state(
+                        context,
+                        phase=phase,
+                    )
+                )
+            finally:
+                self._sync_legacy_model_guard(context, guard)
+            # Persist the reservation before the provider call so a hard crash
+            # cannot regain a model turn on resume.
+            await self._save_checkpoint(context, deadline)
             event = AgentEvent(
                 EventType.MODEL_STARTED,
                 context.run_id,
-                {"step": context.step, "attempt": attempt, "phase": phase},
+                {
+                    "step": context.step,
+                    "attempt": attempt,
+                    "model_turn": guard_snapshot.model_turns,
+                    "phase": phase,
+                },
                 visibility=visibility,
             )
             await self._publish(event)
             yield event
+            response = None
             try:
                 capabilities = getattr(self.model, "capabilities", None)
                 supports_streaming = bool(getattr(capabilities, "streaming", False))
@@ -2705,7 +2863,7 @@ class AgentRuntime:
                         if chunk.response is not None:
                             response = chunk.response
                     if response is None:
-                        raise RuntimeError(
+                        raise ModelProtocolError(
                             "model stream ended without a final response"
                         )
                 else:
@@ -2713,11 +2871,39 @@ class AgentRuntime:
                         self.model.complete(request),
                         timeout=self._remaining(deadline),
                     )
+                    if not isinstance(response, ModelResponse):
+                        raise ModelProtocolError(
+                            "model client must return ModelResponse"
+                        )
+                try:
+                    guard.observe_model_response(response)
+                finally:
+                    self._sync_legacy_model_guard(context, guard)
+                # Observation state is also durable: a resumed request cannot
+                # forget a completed repeated response.
+                await self._save_checkpoint(context, deadline)
                 break
             except asyncio.CancelledError:
+                guard.abandon_model_attempt()
+                self._sync_legacy_model_guard(context, guard)
                 raise
             except Exception as exc:
-                if emitted_delta or attempt >= self.config.retry.max_attempts:
+                guard.abandon_model_attempt()
+                self._sync_legacy_model_guard(context, guard)
+                if isinstance(exc, ModelGuardTripped):
+                    raise
+                classification = classify_model_error(exc)
+                if (
+                    emitted_delta
+                    or not classification.retryable
+                    or attempt >= self.config.retry.max_attempts
+                ):
+                    if classification.code == "model_protocol_error" and not isinstance(
+                        exc, ModelProtocolError
+                    ):
+                        raise ModelProtocolError(
+                            "model protocol response is invalid"
+                        ) from exc
                     raise
                 retry_event = AgentEvent(
                     EventType.RETRY,
@@ -2726,7 +2912,10 @@ class AgentRuntime:
                         "operation": "model",
                         "attempt": attempt,
                         "phase": phase,
-                        "error": str(exc),
+                        "error": "model request failed",
+                        "error_type": type(exc).__name__,
+                        "code": classification.code,
+                        "retryable": classification.retryable,
                     },
                     visibility=visibility,
                 )

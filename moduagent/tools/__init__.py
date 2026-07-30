@@ -32,7 +32,7 @@ from moduagent.tools.failure import (
     resolve_tool_safety_profile,
     tool_error_from_classification,
 )
-from moduagent.tools.function import FunctionTool, function_tool
+from moduagent.tools.function import FunctionTool, function_tool, tool
 from moduagent.tools.registry import ToolRegistry
 from moduagent.tools.runtime import (
     ToolBatchOutcome,
@@ -81,5 +81,6 @@ __all__ = [
     "function_tool",
     "is_tool_argument_fingerprint",
     "resolve_tool_safety_profile",
+    "tool",
     "tool_error_from_classification",
 ]

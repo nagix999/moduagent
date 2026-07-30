@@ -12,6 +12,7 @@ from moduagent import (
     PlanExecutionProfile,
     PlanStep,
     RetryConfig,
+    RunLimits,
     StandardExecutionProfile,
     function_tool,
 )
@@ -184,6 +185,35 @@ def test_fingerprint_tracks_semantic_model_options_and_retry_policy() -> None:
 
     assert first.inspect().model_options["max_tokens"] == 16
     assert second.inspect().model_options["max_tokens"] == 4096
+    assert first.inspect().agent_fingerprint != second.inspect().agent_fingerprint
+
+
+def test_inspection_and_fingerprint_track_model_guard_limits() -> None:
+    first = Agent(
+        config=AgentConfig(
+            "model-guard",
+            "Answer.",
+            limits=RunLimits(
+                max_model_turns=8,
+                no_progress_model_turn_threshold=2,
+            ),
+        ),
+        model=StaticModel(),
+    )
+    second = Agent(
+        config=AgentConfig(
+            "model-guard",
+            "Answer.",
+            limits=RunLimits(
+                max_model_turns=9,
+                no_progress_model_turn_threshold=3,
+            ),
+        ),
+        model=StaticModel(),
+    )
+
+    assert first.inspect().to_dict()["limits"]["max_model_turns"] == 8
+    assert first.inspect().to_dict()["limits"]["no_progress_model_turn_threshold"] == 2
     assert first.inspect().agent_fingerprint != second.inspect().agent_fingerprint
 
 

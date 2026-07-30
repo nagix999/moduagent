@@ -11,10 +11,11 @@ ModuAgent는 자체 모델 엔드포인트와 Python 함수를 바탕으로 AI �
 계획-실행(Plan-and-Execute), 체크포인트 복구, 스킬, 관측성 기능을 추가할 수
 있습니다.
 
-> 현재 버전: **0.4.2 (Alpha)** · Python **3.10+** · **MIT License**
+> 현재 버전: **0.5.0 (Alpha)** · Python **3.10+** · **MIT License**
 
-ModuAgent를 처음 사용한다면 먼저 1단계와 2단계를 완료합니다. 그다음 사용
-사례에 필요할 때만 메모리, 구조화 출력 또는 계획-실행을 추가합니다.
+ModuAgent를 처음 사용한다면 아래의 짧은 다섯 단계를 따라갑니다. 이 단계는
+0.5 Quick API를 사용하며, 고급 조합에는 명시적인 구성 요소 API를 그대로
+사용할 수 있습니다.
 
 ## ModuAgent가 제공하는 기능
 
@@ -35,7 +36,9 @@ Agent ──► Execution profile ──► Model
   └── Events, diagnostics, and metrics
 ```
 
-- `AgentConfig`는 지침, 재시도 동작, 실행 제한을 정의합니다.
+- `Agent.create()`는 일반적인 설정을 대신 구성합니다.
+- `AgentConfig`는 명시적인 조합이 필요할 때 지침, 재시도 동작, 실행 제한을
+  제공합니다.
 - 모델 클라이언트는 vLLM, Ollama 또는 그 밖의 지원되는 엔드포인트에 연결합니다.
 - 도구는 모델이 호출할 수 있는 타입이 지정된 Python 함수입니다.
 - 실행 프로필은 작업의 진행 방식을 제어합니다.
@@ -67,10 +70,10 @@ ModuAgent에는 Python 3.10 이상이 필요합니다. 접근 가능한 모델 �
 패키지를 설치합니다.
 
 ```bash
-python -m pip install "moduagent==0.4.2"
+python -m pip install "moduagent==0.5.0"
 ```
 
-패키지 인덱스에 아직 `0.4.2`가 없고 이미 0.4 소스를 체크아웃했다면 저장소
+패키지 인덱스에 아직 `0.5.0`이 없고 이미 0.5 소스를 체크아웃했다면 저장소
 루트에서 설치합니다.
 
 ```bash
@@ -99,39 +102,22 @@ python -m pip install "psycopg[binary]>=3.2,<4"  # PostgreSQL report example
 
 ```python
 import asyncio
-import os
 
-from moduagent import Agent, AgentConfig, VLLMClient
-
-
-def create_model() -> VLLMClient:
-    return VLLMClient(
-        base_url=os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1"),
-        model=os.environ["VLLM_MODEL"],
-        api_key=os.getenv("VLLM_API_KEY"),
-        timeout=60,
-    )
+from moduagent import Agent, VLLMClient
 
 
 async def main() -> None:
-    agent = Agent(
-        config=AgentConfig(
-            name="assistant",
-            instructions="Answer accurately and concisely.",
-        ),
-        model=create_model(),
+    model = VLLMClient.from_env()
+    agent = Agent.create(
+        model=model,
+        instructions="Answer accurately and concisely.",
     )
 
-    result = await agent.run(
+    answer = await agent.ask(
         "Explain what an AI agent is in one paragraph.",
         session_id="getting-started",
     )
-
-    if result.error:
-        raise RuntimeError(result.error)
-
-    print(result.output)
-    print(f"Tokens used: {result.usage.total_tokens}")
+    print(answer)
 
 
 if __name__ == "__main__":
@@ -143,26 +129,31 @@ if __name__ == "__main__":
 ```bash
 export VLLM_BASE_URL="http://localhost:8000/v1"
 export VLLM_MODEL="your-model-name"
-export VLLM_API_KEY="optional-token"
+# export VLLM_API_KEY="your-token-if-required"
+export VLLM_TIMEOUT="60"
 python getting_started.py
 ```
+
+`VLLMClient.from_env()`는 다음과 같이 문서에 명시된 환경변수만 읽습니다.
+
+| 환경변수 | 필수 | 의미 |
+|---|---|---|
+| `VLLM_MODEL` | 예 | vLLM이 제공하는 모델 이름 |
+| `VLLM_BASE_URL` | 아니요 | OpenAI 호환 기본 URL. 기본값은 `http://localhost:8000/v1` |
+| `VLLM_API_KEY` | 아니요 | Bearer 토큰 |
+| `VLLM_TIMEOUT` | 아니요 | 양수인 요청 timeout(초). 기본값은 `60` |
+
+다른 곳에서 설정값을 가져온다면 일반 `VLLMClient(...)` 생성자를 사용합니다.
+`from_env()`에 직접 전달한 `timeout=`은 `VLLM_TIMEOUT`보다 우선합니다.
 
 엔드포인트와 선택한 모델은 에이전트가 사용하는 도구 호출이나 JSON 스키마
 출력 같은 기능을 지원해야 합니다.
 도구 예제를 사용하려면 선택한 모델에 맞는 vLLM 채팅 템플릿과 도구 파서를
 설정합니다.
 
-`Agent.run()`은 `AgentResult`를 반환합니다. 가장 유용한 필드는 다음과 같습니다.
-
-| 필드 | 의미 |
-|---|---|
-| `output` | 최종 텍스트 또는 검증된 객체 |
-| `error` | 외부에 공개해도 안전한 오류 메시지 또는 `None` |
-| `finish_reason` | `completed`, `timeout`, `max_steps` 등의 종료 이유 |
-| `usage` | 누적된 모델 토큰 사용량 |
-| `run_id` | 체크포인트 복구에 사용하는 식별자 |
-| `messages` | 외부에 공개되는 대화 메시지 |
-| `metadata` | 안전하게 정리된 도구 추적 정보, 계획 요약, 오류 범주 |
+`ask()`는 가장 짧은 실행 경로입니다. 디코딩한 출력을 반환하고 실행이 완료되지
+않으면 비밀 정보를 노출하지 않는 `AgentRunError`를 발생시킵니다. 전체 결과가
+필요한 운영 코드에서는 `run()`을 사용합니다. 두 방식은 5단계에서 설명합니다.
 
 Ollama도 동일한 에이전트 API를 사용합니다.
 
@@ -177,49 +168,34 @@ model = OllamaClient(
 
 ## 2단계: 도구 추가
 
-`@function_tool`을 사용하여 타입이 지정된 Python 함수를 노출합니다.
-이 예시는 1단계의 `create_model()`을 다시 사용합니다.
+`@tool`을 사용하여 타입이 지정된 Python 함수를 노출합니다.
 
 ```python
 import asyncio
 
-from moduagent import Agent, AgentConfig, RetryConfig, function_tool
+from moduagent import Agent, VLLMClient, tool
 
 
-@function_tool(
-    idempotent=True,
-    timeout_seconds=5,
-    max_result_bytes=4096,
-)
+@tool(timeout_seconds=5, max_result_bytes=4096)
 def add(a: int, b: int) -> int:
     """Add two integers."""
     return a + b
 
 
 async def main() -> None:
-    calculator = Agent(
-        config=AgentConfig(
-            name="calculator",
-            instructions=(
-                "Use the add Tool whenever addition is required. "
-                "Do not invent a calculated result."
-            ),
-            retry=RetryConfig(max_attempts=2),
+    calculator = Agent.create(
+        model=VLLMClient.from_env(),
+        instructions=(
+            "Use the add Tool whenever addition is required. "
+            "Do not invent a calculated result."
         ),
-        model=create_model(),
         tools=[add],
     )
-
-    result = await calculator.run(
+    answer = await calculator.ask(
         "What is 12 plus 30?",
         session_id="calculator-demo",
     )
-
-    if result.error:
-        raise RuntimeError(result.error)
-
-    print(result.output)
-    print(result.metadata.get("tool_trace", []))
+    print(answer)
 
 
 asyncio.run(main())
@@ -228,20 +204,22 @@ asyncio.run(main())
 함수의 타입 힌트는 입력 스키마가 되고 독스트링은 모델에 표시되는 설명이
 됩니다. `tools=[...]`로 전달한 도구만 호출할 수 있습니다.
 
-`idempotent=True`는 검증된 동일 호출을 반복해도 안전하다는 선언입니다.
-트랜잭션이나 정확히 한 번(exactly-once) 실행을 보장하는 기능은 아닙니다.
-쓰기 도구에는 애플리케이션 수준의 멱등성 키와 중복 방지가 여전히 필요합니다.
+`@tool`은 기존 `@function_tool` 어댑터의 짧은 이름입니다. 두 방식 모두 도구의
+재시도 또는 수정 후 재실행 안전성을 추측하지 않습니다. 예를 들어
+`idempotent=True`는 검증된 동일 호출을 반복해도 안전하다는 선언일 뿐,
+트랜잭션이나 정확히 한 번(exactly-once) 실행을 보장하지 않습니다. 쓰기
+도구에는 애플리케이션 수준의 멱등성 키와 중복 방지가 여전히 필요합니다.
 
 `pandas.read_sql()` 같은 동기 함수는 이벤트 루프 밖에서 실행됩니다. 운영
 환경에서는 동기 도구가 공통 bounded scheduler를 사용하게 하여 timeout된
 호출이 백그라운드 스레드를 무제한 생성하지 않도록 합니다.
 
 ```python
-from moduagent import SyncToolScheduler, function_tool
+from moduagent import SyncToolScheduler, tool
 
 blocking_tools = SyncToolScheduler(max_workers=8, max_queue=32)
 
-@function_tool(sync_scheduler=blocking_tools, timeout_seconds=10)
+@tool(sync_scheduler=blocking_tools, timeout_seconds=10)
 def query_db(sql: str) -> list[dict]:
     return run_read_only_query(sql)
 ```
@@ -251,13 +229,331 @@ def query_db(sql: str) -> list[dict]:
 `AgentResult.messages`에는 추가되지 않습니다. 기본 공개 도구 추적 정보는
 크기가 제한되며 비밀 정보를 노출하지 않는 요약입니다.
 
-## 3단계: 대화 메모리 추가
+## 3단계: 검증된 구조화 출력 반환
 
-동일한 `session_id`를 사용하면 대화를 이어갈 수 있습니다.
+Pydantic 모델 클래스를 `output=`으로 전달합니다. Quick API는 내부적으로
+기존 `PydanticOutputCodec`을 만들며, `ask()`는 검증된 모델 객체를 반환합니다.
 
-이후의 예제 코드는 새로 추가하는 설정에 집중하며 앞 단계에서 정의한
-`create_model()`과 `add`를 다시 사용합니다. 각 비동기 예제는
-애플리케이션 진입점에서 호출할 수 있는 함수로 감쌌습니다.
+```python
+import asyncio
+
+from pydantic import BaseModel, Field
+
+from moduagent import Agent, VLLMClient, tool
+
+
+@tool
+def add(a: int, b: int) -> int:
+    """두 정수를 더합니다."""
+    return a + b
+
+
+class Answer(BaseModel):
+    answer: str
+    confidence: float = Field(ge=0, le=1)
+
+
+structured_agent = Agent.create(
+    model=VLLMClient.from_env(),
+    instructions=(
+        "Use the add Tool for every arithmetic operation, then return "
+        "the answer in the requested format."
+    ),
+    tools=[add],
+    output=Answer,
+)
+
+
+async def main() -> None:
+    answer: Answer = await structured_agent.ask(
+        "What is 20 plus 22?",
+        session_id="structured-demo",
+    )
+    print(answer.answer, answer.confidence)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+도구와 구조화 출력을 함께 사용할 수 있습니다. ModuAgent는 요청 단계를
+다음과 같이 분리합니다.
+
+```text
+ACT:      model receives Tool schemas, without the final output schema
+FINALIZE: model receives the Pydantic schema, without Tools
+```
+
+이 방식은 도구 호출과 구조화 출력을 같은 요청에 넣었을 때 흔히 발생하는
+vLLM 충돌을 방지합니다. `VLLMClient`는 기본적으로 이 조합을 지원하지 않는
+것으로 선언하므로 런타임이 분리 방식을 사용합니다.
+
+## 4단계: 엄격한 계획-실행 사용
+
+작업에 서로 의존하는 단계가 있고 각 중간 결과가 최종 답변에 반영되기 전에
+검증되어야 한다면 계획-실행을 사용합니다.
+
+```python
+import asyncio
+
+from pydantic import BaseModel, Field
+
+from moduagent import Agent, RunLimits, VLLMClient, tool
+
+
+@tool
+def add(a: int, b: int) -> int:
+    """두 정수를 더합니다."""
+    return a + b
+
+
+class Answer(BaseModel):
+    answer: str
+    confidence: float = Field(ge=0, le=1)
+
+model = VLLMClient.from_env()
+
+planning_agent = Agent.create(
+    model=model,
+    instructions=(
+        "Use the add Tool for every arithmetic operation. "
+        "Complete multi-step requests using only validated and committed "
+        "step results."
+    ),
+    tools=[add],
+    output=Answer,
+    execution="plan",
+    limits=RunLimits(
+        max_steps=4,
+        max_step_attempts=2,
+        max_replans=1,
+        max_tool_calls=8,
+        timeout_seconds=120,
+    ),
+)
+
+
+async def main() -> None:
+    answer: Answer = await planning_agent.ask(
+        "Calculate 10 + 20, then add 5 to that verified result.",
+        session_id="plan-demo",
+    )
+    print(answer)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+엄격한 실행 흐름은 다음과 같습니다.
+
+```text
+PLAN → ACT_TOOL → STEP_RESULT → VALIDATE/COMMIT → VERIFY → FINALIZE
+```
+
+- `max_steps`는 모델 호출 횟수가 아니라 생성되는 계획 단계 수를 제한합니다.
+- `max_step_attempts`는 한 단계의 검증 재시도 횟수를 제한합니다.
+- `max_replans`는 완료되지 않은 작업을 수정하는 횟수를 제한합니다.
+- `max_tool_calls`는 전체 실행에서 업무 도구 호출 횟수를 제한합니다.
+- `timeout_seconds`는 계획 수립부터 모델 호출, 도구 실행, 최종 응답 생성,
+  영속화까지 모든 작업이 공유하는 하나의 실행 기한입니다.
+
+`execution="plan"`을 사용하면 Quick API가 같은 `model`로
+`LLMPlanGenerator`를 만들고, generator의 `max_steps`를
+`limits.max_steps`와 맞춥니다. 사용자 정의 planner, validator 또는 복구
+정책이 필요하면 명시적인 `PlanExecutionProfile`을 `execution=`에 전달합니다.
+
+채팅, 직접적인 도구 사용, 짧은 워크플로에는 Standard 실행이 더 나은
+기본값입니다.
+
+## 5단계: 결과 확인과 모델 호출 제한
+
+`ask()`는 `run()`을 호출한 뒤 `unwrap()`을 호출하는 것과 같습니다. 성공한
+경우 디코딩된 출력만 필요하다면 다음과 같이 사용합니다. 이 단계의 예제는
+4단계에서 만든 `planning_agent`를 사용합니다.
+
+```python
+import asyncio
+
+
+async def main() -> None:
+    answer = await planning_agent.ask("Complete the task.")
+    print(answer)
+
+
+asyncio.run(main())
+```
+
+사용량, 추적 정보, 종료 이유 또는 복구 metadata도 필요하면 `run()`을
+사용합니다.
+
+```python
+import asyncio
+
+
+async def main() -> None:
+    result = await planning_agent.run(
+        "Complete the task.",
+        session_id="operations-demo",
+    )
+    print(result.explain())  # 간결하고 정제된 종료 요약
+    answer = result.unwrap()  # completed가 아니면 AgentRunError 발생
+    print(answer)
+
+
+asyncio.run(main())
+```
+
+또는 `unwrap()` 줄을 다음의 명시적 형식으로 바꿔도 같습니다.
+
+```python
+result.raise_for_error()
+answer = result.output
+```
+
+주요 `AgentResult` 필드는 다음과 같습니다.
+
+| 필드 | 의미 |
+|---|---|
+| `output` | 최종 텍스트 또는 검증된 객체 |
+| `error` | 외부에 공개해도 안전한 오류 메시지 또는 `None` |
+| `finish_reason` | 안정적으로 분류된 종료 이유 |
+| `usage` | 누적된 모델 토큰 사용량 |
+| `run_id` | 오류 연관 관계 및 체크포인트 식별자 |
+| `messages` | 외부에 공개되는 대화 메시지 |
+| `metadata` | 크기가 제한된 도구 추적 정보, 계획 요약, 안전한 오류 범주 |
+
+종료 이유는 다음과 같습니다.
+
+| 종료 이유 | 의미 |
+|---|---|
+| `completed` | 출력이 정상적으로 완료됨 |
+| `max_steps` | 계획 또는 실행 스텝 예산 소진 |
+| `max_tool_calls` | 도구 호출 예산 소진 |
+| `max_model_turns` | 전체 실행의 모델 시도 예산 소진 |
+| `no_progress` | 같은 의미 상태와 응답이 반복되어 circuit breaker 동작 |
+| `timeout` | 전체 실행 기한 만료 |
+| `cancelled` | 호출자가 실행 취소 |
+| `error` | 그 밖의 종료 오류 발생 |
+
+`ask()`와 `unwrap()`은 `completed` 이외의 모든 종료 이유에 대해 비밀 정보를
+노출하지 않는 `AgentRunError`를 발생시킵니다.
+
+```python
+import asyncio
+
+from moduagent import AgentRunError
+
+
+async def main() -> None:
+    try:
+        answer = await planning_agent.ask("Complete the task.")
+        print(answer)
+    except AgentRunError as exc:
+        print(exc.run_id, exc.finish_reason, exc.code)
+        print(exc.retryable, exc.resumable, exc.failure_id)
+
+
+asyncio.run(main())
+```
+
+이 예외는 prompt, 출력, 도구 인자, 원본 provider body 또는 임의의 결과
+metadata를 보관하지 않습니다.
+
+### 엄격한 모델 재시도 계약
+
+`RetryConfig.max_attempts`는 첫 호출을 포함하고 기본값은 `1`입니다. 따라서
+재시도는 명시적으로 활성화해야 합니다.
+
+```python
+from moduagent import RetryConfig
+
+retrying_agent = Agent.create(
+    model=model,
+    instructions="Answer accurately.",
+    retry=RetryConfig(max_attempts=2),
+)
+```
+
+모델 호출은 다음 allowlist에 해당할 때만 재시도합니다.
+
+- timeout 오류
+- 연결 또는 네트워크 오류
+- HTTP `408`
+- HTTP `5xx`
+
+다음 오류는 재시도하지 않습니다.
+
+- HTTP `429`를 포함한 그 밖의 모든 HTTP `4xx`
+- 잘못된 JSON, 유효하지 않은 도구 인자 또는 provider 프로토콜/파싱 오류
+- 구조화 출력 검증 오류
+- 잘못된 요청, capability 불일치, `TypeError` 또는 프로그래밍 오류
+
+스트리밍 모델 호출은 공개 delta가 하나라도 전달된 후에는 재시도하지 않습니다.
+도구 재시도와 repair는 별도 계약이며 도구가 선언한 안전성 프로필도 충족해야
+합니다. 모델 재시도를 활성화했다는 이유만으로 도구 재실행이 안전해지지
+않습니다.
+
+### 전체 실행 모델 보호 장치
+
+모든 실행에는 서로 독립적인 두 가지 모델 보호 장치가 있습니다.
+
+```python
+limits = RunLimits(
+    max_model_turns=32,
+    no_progress_model_turn_threshold=3,
+)
+```
+
+- `max_model_turns=32`는 계획, 실행, 메모리 요약, Skill 선택, repair, 최종
+  출력에 걸친 프레임워크 관리 모델 시도 횟수를 제한합니다. 전송 오류
+  재시도도 이 예산을 사용합니다.
+- `no_progress_model_turn_threshold=3`은 동일한 의미 상태와 정규화된 응답이
+  연속 세 번 관찰되면 중단합니다. 성공한 도구 outcome은 run별 salt가 적용된
+  fingerprint가 새로울 때만 무진행 횟수를 초기화합니다. 동일한 성공 outcome의
+  반복은 보호 장치를 우회하지 않습니다. 새 입력을 소비한 각 메모리 요약
+  batch와 커밋된 각 계획 스텝도 진전으로 처리합니다. 어떤 경우에도 전체 모델
+  호출 횟수는 초기화하지 않습니다.
+
+이에 해당하는 종료 이유는 `max_model_turns`와 `no_progress`이며 둘 다
+자동으로 재시도하거나 안전하게 재개하지 않습니다. 따라서 `error_summary`와
+`AgentRunError`는 `retryable=False`, `resumable=False`와 함께 크기가 제한된
+카운터와 안전한 분류 필드만 포함합니다.
+
+기본 제공 구성 요소는 보조 호출도 run의 `ModelGateway`를 통과시킵니다.
+사용자 정의 메모리 정책, selector, planner와 model client도 이 경계를
+지켜야 합니다. provider를 직접 호출하거나 client 내부에서 숨겨진 재시도를
+수행하면 프레임워크가 각 요청을 별도 turn으로 계산할 수 없습니다.
+
+체크포인트 저장소가 있으면 provider 재시도를 포함한 모든 프레임워크 관리
+모델 시도를 실제 provider I/O 직전에 영속적으로 예약합니다. 따라서 요청 중
+프로세스가 강제 종료되어도 재개 시 이미 소비한 turn이 복원되지 않습니다.
+모델 보호 장치의 체크포인트에는 숫자 카운터, run별 무작위 salt,
+HMAC-SHA-256 관찰 digest만 저장합니다. 성공한 도구 진전 역시 run별 salt가
+적용된 fingerprint로 표현합니다. 원본 프롬프트, 모델 출력, 도구 인자와 결과,
+provider metadata, provider가 만든 call ID는 보호 장치 상태에 저장하지
+않습니다.
+
+## 프레임워크의 책임 범위
+
+ModuAgent 0.5에는 도메인 Recipe, Workflow DSL, 데이터베이스 추상화, SQL 생성
+또는 보고서 전용 동작이 포함되지 않습니다. 프레임워크는 구성 요소를 조합하고
+실행하며, 애플리케이션은 다음을 직접 담당합니다.
+
+- 지침과 업무 규칙
+- 도구 구현과 입출력 스키마
+- 기준이 되는 데이터베이스 또는 서비스 스키마
+- 도구 멱등성, repair 및 timeout 안전성 선언
+- 데이터베이스 역할, 트랜잭션, 쿼리 제한을 포함한 실제 보안 경계
+
+Quick API는 반복되는 프레임워크 연결 코드만 줄입니다. 도메인 의미나 도구
+안전성을 추론하지 않습니다.
+
+## 고급 조합: 대화 메모리
+
+동일한 `session_id`를 사용하면 대화를 이어갈 수 있습니다. 저장소, sink,
+인가, 체크포인트, 스킬, 사용자 정의 engine 또는 그 밖의 고급 구성 요소를
+선택해야 한다면 명시적인 `Agent(...)` 생성자를 사용합니다.
 
 ```python
 from moduagent import (
@@ -274,26 +570,23 @@ memory_agent = Agent(
         name="memory-assistant",
         instructions="Use relevant conversation context when answering.",
     ),
-    model=create_model(),
+    model=model,
     conversation_store=conversations,
     conversation_memory_policy=RecentTurnsConversationMemoryPolicy(max_turns=6),
 )
 
 async def demonstrate_memory() -> None:
-    remembered = await memory_agent.run(
+    first = await memory_agent.run(
         "Remember that my deployment region is Seoul.",
         session_id="user-42",
     )
-    if remembered.error:
-        raise RuntimeError(remembered.error)
+    first.raise_for_error()
 
     result = await memory_agent.run(
         "Which deployment region did I choose?",
         session_id="user-42",
     )
-    if result.error:
-        raise RuntimeError(result.error)
-    print(result.output)
+    print(result.unwrap())
 ```
 
 저장소와 메모리 정책의 역할은 서로 다릅니다.
@@ -314,134 +607,7 @@ vLLM의 정확한 토큰 계산을 반복해서 사용한다면 `VLLMTokenCounte
 `CachingTokenCounter`로 감쌉니다. cache에는 크기가 제한된 keyed digest와
 성공한 토큰 수만 저장됩니다.
 
-## 4단계: 검증된 구조화 출력 반환
-
-`PydanticOutputCodec`은 모델의 최종 응답을 검증하고 해당 모델 객체를
-`result.output`으로 반환합니다.
-
-```python
-from pydantic import BaseModel, Field
-
-from moduagent import Agent, AgentConfig, PydanticOutputCodec
-
-
-class Answer(BaseModel):
-    answer: str
-    confidence: float = Field(ge=0, le=1)
-
-
-structured_agent = Agent(
-    config=AgentConfig(
-        name="structured-assistant",
-        instructions=(
-            "Use the add Tool for every arithmetic operation, then return "
-            "the answer in the requested format."
-        ),
-    ),
-    model=create_model(),
-    tools=[add],
-    output_codec=PydanticOutputCodec(model=Answer),
-)
-
-async def demonstrate_structured_output() -> None:
-    result = await structured_agent.run(
-        "What is 20 plus 22?",
-        session_id="structured-demo",
-    )
-
-    if result.error:
-        raise RuntimeError(result.error)
-
-    answer: Answer = result.output
-    print(answer.answer, answer.confidence)
-```
-
-도구와 구조화 출력을 함께 사용할 수 있습니다. ModuAgent는 요청 단계를
-다음과 같이 분리합니다.
-
-```text
-ACT:      model receives Tool schemas, without the final output schema
-FINALIZE: model receives the Pydantic schema, without Tools
-```
-
-이 방식은 도구 호출과 구조화 출력을 같은 요청에 넣었을 때 흔히 발생하는
-vLLM 충돌을 방지합니다. `VLLMClient`는 기본적으로 이 조합을 지원하지 않는
-것으로 선언하므로 런타임이 분리 방식을 사용합니다.
-
-## 5단계: 엄격한 계획-실행 사용
-
-작업에 서로 의존하는 단계가 있고 각 중간 결과가 최종 답변에 반영되기 전에
-검증되어야 한다면 계획-실행을 사용합니다.
-
-```python
-from moduagent import (
-    Agent,
-    AgentConfig,
-    InMemoryCheckpointStore,
-    InMemoryConversationStore,
-    LLMPlanGenerator,
-    PlanExecutionProfile,
-    RunLimits,
-)
-
-model = create_model()
-
-planning_agent = Agent(
-    config=AgentConfig(
-        name="planning-agent",
-        instructions=(
-            "Use the add Tool for every arithmetic operation. "
-            "Complete multi-step requests using only validated and committed "
-            "step results."
-        ),
-        limits=RunLimits(
-            max_steps=4,
-            max_step_attempts=2,
-            max_replans=1,
-            max_tool_calls=8,
-            timeout_seconds=120,
-        ),
-    ),
-    model=model,
-    tools=[add],
-    execution_profile=PlanExecutionProfile(
-        plan_generator=LLMPlanGenerator(
-            model=model,
-            max_steps=4,
-        ),
-        revise_on_tool_failure=True,
-    ),
-    conversation_store=InMemoryConversationStore(),
-    checkpoint_store=InMemoryCheckpointStore(),
-)
-
-async def demonstrate_plan_execution() -> None:
-    result = await planning_agent.run(
-        "Calculate 10 + 20, then add 5 to that verified result.",
-        session_id="plan-demo",
-    )
-    if result.error:
-        raise RuntimeError(result.error)
-    print(result.output)
-```
-
-엄격한 실행 흐름은 다음과 같습니다.
-
-```text
-PLAN → ACT_TOOL → STEP_RESULT → VALIDATE/COMMIT → VERIFY → FINALIZE
-```
-
-- `max_steps`는 모델 호출 횟수가 아니라 생성되는 계획 단계 수를 제한합니다.
-- `max_step_attempts`는 한 단계의 검증 재시도 횟수를 제한합니다.
-- `max_replans`는 완료되지 않은 작업을 수정하는 횟수를 제한합니다.
-- `max_tool_calls`는 전체 실행에서 업무 도구 호출 횟수를 제한합니다.
-- `timeout_seconds`는 계획 수립부터 모델 호출, 도구 실행, 최종 응답 생성,
-  영속화까지 모든 작업이 공유하는 하나의 실행 기한입니다.
-
-채팅, 직접적인 도구 사용, 짧은 워크플로에는 Standard 실행이 더 나은
-기본값입니다.
-
-### 전체 리포트 자동화 예제
+### 애플리케이션 예제: 리포트 자동화
 
 저장소에는 단 두 개의 도구만 사용하는 완전한 계획-실행 에이전트가
 포함되어 있습니다.
@@ -474,7 +640,11 @@ python examples/report_automation_agent.py
 사용하세요. 예제도 읽기 전용 트랜잭션을 시작하고 statement 및 lock
 timeout을 적용합니다.
 
-## 다섯 단계를 마친 후
+이 코드는 사용자가 prompt, 스키마, 도구와 안전장치를 정의하는 방법을 보여
+주는 애플리케이션 예제입니다. 프레임워크에 내장된 Recipe나 데이터베이스
+추상화가 아닙니다.
+
+## Quick API 이후
 
 이제 대부분의 에이전트를 만들 수 있습니다. 다음 기능은 선택 사항이며,
 스트리밍, 복구, 재사용 가능한 도메인 절차 또는 배포 제어가 필요할 때
@@ -499,8 +669,8 @@ async def stream_result() -> None:
         elif event.type in (EventType.RUN_COMPLETED, EventType.RUN_FAILED):
             result = event.data["result"]
 
-    if result is not None and result.error:
-        raise RuntimeError(result.error)
+    if result is not None:
+        result.raise_for_error()
 ```
 
 두 가지 공개 델타를 모두 처리합니다. Standard의 직접 응답은
@@ -516,6 +686,8 @@ async def stream_result() -> None:
 정제된 원인도 확인해야 한다면 `DiagnosticSink`를 추가합니다.
 
 ```python
+import asyncio
+
 from moduagent import InMemoryDiagnosticSink, LoggingEventSink
 
 diagnostics = InMemoryDiagnosticSink(max_records=1_000)
@@ -525,7 +697,7 @@ observable_agent = Agent(
         name="observable-agent",
         instructions="Complete the request using the available Tools.",
     ),
-    model=create_model(),
+    model=model,
     tools=[add],
     event_sink=LoggingEventSink(),
     diagnostic_sink=diagnostics,
@@ -533,15 +705,20 @@ observable_agent = Agent(
     diagnostic_max_pending_deliveries=1_024,
 )
 
-result = await observable_agent.run("Use add for 20 + 22.")
 
-if result.failure_id is not None:
-    failure = diagnostics.get(result.failure_id)
-    if failure is not None:
-        print(failure.to_dict())
+async def main() -> None:
+    result = await observable_agent.run("Use add for 20 + 22.")
 
-for failure in diagnostics.for_run(result.run_id):
-    print(failure.failure_id, failure.component, failure.operation)
+    if result.failure_id is not None:
+        failure = diagnostics.get(result.failure_id)
+        if failure is not None:
+            print(failure.to_dict())
+
+    for failure in diagnostics.for_run(result.run_id):
+        print(failure.failure_id, failure.component, failure.operation)
+
+
+asyncio.run(main())
 ```
 
 `result.metadata["tool_trace"]`에는 실제 실행된 도구와 연관 ID가 기록됩니다.
@@ -551,7 +728,7 @@ for failure in diagnostics.for_run(result.run_id):
 오류는 도구 추적 정보와 `diagnostics.for_run()`에만 남을 수 있습니다.
 
 진단은 기본적으로 꺼져 있습니다. `diagnostic_sink`를 생략하거나
-`NoopDiagnosticSink`를 사용하면 0.4 동작을 유지합니다. 전달은 최선 노력
+`NoopDiagnosticSink`를 사용하면 기본 동작을 유지합니다. 전달은 최선 노력
 방식이며
 `diagnostic_timeout_seconds`와 `diagnostic_max_pending_deliveries`로
 제한됩니다. 표준 라이브러리 로깅은 제한된 데몬 워커 풀에서 실행되며 이미
@@ -601,7 +778,7 @@ resumable_agent = Agent(
         name="resumable-agent",
         instructions="Complete the request safely.",
     ),
-    model=create_model(),
+    model=model,
     tools=[add],
     conversation_store=InMemoryConversationStore(),
     checkpoint_store=checkpoints,
@@ -635,6 +812,9 @@ async def resume_if_safe() -> None:
 체크포인트가 존재하더라도 `resumable`은 `false`일 수 있습니다. 특히 도구가
 시작되었지만 그 결과가 영속적으로 확정되지 않았을 수 있습니다. ModuAgent는
 해당 도구를 자동으로 다시 실행하지 않고 실행을 중단하여 수동 검토를 요구합니다.
+`max_model_turns`와 `no_progress`도 항상 `resumable=false`인 terminal 보호
+결정입니다. 재개로 소비한 turn 예산을 늘리거나 동작한 circuit을 다시 열 수
+없습니다.
 
 체크포인트를 사용하는 에이전트에는 원자적 `append_once()`를 지원하는
 `ConversationStore`가 필요합니다. 내장 인메모리 저장소와 지원되는 Redis
@@ -657,10 +837,10 @@ skills/
 ```
 
 ```python
-from moduagent import SkillRegistry, function_tool
+from moduagent import SkillRegistry, tool
 
 
-@function_tool(idempotent=True)
+@tool(idempotent=True)
 def lookup_invoice(invoice_id: str) -> dict[str, object]:
     """Look up an invoice by ID."""
     return {
@@ -678,7 +858,7 @@ agent = Agent(
         name="invoice-agent",
         instructions="Use verified evidence only.",
     ),
-    model=create_model(),
+    model=model,
     tools=[lookup_invoice],
     skill_registry=skills,
 )
@@ -689,9 +869,7 @@ async def review_invoice() -> None:
         session_id="invoice-42",
         skills=["invoice-review"],
     )
-    if result.error:
-        raise RuntimeError(result.error)
-    print(result.output)
+    print(result.unwrap())
 ```
 
 예제 도구는 시연을 위해 고정된 데이터를 반환합니다. 함수 본문을 권한이
@@ -707,8 +885,8 @@ async def review_invoice() -> None:
 
 ## 확정된 에이전트 설정 확인
 
-`Agent.inspect()`는 외부 요청을 보내지 않으며, 변경할 수 없고 비밀 정보를
-노출하지 않는 `AgentSpec`을 반환합니다.
+`Agent.inspect()`는 외부 요청을 보내지 않으며, 변경할 수 없고 credential이
+마스킹된 `AgentSpec`을 반환합니다.
 
 ```python
 spec = planning_agent.inspect()
@@ -720,6 +898,8 @@ print(spec.to_dict(include_instructions=False))
 
 이 명세에는 확정된 모델 기능, 도구 스키마 지문과 안전 프로필, 출력 동작,
 영속성 정책, 호환성 메타데이터가 포함됩니다. API 키와 토큰은 마스킹됩니다.
+원본 instruction은 객체에 남아 있으므로 instruction에 비밀 정보를 넣지 말고,
+명세를 로깅하거나 외부로 내보낼 때는 `include_instructions=False`를 사용합니다.
 
 ## 프로덕션 적용 전
 
@@ -754,7 +934,8 @@ ModuAgent는 분산 잠금, 작업자 큐, 스케줄러, 영속 아웃박스, �
 
 ### Pydantic 출력을 사용했을 때 도구가 실행되지 않은 이유는 무엇인가요?
 
-0.4에서는 도구 선택과 최종 구조화 출력이 서로 다른 모델 단계입니다. 도구가
+ModuAgent에서는 도구 선택과 최종 구조화 출력이 서로 다른 모델 단계입니다.
+도구가
 호출되지 않았다면 모델의 도구 호출 지원 여부, 채팅 템플릿과 파서 설정,
 도구 설명, 에이전트 지침을 확인합니다.
 
@@ -779,9 +960,11 @@ Redis 또는 영속 사용자 정의 저장소를 사용합니다.
 
 | 목적 | 주요 API |
 |---|---|
-| 구성 및 실행 | `Agent`, `AgentConfig`, `RunLimits`, `RetryConfig` |
+| 빠른 구성과 출력 | `Agent.create()`, `Agent.ask()`, `AgentRunError` |
+| 실행 운영 | `Agent.run()`, `AgentResult`, `RunLimits`, `RetryConfig` |
+| 명시적 조합 | `Agent`, `AgentConfig` |
 | 모델 연결 | `VLLMClient`, `OllamaClient` |
-| 도구 추가 | `function_tool`, `ToolSafetyProfile`, `ToolAuthorizer` |
+| 도구 추가 | `tool`, `function_tool`, `ToolSafetyProfile`, `ToolAuthorizer` |
 | 실행 방식 선택 | `StandardExecutionProfile`, `PlanExecutionProfile` |
 | 출력 검증 | `PydanticOutputCodec`, `TextOutputCodec` |
 | 대화 유지 | `ConversationStore`, `RecentTurnsConversationMemoryPolicy` |

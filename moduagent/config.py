@@ -54,6 +54,11 @@ class RunLimits:
     max_step_attempts: int = 2
     max_replans: int = 2
     max_tool_repair_attempts: int = 1
+    # Appended for 0.5 so all 0.4 positional arguments retain their meaning.
+    # Three identical completed turns tolerate one redundant retry while
+    # stopping a stable model loop before it consumes the wider turn budget.
+    max_model_turns: int = 32
+    no_progress_model_turn_threshold: int = 3
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -63,6 +68,8 @@ class RunLimits:
             "max_step_attempts",
             "max_replans",
             "max_tool_repair_attempts",
+            "max_model_turns",
+            "no_progress_model_turn_threshold",
         ):
             if type(getattr(self, field_name)) is not int:
                 raise TypeError(f"{field_name} must be an integer")
@@ -88,6 +95,10 @@ class RunLimits:
             raise ValueError("timeout_seconds must be positive")
         if self.max_parallel_tools < 1:
             raise ValueError("max_parallel_tools must be at least 1")
+        if self.max_model_turns < 1:
+            raise ValueError("max_model_turns must be at least 1")
+        if self.no_progress_model_turn_threshold < 2:
+            raise ValueError("no_progress_model_turn_threshold must be at least 2")
 
 
 @dataclass(frozen=True, slots=True)

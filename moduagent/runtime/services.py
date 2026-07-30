@@ -28,8 +28,11 @@ from moduagent.models import (
     ModelChunk,
     ModelClient,
     ModelCapabilities,
+    ModelErrorClassification,
+    ModelProtocolError,
     ModelRequest,
     ModelResponse,
+    classify_model_error,
     validate_request_capabilities,
 )
 from moduagent.observability.diagnostics import NoopDiagnosticSink
@@ -37,6 +40,11 @@ from moduagent.runtime.events import AgentEvent
 from moduagent.runtime.events import EventType
 from moduagent.runtime.events import EventVisibility
 from moduagent.runtime.context import RunStatus
+from moduagent.runtime.model_guard import (
+    ModelGuardSnapshot,
+    ModelGuardTripped,
+    NoProgressCircuitBreaker,
+)
 from moduagent.skills.tools import SKILL_RESOURCE_TOOL_NAMES
 from moduagent.tools import (
     FailureProjector,
@@ -51,6 +59,7 @@ from moduagent.tools import (
     ToolSafetyProfile,
     ToolSchema,
     fingerprint_tool_arguments,
+    is_tool_argument_fingerprint,
 )
 
 
@@ -64,6 +73,8 @@ _ENGINE_OWNED_POLICY_KEYS = frozenset(
     }
 )
 _MAX_PENDING_SERVICE_EVENTS = 256
+_MODEL_GUARD_POLICY_KEY = "_moduagent_model_guard"
+_TOOL_PROGRESS_POLICY_KEY = "_moduagent_successful_tool_progress"
 
 
 def _contains_unsupported_projection(value: Any) -> bool:
@@ -106,6 +117,11 @@ class RuntimeServices:
         init=False,
         repr=False,
     )
+    _model_guard: NoProgressCircuitBreaker | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
     _pending_event_signal: asyncio.Event = field(
         default_factory=asyncio.Event,
         init=False,
@@ -123,7 +139,43 @@ class RuntimeServices:
         if self._bound_context is not None and self._bound_context is not context:
             raise ExecutionInvariantError("RuntimeServices cannot be rebound")
         self._bound_context = context
+        limits = context.config.limits
+        raw_guard_state = context.run.policy_state.get(_MODEL_GUARD_POLICY_KEY)
+        try:
+            self._model_guard = (
+                NoProgressCircuitBreaker(
+                    max_model_turns=limits.max_model_turns,
+                    no_progress_model_turn_threshold=(
+                        limits.no_progress_model_turn_threshold
+                    ),
+                )
+                if raw_guard_state is None
+                else NoProgressCircuitBreaker.from_state(
+                    raw_guard_state,
+                    max_model_turns=limits.max_model_turns,
+                    no_progress_model_turn_threshold=(
+                        limits.no_progress_model_turn_threshold
+                    ),
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise ExecutionInvariantError(
+                "checkpoint model guard state is invalid"
+            ) from exc
+        raw_tool_progress = context.run.policy_state.get(_TOOL_PROGRESS_POLICY_KEY)
+        if raw_tool_progress is not None and not is_tool_argument_fingerprint(
+            raw_tool_progress
+        ):
+            raise ExecutionInvariantError("checkpoint Tool progress state is invalid")
+        self._sync_model_guard_state(context)
         context.run.model_gateway = self
+
+    def restore_engine_snapshot(self, snapshot: EngineSnapshot) -> None:
+        """Restore the last durable Engine envelope for write-ahead updates."""
+
+        if not isinstance(snapshot, EngineSnapshot):
+            raise TypeError("snapshot must be an EngineSnapshot")
+        self._last_engine_snapshot = snapshot
 
     @property
     def checkpointing_enabled(self) -> bool:
@@ -144,6 +196,152 @@ class RuntimeServices:
         if context is None:
             raise ExecutionInvariantError("ModelGateway is not bound to a run")
         return await self._complete_model(context, model, request, phase=phase)
+
+    async def _before_model_attempt(
+        self,
+        context: EngineContext,
+        *,
+        phase: str,
+    ) -> ModelGuardSnapshot:
+        guard = self._require_model_guard()
+        try:
+            guard_snapshot = guard.before_model_attempt(
+                {
+                    "engine_id": str(context.resolved_spec.get("engine_id", "unknown")),
+                    "phase": phase,
+                    "step_id": self._current_step_id(context),
+                }
+            )
+        finally:
+            self._sync_model_guard_state(context)
+        if self.checkpointing_enabled:
+            snapshot = self._last_engine_snapshot
+            if snapshot is None:
+                # Automatic Skill selection and LLM Plan creation can invoke a
+                # Model before Engine.initialize() has a state to checkpoint.
+                # Their reservation itself becomes the empty bootstrap. The
+                # coordinator keeps _moduagent_engine_initialized=False until
+                # initialization succeeds and persists a real Engine state.
+                snapshot = EngineSnapshot(
+                    engine_id=str(context.resolved_spec.get("engine_id", "unknown")),
+                    state_version=int(context.resolved_spec.get("state_version", 1)),
+                    state={},
+                )
+            # Write the reservation before provider I/O. Reusing the last
+            # Engine snapshot is intentional: the provider response has not
+            # advanced Engine state yet, while the guard turn already belongs
+            # to this run even if the process hard-crashes during the request.
+            await self.checkpoint(
+                context,
+                snapshot,
+                boundary=DurableBoundary.BEFORE_MODEL,
+            )
+        return guard_snapshot
+
+    def _observe_model_response(
+        self,
+        context: EngineContext,
+        response: ModelResponse,
+    ) -> ModelGuardSnapshot:
+        guard = self._require_model_guard()
+        try:
+            return guard.observe_model_response(response)
+        finally:
+            self._sync_model_guard_state(context)
+
+    def _observe_completed_model_response(
+        self,
+        context: EngineContext,
+        response: ModelResponse,
+        *,
+        phase: str,
+    ) -> ModelGuardSnapshot:
+        snapshot = self._observe_model_response(context, response)
+        if phase == "memory_summary":
+            # Each successful summary batch consumes new source records. Its
+            # text may legitimately be identical to the preceding folded
+            # summary, so begin the next batch with fresh no-progress history.
+            return self._mark_model_progress(context)
+        return snapshot
+
+    def _abandon_model_attempt(
+        self,
+        context: EngineContext,
+    ) -> ModelGuardSnapshot:
+        guard = self._require_model_guard()
+        try:
+            return guard.abandon_model_attempt()
+        finally:
+            self._sync_model_guard_state(context)
+
+    def _mark_model_progress(
+        self,
+        context: EngineContext,
+    ) -> ModelGuardSnapshot:
+        guard = self._require_model_guard()
+        try:
+            return guard.mark_progress()
+        finally:
+            self._sync_model_guard_state(context)
+
+    def _mark_successful_tool_progress(
+        self,
+        context: EngineContext,
+        calls: tuple[Any, ...],
+        results: tuple[ToolResult, ...],
+    ) -> bool:
+        """Reset no-progress only for a semantically new successful outcome.
+
+        Provider call IDs, attempts, and durations are deliberately excluded.
+        The checkpoint retains only a canonical SHA-256 fingerprint, never
+        Tool arguments or results.
+        """
+
+        successful = [
+            {
+                "tool_name": call.name,
+                "arguments": dict(
+                    result.invocation_arguments
+                    if result.invocation_arguments is not None
+                    else call.arguments
+                ),
+                "value": result.value,
+            }
+            for call, result in zip(calls, results)
+            if result.success
+        ]
+        if not successful:
+            return False
+        guard_state = context.run.policy_state.get(_MODEL_GUARD_POLICY_KEY)
+        run_salt = guard_state.get("salt") if isinstance(guard_state, Mapping) else None
+        digest = fingerprint_tool_arguments(
+            {
+                "run_salt": run_salt,
+                "successful_tool_outcomes": successful,
+            }
+        )
+        previous = context.run.policy_state.get(_TOOL_PROGRESS_POLICY_KEY)
+        context.run.policy_state[_TOOL_PROGRESS_POLICY_KEY] = digest
+        if previous == digest:
+            return False
+        self._mark_model_progress(context)
+        return True
+
+    def _require_model_guard(self) -> NoProgressCircuitBreaker:
+        if self._model_guard is None:
+            raise ExecutionInvariantError("model guard is not bound to a run")
+        return self._model_guard
+
+    def _sync_model_guard_state(self, context: EngineContext) -> None:
+        guard = self._model_guard
+        if guard is None:
+            return
+        context.run.policy_state[_MODEL_GUARD_POLICY_KEY] = dict(guard.to_state())
+        snapshot = guard.snapshot
+        context.run.metadata["_moduagent_model_turns"] = snapshot.model_turns
+        context.run.metadata["_moduagent_no_progress_model_turns"] = (
+            snapshot.no_progress_model_turns
+        )
 
     def drain_events(self) -> tuple[AgentEvent, ...]:
         """Return service-owned events waiting to enter the public stream."""
@@ -307,10 +505,15 @@ class RuntimeServices:
             ) from exc
         context.run.status = RunStatus.WAITING_FOR_MODEL
         for attempt in range(1, context.config.retry.max_attempts + 1):
+            guard_snapshot = await self._before_model_attempt(
+                context,
+                phase=phase,
+            )
             await self._queue_model_started(
                 context,
                 attempt=attempt,
                 phase=phase,
+                model_turn=guard_snapshot.model_turns,
             )
             attempt_started = asyncio.get_running_loop().time()
             try:
@@ -319,7 +522,7 @@ class RuntimeServices:
                     timeout=self.remaining_seconds(context),
                 )
                 if not isinstance(response, ModelResponse):
-                    raise TypeError("model must return ModelResponse")
+                    raise ModelProtocolError("model client must return ModelResponse")
                 context.run.usage = context.run.usage + response.usage
                 context.run.status = RunStatus.RUNNING
                 await self._queue_model_completed(
@@ -332,11 +535,24 @@ class RuntimeServices:
                         asyncio.get_running_loop().time() - attempt_started,
                     ),
                 )
+                self._observe_completed_model_response(
+                    context,
+                    response,
+                    phase=phase,
+                )
                 return response
             except asyncio.CancelledError:
+                self._abandon_model_attempt(context)
                 raise
             except Exception as exc:
-                if attempt >= context.config.retry.max_attempts:
+                self._abandon_model_attempt(context)
+                if isinstance(exc, ModelGuardTripped):
+                    raise
+                classification = classify_model_error(exc)
+                if (
+                    not classification.retryable
+                    or attempt >= context.config.retry.max_attempts
+                ):
                     await self._capture_exception(
                         context,
                         exc,
@@ -345,27 +561,24 @@ class RuntimeServices:
                         phase=phase,
                         step_id=self._current_step_id(context),
                         attempt=attempt,
-                        category=(
-                            "timeout"
-                            if isinstance(exc, asyncio.TimeoutError)
-                            else "model_invocation"
-                        ),
-                        code=(
-                            "model_timeout"
-                            if isinstance(exc, asyncio.TimeoutError)
-                            else "model_invocation_failed"
-                        ),
-                        retryable=True,
+                        category=classification.category,
+                        code=classification.code,
+                        retryable=classification.retryable,
                         terminal=True,
                     )
                     if isinstance(exc, asyncio.TimeoutError):
                         raise
+                    if classification.code == "model_protocol_error":
+                        raise ModelProtocolError(
+                            "model protocol response is invalid"
+                        ) from exc
                     raise ModelInvocationError("model invocation failed") from exc
                 await self._queue_retry_event(
                     context,
                     attempt=attempt,
                     phase=phase,
                     error=exc,
+                    classification=classification,
                 )
                 delay = min(
                     context.config.retry.delay_for(attempt),
@@ -431,10 +644,15 @@ class RuntimeServices:
         emitted_output = False
         context.run.status = RunStatus.WAITING_FOR_MODEL
         for attempt in range(1, context.config.retry.max_attempts + 1):
+            guard_snapshot = await self._before_model_attempt(
+                context,
+                phase=phase,
+            )
             await self._queue_model_started(
                 context,
                 attempt=attempt,
                 phase=phase,
+                model_turn=guard_snapshot.model_turns,
             )
             attempt_started = asyncio.get_running_loop().time()
             try:
@@ -450,7 +668,7 @@ class RuntimeServices:
                     except StopAsyncIteration:
                         break
                     if not isinstance(chunk, ModelChunk):
-                        raise TypeError("model stream must yield ModelChunk")
+                        raise ModelProtocolError("model stream must yield ModelChunk")
                     emitted_output = emitted_output or bool(chunk.delta)
                     terminal = terminal or chunk.response is not None
                     if chunk.response is not None:
@@ -471,9 +689,13 @@ class RuntimeServices:
                         )
                     yield chunk
                 if not terminal:
-                    raise RuntimeError("model stream ended without a final response")
+                    raise ModelProtocolError(
+                        "model stream ended without a final response"
+                    )
                 if response is None:
-                    raise RuntimeError("model stream returned no terminal response")
+                    raise ModelProtocolError(
+                        "model stream returned no terminal response"
+                    )
                 context.run.usage = context.run.usage + response.usage
                 context.run.status = RunStatus.RUNNING
                 await self._queue_model_completed(
@@ -486,11 +708,22 @@ class RuntimeServices:
                         asyncio.get_running_loop().time() - attempt_started,
                     ),
                 )
+                self._observe_completed_model_response(
+                    context,
+                    response,
+                    phase=phase,
+                )
                 return
             except asyncio.CancelledError:
+                self._abandon_model_attempt(context)
                 raise
             except Exception as exc:
-                if emitted_output or attempt >= context.config.retry.max_attempts:
+                self._abandon_model_attempt(context)
+                if isinstance(exc, ModelGuardTripped):
+                    raise
+                classification = classify_model_error(exc)
+                retryable = classification.retryable and not emitted_output
+                if not retryable or attempt >= context.config.retry.max_attempts:
                     await self._capture_exception(
                         context,
                         exc,
@@ -499,27 +732,40 @@ class RuntimeServices:
                         phase=phase,
                         step_id=self._current_step_id(context),
                         attempt=attempt,
-                        category=(
-                            "timeout"
-                            if isinstance(exc, asyncio.TimeoutError)
-                            else "model_invocation"
-                        ),
-                        code=(
-                            "model_timeout"
-                            if isinstance(exc, asyncio.TimeoutError)
-                            else "model_invocation_failed"
-                        ),
-                        retryable=True,
+                        category=classification.category,
+                        code=classification.code,
+                        retryable=retryable,
                         terminal=True,
                     )
+                    if emitted_output:
+                        # A transient transport failure is no longer safe to
+                        # retry after public output. Preserve that effective
+                        # classification even when diagnostics are disabled
+                        # and no FailureDiagnostic supplies primary metadata.
+                        self._record_primary_failure_summary(
+                            context,
+                            component="model",
+                            operation="stream",
+                            phase=phase,
+                            step_id=self._current_step_id(context),
+                            attempt=attempt,
+                            category=classification.category,
+                            code=classification.code,
+                            retryable=False,
+                        )
                     if isinstance(exc, asyncio.TimeoutError):
                         raise
+                    if classification.code == "model_protocol_error":
+                        raise ModelProtocolError(
+                            "model protocol response is invalid"
+                        ) from exc
                     raise ModelInvocationError("model invocation failed") from exc
                 await self._queue_retry_event(
                     context,
                     attempt=attempt,
                     phase=phase,
                     error=exc,
+                    classification=classification,
                 )
                 delay = min(
                     context.config.retry.delay_for(attempt),
@@ -587,6 +833,39 @@ class RuntimeServices:
             }
             return failure_id
         return None
+
+    @staticmethod
+    def _record_primary_failure_summary(
+        context: EngineContext,
+        *,
+        component: str,
+        operation: str,
+        phase: str | None,
+        step_id: str | None,
+        attempt: int | None,
+        category: str,
+        code: str,
+        retryable: bool,
+    ) -> None:
+        existing = context.run.primary_failure
+        failure_id = (
+            existing.get("failure_id") if isinstance(existing, Mapping) else None
+        )
+        context.run.primary_failure = {
+            **(
+                {"failure_id": failure_id}
+                if isinstance(failure_id, str) and failure_id
+                else {}
+            ),
+            "component": component,
+            "operation": operation,
+            **({} if phase is None else {"phase": phase}),
+            **({} if step_id is None else {"step_id": step_id}),
+            **({} if attempt is None else {"attempt": attempt}),
+            "category": category,
+            "code": code,
+            "retryable": retryable,
+        }
 
     @staticmethod
     def _current_step_id(context: EngineContext) -> str | None:
@@ -765,6 +1044,11 @@ class RuntimeServices:
                 result,
                 failure=failure_payload,
             )
+        self._mark_successful_tool_progress(
+            context,
+            outcome.calls,
+            outcome.results,
+        )
         return outcome
 
     async def record_tool_result(
@@ -801,6 +1085,11 @@ class RuntimeServices:
             result,
             failure=failure,
         )
+        self._mark_successful_tool_progress(
+            context,
+            (call,),
+            (result,),
+        )
 
     async def finalize(
         self,
@@ -834,18 +1123,18 @@ class RuntimeServices:
         else:
             response = await self.request_model(context, request, phase=phase)
         if response is None:
-            raise ModelInvocationError("finalization returned no response")
+            raise ModelProtocolError("finalization returned no response")
         if response.tool_calls or response.message.tool_calls:
-            raise ModelInvocationError("finalization returned tool calls")
+            raise ModelProtocolError("finalization returned tool calls")
         finish_reason = (response.finish_reason or "").lower()
         if finish_reason in {"timeout", "length", "max_tokens"}:
-            raise ModelInvocationError(
+            raise ModelProtocolError(
                 f"incomplete finalization response ({finish_reason})"
             )
         output = self.decode_output(context, response)
         content = response.message.content
         if content is None or not str(content).strip():
-            raise ModelInvocationError("finalization response is empty")
+            raise ModelProtocolError("finalization response is empty")
         finalized = FinalizationResult(
             response=response,
             output=output,
@@ -943,6 +1232,8 @@ class RuntimeServices:
         *,
         boundary: DurableBoundary,
     ) -> None:
+        if boundary is DurableBoundary.STEP_COMMITTED:
+            self._mark_model_progress(context)
         if not self.checkpointing_enabled:
             return
         self._last_engine_snapshot = snapshot
@@ -1110,6 +1401,7 @@ class RuntimeServices:
         attempt: int,
         phase: str,
         error: Exception,
+        classification: ModelErrorClassification,
     ) -> None:
         event = AgentEvent(
             EventType.RETRY,
@@ -1120,6 +1412,8 @@ class RuntimeServices:
                 "phase": phase,
                 "error": "model request failed",
                 "error_type": type(error).__name__,
+                "code": classification.code,
+                "retryable": classification.retryable,
             },
         )
         await self._enqueue_event(await self.publish_event(context, event))
@@ -1130,6 +1424,7 @@ class RuntimeServices:
         *,
         attempt: int,
         phase: str,
+        model_turn: int,
     ) -> None:
         await self.defer_event(
             context,
@@ -1139,6 +1434,7 @@ class RuntimeServices:
                 {
                     "step": context.run.step,
                     "attempt": attempt,
+                    "model_turn": model_turn,
                     "phase": phase,
                 },
                 visibility=EventVisibility.INTERNAL,

@@ -5,6 +5,8 @@ from typing import Any, Protocol, runtime_checkable
 
 import httpx
 
+from .errors import ModelProtocolError
+
 
 @runtime_checkable
 class HttpTransport(Protocol):
@@ -49,9 +51,14 @@ class HttpxTransport:
             timeout=timeout,
         )
         response.raise_for_status()
-        value = response.json()
+        try:
+            value = response.json()
+        except (ValueError, UnicodeError) as exc:
+            raise ModelProtocolError("model endpoint returned invalid JSON") from exc
         if not isinstance(value, Mapping):
-            raise ValueError("model endpoint returned a non-object JSON response")
+            raise ModelProtocolError(
+                "model endpoint returned a non-object JSON response"
+            )
         return dict(value)
 
     async def stream_lines(

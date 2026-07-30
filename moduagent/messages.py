@@ -155,6 +155,8 @@ class FinishReason(str, Enum):
     COMPLETED = "completed"
     MAX_STEPS = "max_steps"
     MAX_TOOL_CALLS = "max_tool_calls"
+    MAX_MODEL_TURNS = "max_model_turns"
+    NO_PROGRESS = "no_progress"
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
     ERROR = "error"

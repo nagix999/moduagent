@@ -98,5 +98,5 @@ jobs:
           python -m venv /tmp/moduagent-venv
           /tmp/moduagent-venv/bin/python -m pip install /tmp/moduagent-wheel/moduagent-*.whl
           /tmp/moduagent-venv/bin/python -c \
-            "import moduagent; assert moduagent.__version__ == '0.4.2'"
+            "import moduagent; assert moduagent.__version__ == '0.5.0'"
           /tmp/moduagent-venv/bin/moduagent --help

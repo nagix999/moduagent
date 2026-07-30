@@ -1623,7 +1623,7 @@ def test_invalid_step_result_secret_does_not_leak_to_public_failure() -> None:
 
         terminal = next(event for event in events if event.type is EventType.RUN_FAILED)
         result = terminal.data["result"]
-        assert result.error == ("StepResult validation failed after maximum attempts")
+        assert result.error == "StepResult protocol validation failed"
         assert all(secret not in repr(event.data) for event in events)
 
     asyncio.run(scenario())

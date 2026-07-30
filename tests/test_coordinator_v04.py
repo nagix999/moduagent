@@ -296,7 +296,7 @@ def test_model_retry_event_excludes_raw_provider_exception() -> None:
             del request
             self.calls += 1
             if self.calls == 1:
-                raise RuntimeError("provider token=TOPSECRET")
+                raise ConnectionError("provider token=TOPSECRET")
             return ModelResponse(Message.assistant("recovered"))
 
         async def stream(self, request: ModelRequest):
@@ -328,7 +328,7 @@ def test_model_retry_event_excludes_raw_provider_exception() -> None:
 
         retry = next(event for event in events if event.type is EventType.RETRY)
         assert retry.data["error"] == "model request failed"
-        assert retry.data["error_type"] == "RuntimeError"
+        assert retry.data["error_type"] == "ConnectionError"
         assert "TOPSECRET" not in repr([event.to_dict() for event in events])
 
     asyncio.run(scenario())

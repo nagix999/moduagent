@@ -25,9 +25,11 @@ from moduagent.persistence import (
     RedisCheckpointStore,
     RunCheckpoint,
     RunSnapshot,
+    SNAPSHOT_RUNTIME_VERSION,
     StateMigrationError,
     migrate_checkpoint_payload,
 )
+from moduagent.persistence.snapshot import current_runtime_version
 from moduagent.runtime.context import AgentResult, RunContext, RunRequest
 from moduagent.runtime.events import (
     AgentEvent,
@@ -152,6 +154,24 @@ def test_v4_snapshot_has_dual_version_guard_and_shared_engine_contract() -> None
     assert restored.engine.engine_id == "standard"
     assert EngineSnapshot is ExecutionEngineSnapshot
     assert isinstance(restored.engine, ExecutionEngineSnapshot)
+
+
+def test_snapshot_runtime_version_tracks_the_v05_release_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert SNAPSHOT_RUNTIME_VERSION == "0.5.0"
+
+    monkeypatch.setattr(
+        "moduagent.persistence.snapshot.version",
+        lambda package: "0.5.7",
+    )
+    assert current_runtime_version() == "0.5.7"
+
+    monkeypatch.setattr(
+        "moduagent.persistence.snapshot.version",
+        lambda package: "0.4.2",
+    )
+    assert current_runtime_version() == SNAPSHOT_RUNTIME_VERSION
 
 
 def test_event_wire_projection_is_finite_and_never_uses_opaque_repr() -> None:

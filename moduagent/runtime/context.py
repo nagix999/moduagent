@@ -5,12 +5,24 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping
 
+from moduagent.errors import AgentRunError
 from moduagent.messages import FinishReason, Message, MessageRole, Usage
 from moduagent.models import ModelGateway
 
 
 _SKILL_MODES = frozenset({"disabled", "explicit", "auto", "hybrid"})
 _SKILL_PHASES = ("plan", "act", "finalize")
+
+
+def _safe_run_id(value: Any) -> str:
+    if not isinstance(value, str):
+        return "unknown"
+    normalized = " ".join(
+        "".join(
+            character if character.isprintable() else " " for character in value
+        ).split()
+    )
+    return normalized[:256] or "unknown"
 
 
 class RunStatus(str, Enum):
@@ -272,3 +284,49 @@ class AgentResult:
             return None
         value = summary.get("failure_id")
         return value if isinstance(value, str) and value else None
+
+    def raise_for_error(self) -> None:
+        """Raise :class:`AgentRunError` unless this result completed successfully."""
+
+        if self.finish_reason == FinishReason.COMPLETED and self.error is None:
+            return
+        summary = self.metadata.get("error_summary")
+        raise AgentRunError(
+            run_id=self.run_id,
+            finish_reason=(
+                self.finish_reason.value
+                if isinstance(self.finish_reason, FinishReason)
+                else str(self.finish_reason)
+            ),
+            error_summary=summary if isinstance(summary, Mapping) else None,
+        )
+
+    def unwrap(self) -> Any:
+        """Return the decoded output, raising :class:`AgentRunError` on failure."""
+
+        self.raise_for_error()
+        return self.output
+
+    def explain(self) -> str:
+        """Return a concise, secret-safe terminal run summary."""
+
+        if self.finish_reason == FinishReason.COMPLETED and self.error is None:
+            return (
+                "agent run completed "
+                f"(run_id={_safe_run_id(self.run_id)}, "
+                f"input_tokens={self.usage.input_tokens}, "
+                f"output_tokens={self.usage.output_tokens}, "
+                f"total_tokens={self.usage.total_tokens})"
+            )
+        summary = self.metadata.get("error_summary")
+        return str(
+            AgentRunError(
+                run_id=self.run_id,
+                finish_reason=(
+                    self.finish_reason.value
+                    if isinstance(self.finish_reason, FinishReason)
+                    else str(self.finish_reason)
+                ),
+                error_summary=summary if isinstance(summary, Mapping) else None,
+            )
+        )
