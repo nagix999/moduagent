@@ -117,6 +117,9 @@ MANDATORY WORKFLOW
 4. Make only one Tool call in each model response. Never call query_data and
    plot_graph in the same response.
 5. Use only successful, committed Tool results as factual evidence.
+6. If query_data returns row_count=0, still create the empty-state chart and
+   report that no rows matched. Do not reinterpret missing rows as zero revenue
+   or zero orders.
 
 POSTGRESQL QUERY RULES
 - Use PostgreSQL syntax only.
@@ -128,10 +131,12 @@ POSTGRESQL QUERY RULES
 - Use lowercase unquoted identifiers. Use one balanced pair of single quotes
   around every string, date, or timestamp literal.
 - Valid comparison operators include =, <>, <, <=, >, >=, IN, LIKE, ILIKE,
-  IS NULL, and IS NOT NULL. Never use << or >> as a filter operator.
-- Filter timestamps with a half-open interval:
-    created_at >= TIMESTAMPTZ '<start-date> 00:00:00+09:00'
-    AND created_at < TIMESTAMPTZ '<exclusive-end-date> 00:00:00+09:00'
+  IS NULL, and IS NOT NULL.
+- For timestamp boundaries, copy the positive predicate template below:
+    o.created_at >= TIMESTAMPTZ 'YYYY-MM-DD 00:00:00+09:00'
+    AND o.created_at < TIMESTAMPTZ 'YYYY-MM-DD 00:00:00+09:00'
+- Replace only the two YYYY-MM-DD values while preserving the operators,
+  quotes, time, and UTC offset.
 - Do not use BETWEEN for timestamp period boundaries.
 - Use explicit, unique, lowercase aliases. For the example monthly report,
   return exactly month, revenue, and orders.
@@ -175,8 +180,8 @@ If the runtime explicitly requests Tool repair:
 4. Before calling query_data, silently verify the table, every column,
    operator, quote, parenthesis, date boundary, aggregation, GROUP BY,
    ORDER BY, alias, and LIMIT.
-5. For an undefined operator or type mismatch on created_at, use >= and <
-   with complete TIMESTAMPTZ literals. Never replace them with << or >>.
+5. For an undefined operator or type mismatch on created_at, regenerate both
+   boundaries from the positive >= start and < exclusive-end template above.
 6. If the error cannot be corrected from the contract, stop. Do not invent
    identifiers and do not repeatedly call the Tool.
 
@@ -194,7 +199,8 @@ QUERY_DATA_DESCRIPTION = """\
 Execute one bounded, read-only PostgreSQL SELECT or WITH...SELECT query.
 The query must use only the authoritative schema in the Agent instructions and
 must return unique chart-ready aliases. On success, this Tool returns columns,
-rows, row_count, truncated, and a run-scoped dataset path for plot_graph.
+rows, row_count, has_data, truncated, and a run-scoped dataset path for
+plot_graph. A valid zero-row result is successful and has_data is false.
 """
 
 
@@ -263,6 +269,15 @@ class _ArtifactWriteError(RuntimeError):
     pass
 
 
+class _QueryContractError(ValueError):
+    """Stable, model-safe validation error for generated SQL."""
+
+    def __init__(self, reason: str, safe_message: str) -> None:
+        super().__init__(safe_message)
+        self.reason = reason
+        self.safe_message = safe_message
+
+
 def _artifact_path(context: ToolExecutionContext, suffix: str) -> Path:
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     safe_run_id = re.sub(r"[^A-Za-z0-9_.-]", "_", context.run_id)
@@ -274,17 +289,53 @@ def _artifact_path(context: ToolExecutionContext, suffix: str) -> Path:
 def _validate_read_query(query: str) -> str:
     statement = query.strip()
     if not statement:
-        raise ValueError("query cannot be empty")
+        raise _QueryContractError(
+            "query_empty",
+            "Provide one non-empty PostgreSQL SELECT query.",
+        )
     if len(statement) > 20_000:
-        raise ValueError("query must be at most 20000 characters")
+        raise _QueryContractError(
+            "query_too_long",
+            "Keep the PostgreSQL query within 20000 characters.",
+        )
+
+    fenced = re.fullmatch(
+        r"```(?:sql|postgresql)?\s*(.*?)\s*```",
+        statement,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if fenced is not None:
+        statement = fenced.group(1).strip()
+    if re.match(r"^sql\s*:", statement, flags=re.IGNORECASE):
+        statement = re.sub(
+            r"^sql\s*:\s*",
+            "",
+            statement,
+            count=1,
+            flags=re.IGNORECASE,
+        ).strip()
+    if statement.endswith(";"):
+        statement = statement[:-1].rstrip()
     if ";" in statement:
-        raise ValueError("query must contain exactly one statement without semicolon")
+        raise _QueryContractError(
+            "query_multiple_statements",
+            "Provide exactly one PostgreSQL SELECT statement.",
+        )
     if not re.match(r"^(select|with)\b", statement, flags=re.IGNORECASE):
-        raise ValueError("only SELECT or WITH...SELECT is allowed")
+        raise _QueryContractError(
+            "query_not_select",
+            "Start the read-only query with SELECT or WITH.",
+        )
     if re.search(r"(--|/\*|\*/)", statement):
-        raise ValueError("SQL comments are not allowed")
+        raise _QueryContractError(
+            "query_comment_forbidden",
+            "Remove SQL comments and return only the executable SELECT.",
+        )
     if re.search(r"\bselect\s+\*", statement, flags=re.IGNORECASE):
-        raise ValueError("SELECT * is not allowed")
+        raise _QueryContractError(
+            "query_select_star_forbidden",
+            "Select explicit chart-ready columns and aliases instead of SELECT *.",
+        )
 
     forbidden = re.compile(
         r"\b("
@@ -295,7 +346,10 @@ def _validate_read_query(query: str) -> str:
         flags=re.IGNORECASE,
     )
     if forbidden.search(statement):
-        raise ValueError("query contains a forbidden operation")
+        raise _QueryContractError(
+            "query_forbidden_operation",
+            "Use one read-only SELECT without administrative or write operations.",
+        )
     return statement
 
 
@@ -320,14 +374,24 @@ def _open_postgresql_connection(dsn: str) -> Any:
 def _store_dataset(
     rows: list[dict[str, Any]],
     *,
+    columns: list[str] | None = None,
     context: ToolExecutionContext,
 ) -> Path:
     dataset_path = _artifact_path(context, "dataset.json")
     temporary_path = dataset_path.with_suffix(".tmp.json")
     normalized_rows = json.loads(json.dumps(rows, ensure_ascii=False, default=str))
+    normalized_columns = (
+        list(columns)
+        if columns is not None
+        else (list(normalized_rows[0]) if normalized_rows else [])
+    )
+    dataset = {
+        "columns": normalized_columns,
+        "rows": normalized_rows,
+    }
     try:
         temporary_path.write_text(
-            json.dumps(normalized_rows, ensure_ascii=False, indent=2),
+            json.dumps(dataset, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         os.replace(temporary_path, dataset_path)
@@ -357,6 +421,14 @@ def _map_query_error(exc: Exception) -> ToolError:
             message="The query dataset artifact could not be stored.",
             retryable=False,
             recovery=ToolRecoveryAction.FAIL,
+        )
+    if isinstance(exc, _QueryContractError):
+        return ToolError(
+            type=ToolErrorType.INVALID_ARGUMENTS,
+            reason=exc.reason,
+            message=exc.safe_message,
+            retryable=False,
+            recovery=ToolRecoveryAction.REPAIR_CALL,
         )
 
     sqlstate = getattr(exc, "sqlstate", None)
@@ -427,25 +499,97 @@ def _map_query_error(exc: Exception) -> ToolError:
             type=ToolErrorType.EXECUTION_ERROR,
             reason="undefined_operator_or_function",
             message=(
-                "Use an operator compatible with the declared column type. "
-                "For created_at boundaries use >= and < with complete "
-                "TIMESTAMPTZ literals; never use << or >>."
+                "Use only type-compatible PostgreSQL operators and functions "
+                "supported by the reference query. Regenerate created_at "
+                "boundaries from the >= start and < exclusive-end template."
             ),
             retryable=False,
             recovery=ToolRecoveryAction.REPAIR_CALL,
         )
-    if isinstance(exc, ValueError) or (
-        isinstance(sqlstate, str) and sqlstate.startswith(("22", "42"))
-    ):
+    structured_query_errors = {
+        "42702": (
+            "ambiguous_column",
+            "Qualify every ambiguous column with its declared table alias.",
+        ),
+        "42712": (
+            "duplicate_table_alias",
+            "Use one unique alias for each table reference.",
+        ),
+        "42803": (
+            "grouping_error",
+            "Regenerate SELECT, GROUP BY, and ORDER BY as one consistent query.",
+        ),
+        "42804": (
+            "datatype_mismatch",
+            "Use expressions and casts compatible with the declared column types.",
+        ),
+        "42P10": (
+            "invalid_column_reference",
+            "Use only valid declared columns in grouping and ordering expressions.",
+        ),
+        "22P02": (
+            "invalid_text_representation",
+            "Use a literal representation compatible with the declared column type.",
+        ),
+        "22007": (
+            "invalid_datetime_format",
+            "Use the complete declared ISO TIMESTAMPTZ boundary template.",
+        ),
+        "22008": (
+            "datetime_field_overflow",
+            "Use a valid ISO calendar date in the declared TIMESTAMPTZ template.",
+        ),
+        "22003": (
+            "numeric_value_out_of_range",
+            "Use numeric expressions within the declared PostgreSQL column range.",
+        ),
+        "22012": (
+            "division_by_zero",
+            "Guard the denominator with NULLIF before division.",
+        ),
+        "22023": (
+            "invalid_parameter_value",
+            "Use only parameter values supported by the declared schema contract.",
+        ),
+    }
+    if sqlstate in structured_query_errors:
+        reason, message = structured_query_errors[sqlstate]
         return ToolError(
             type=ToolErrorType.INVALID_ARGUMENTS,
-            reason="invalid_read_query",
+            reason=reason,
+            message=message,
+            retryable=False,
+            recovery=ToolRecoveryAction.REPAIR_CALL,
+        )
+    if isinstance(sqlstate, str) and sqlstate.startswith("42"):
+        return ToolError(
+            type=ToolErrorType.INVALID_ARGUMENTS,
+            reason="postgres_query_structure_error",
             message=(
-                "Regenerate one read-only PostgreSQL query using only the "
-                "declared tables, columns, types, aliases, and operators."
+                "Regenerate one PostgreSQL SELECT using only the declared "
+                "tables, columns, aliases, grouping, and ordering."
             ),
             retryable=False,
             recovery=ToolRecoveryAction.REPAIR_CALL,
+        )
+    if isinstance(sqlstate, str) and sqlstate.startswith("22"):
+        return ToolError(
+            type=ToolErrorType.INVALID_ARGUMENTS,
+            reason="postgres_data_exception",
+            message=(
+                "Regenerate literals, casts, and expressions to match the "
+                "declared PostgreSQL column types."
+            ),
+            retryable=False,
+            recovery=ToolRecoveryAction.REPAIR_CALL,
+        )
+    if isinstance(exc, ValueError):
+        return ToolError(
+            type=ToolErrorType.EXECUTION_ERROR,
+            reason="query_tool_internal_error",
+            message="The query Tool encountered an unexpected validation failure.",
+            retryable=False,
+            recovery=ToolRecoveryAction.FAIL,
         )
 
     try:
@@ -539,22 +683,28 @@ def query_data(
                 )
                 cursor.execute(bounded_query)
                 if cursor.description is None:
-                    raise ValueError("query must return rows")
+                    raise _QueryContractError(
+                        "query_no_result_set",
+                        "The PostgreSQL query must return a result set.",
+                    )
                 columns = [column.name for column in cursor.description]
                 if len(columns) != len(set(columns)):
-                    raise ValueError("query columns must use unique aliases")
+                    raise _QueryContractError(
+                        "query_duplicate_output_alias",
+                        "Return one unique alias for every selected output column.",
+                    )
                 fetched = cursor.fetchmany(MAX_QUERY_ROWS + 1)
 
-    if not fetched:
-        raise ValueError("query returned no rows")
     truncated = len(fetched) > MAX_QUERY_ROWS
     rows = [dict(row) for row in fetched[:MAX_QUERY_ROWS]]
-    dataset_path = _store_dataset(rows, context=context)
-    normalized_rows = json.loads(dataset_path.read_text(encoding="utf-8"))
+    dataset_path = _store_dataset(rows, columns=columns, context=context)
+    dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
+    normalized_rows = dataset["rows"]
     return {
         "columns": columns,
         "rows": normalized_rows,
         "row_count": len(normalized_rows),
+        "has_data": bool(normalized_rows),
         "truncated": truncated,
         "dataset_path": str(dataset_path),
     }
@@ -593,14 +743,24 @@ def plot_graph(
     dataset_path = _artifact_path(context, "dataset.json")
     if not dataset_path.exists():
         raise FileNotFoundError("query_data dataset is missing")
-    rows = json.loads(dataset_path.read_text(encoding="utf-8"))
-    if not isinstance(rows, list) or not rows:
-        raise ValueError("query_data dataset is empty")
+    dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
+    if isinstance(dataset, list):
+        rows = dataset
+        columns = list(rows[0]) if rows and isinstance(rows[0], dict) else []
+    elif isinstance(dataset, dict):
+        rows = dataset.get("rows")
+        columns = dataset.get("columns")
+    else:
+        raise ValueError("query_data dataset has an invalid shape")
+    if not isinstance(rows, list) or not isinstance(columns, list):
+        raise ValueError("query_data dataset has an invalid shape")
+    if x_column not in columns or y_column not in columns:
+        raise ValueError("chart columns do not exist in query_data output")
     if any(
         not isinstance(row, dict) or x_column not in row or y_column not in row
         for row in rows
     ):
-        raise ValueError("chart columns do not exist in query_data output")
+        raise ValueError("chart rows do not match query_data columns")
 
     x_values = [str(row[x_column]) for row in rows]
     try:
@@ -613,7 +773,16 @@ def plot_graph(
     pyplot = _load_pyplot()
     figure, axes = pyplot.subplots(figsize=(10, 5))
     try:
-        if chart_type == "line":
+        if not rows:
+            axes.text(
+                0.5,
+                0.5,
+                "No data for the requested period",
+                ha="center",
+                va="center",
+                transform=axes.transAxes,
+            )
+        elif chart_type == "line":
             axes.plot(x_values, y_values, marker="o", color="#4C78A8")
         else:
             axes.bar(x_values, y_values, color="#4C78A8")
@@ -699,6 +868,9 @@ _DEBUG_EVENTS = {
     EventType.TOOL_STARTED,
     EventType.TOOL_COMPLETED,
     EventType.TOOL_REPAIR_SCHEDULED,
+    EventType.TOOL_REPAIR_EXHAUSTED,
+    EventType.STEP_RETRY,
+    EventType.STEP_FAILED,
     EventType.PLAN_REVISED,
     EventType.RUN_COMPLETED,
     EventType.RUN_FAILED,

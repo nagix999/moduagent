@@ -68,7 +68,12 @@ def test_authoritative_schema_and_repair_rules_are_in_system_instructions() -> N
     assert "created_at TIMESTAMPTZ" in instructions
     assert "query_data(query)" in instructions
     assert "plot_graph(x_column, y_column, title, chart_type)" in instructions
-    assert "Never use << or >>" in instructions
+    assert "o.created_at >= TIMESTAMPTZ" in instructions
+    assert "AND o.created_at < TIMESTAMPTZ" in instructions
+    assert "<<" not in instructions
+    assert ">>" not in instructions
+    assert "<start-date>" not in instructions
+    assert "<exclusive-end-date>" not in instructions
     assert "Never resend the identical query" in instructions
     assert "TIMESTAMPTZ '2025-01-01 00:00:00+09:00'" in instructions
 
@@ -92,23 +97,58 @@ LIMIT 12
 
 
 @pytest.mark.parametrize(
-    "query",
+    ("query", "expected"),
     [
-        "",
-        "DELETE FROM reporting.orders",
-        "SELECT * FROM reporting.orders",
-        "SELECT order_id FROM reporting.orders;",
-        "SELECT order_id FROM reporting.orders -- comment",
         (
-            "WITH removed AS (DELETE FROM reporting.orders RETURNING order_id) "
-            "SELECT order_id FROM removed"
+            "SELECT order_id FROM reporting.orders;",
+            "SELECT order_id FROM reporting.orders",
         ),
-        "SELECT pg_sleep(10)",
+        (
+            "```sql\nSELECT order_id FROM reporting.orders;\n```",
+            "SELECT order_id FROM reporting.orders",
+        ),
+        (
+            "SQL: SELECT order_id FROM reporting.orders;",
+            "SELECT order_id FROM reporting.orders",
+        ),
     ],
 )
-def test_read_query_validation_rejects_unsafe_shapes(query: str) -> None:
-    with pytest.raises(ValueError):
+def test_read_query_validation_normalizes_common_model_wrappers(
+    query: str,
+    expected: str,
+) -> None:
+    assert example._validate_read_query(query) == expected
+
+
+@pytest.mark.parametrize(
+    ("query", "reason"),
+    [
+        ("", "query_empty"),
+        ("DELETE FROM reporting.orders", "query_not_select"),
+        ("SELECT * FROM reporting.orders", "query_select_star_forbidden"),
+        (
+            "SELECT order_id FROM reporting.orders; SELECT 2",
+            "query_multiple_statements",
+        ),
+        (
+            "SELECT order_id FROM reporting.orders -- comment",
+            "query_comment_forbidden",
+        ),
+        (
+            "WITH removed AS (DELETE FROM reporting.orders RETURNING order_id) "
+            "SELECT order_id FROM removed",
+            "query_forbidden_operation",
+        ),
+        ("SELECT pg_sleep(10)", "query_forbidden_operation"),
+    ],
+)
+def test_read_query_validation_rejects_unsafe_shapes(
+    query: str,
+    reason: str,
+) -> None:
+    with pytest.raises(example._QueryContractError) as captured:
         example._validate_read_query(query)
+    assert captured.value.reason == reason
 
 
 class _FakePostgreSQLError(Exception):
@@ -126,6 +166,26 @@ class _FakePostgreSQLError(Exception):
         (
             "42883",
             "undefined_operator_or_function",
+            ToolRecoveryAction.REPAIR_CALL,
+            False,
+        ),
+        ("42803", "grouping_error", ToolRecoveryAction.REPAIR_CALL, False),
+        ("42804", "datatype_mismatch", ToolRecoveryAction.REPAIR_CALL, False),
+        (
+            "22007",
+            "invalid_datetime_format",
+            ToolRecoveryAction.REPAIR_CALL,
+            False,
+        ),
+        (
+            "42ZZZ",
+            "postgres_query_structure_error",
+            ToolRecoveryAction.REPAIR_CALL,
+            False,
+        ),
+        (
+            "22ZZZ",
+            "postgres_data_exception",
             ToolRecoveryAction.REPAIR_CALL,
             False,
         ),
@@ -158,12 +218,25 @@ def test_query_error_mapping_is_actionable_and_does_not_leak_driver_details(
 
 
 def test_local_query_validation_failure_is_repairable() -> None:
-    mapped = example._map_query_error(ValueError("private invalid SQL"))
+    mapped = example._map_query_error(
+        example._QueryContractError(
+            "query_select_star_forbidden",
+            "Select explicit columns.",
+        )
+    )
 
     assert mapped.type is ToolErrorType.INVALID_ARGUMENTS
-    assert mapped.reason == "invalid_read_query"
+    assert mapped.reason == "query_select_star_forbidden"
     assert mapped.recovery is ToolRecoveryAction.REPAIR_CALL
-    assert "private invalid SQL" not in str(mapped.to_dict())
+
+
+def test_unexpected_value_error_fails_closed_without_leaking_details() -> None:
+    mapped = example._map_query_error(ValueError("PRIVATE SQL"))
+
+    assert mapped.type is ToolErrorType.EXECUTION_ERROR
+    assert mapped.reason == "query_tool_internal_error"
+    assert mapped.recovery is ToolRecoveryAction.FAIL
+    assert "PRIVATE SQL" not in str(mapped.to_dict())
 
 
 def test_dataset_artifacts_are_isolated_by_run_id(
@@ -182,6 +255,142 @@ def test_dataset_artifacts_are_isolated_by_run_id(
     )
 
     assert first != second
-    assert json.loads(first.read_text(encoding="utf-8"))[0]["revenue"] == 10
-    assert json.loads(second.read_text(encoding="utf-8"))[0]["revenue"] == 20
+    assert json.loads(first.read_text(encoding="utf-8"))["rows"][0]["revenue"] == 10
+    assert json.loads(second.read_text(encoding="utf-8"))["rows"][0]["revenue"] == 20
     assert not list(tmp_path.glob("*.tmp.json"))
+
+
+class _FakeColumn:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _FakeCursor:
+    description = [
+        _FakeColumn("month"),
+        _FakeColumn("revenue"),
+        _FakeColumn("orders"),
+    ]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args: object) -> bool:
+        return False
+
+    def execute(self, _query: str, _params: object = None) -> None:
+        return None
+
+    def fetchmany(self, _size: int) -> list[dict[str, object]]:
+        return []
+
+
+class _FakeConnection:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args: object) -> bool:
+        return False
+
+    def transaction(self):
+        return self
+
+    def cursor(self) -> _FakeCursor:
+        return _FakeCursor()
+
+
+def test_empty_query_result_is_a_successful_report_dataset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(example, "ARTIFACT_DIR", tmp_path)
+    monkeypatch.setenv("REPORT_DATABASE_URL", "postgresql://private.invalid/report")
+    monkeypatch.setattr(
+        example,
+        "_open_postgresql_connection",
+        lambda _dsn: _FakeConnection(),
+    )
+
+    result = example.query_data.function(
+        query=(
+            "SELECT '2025-01' AS month, 0::float AS revenue, "
+            "0::bigint AS orders WHERE FALSE"
+        ),
+        context=ToolExecutionContext(run_id="empty-period"),
+    )
+
+    assert result["columns"] == ["month", "revenue", "orders"]
+    assert result["rows"] == []
+    assert result["row_count"] == 0
+    assert result["has_data"] is False
+    assert result["truncated"] is False
+    dataset = json.loads(Path(result["dataset_path"]).read_text(encoding="utf-8"))
+    assert dataset == {
+        "columns": ["month", "revenue", "orders"],
+        "rows": [],
+    }
+
+
+class _FakeAxes:
+    transAxes = object()
+
+    def text(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    def set_title(self, _value: str) -> None:
+        return None
+
+    def set_xlabel(self, _value: str) -> None:
+        return None
+
+    def set_ylabel(self, _value: str) -> None:
+        return None
+
+    def grid(self, **_kwargs: object) -> None:
+        return None
+
+    def tick_params(self, **_kwargs: object) -> None:
+        return None
+
+
+class _FakeFigure:
+    def tight_layout(self) -> None:
+        return None
+
+    def savefig(self, path: Path, *, dpi: int) -> None:
+        assert dpi == 150
+        path.write_bytes(b"empty-chart")
+
+
+class _FakePyplot:
+    def subplots(self, *, figsize: tuple[int, int]):
+        assert figsize == (10, 5)
+        return _FakeFigure(), _FakeAxes()
+
+    def close(self, _figure: _FakeFigure) -> None:
+        return None
+
+
+def test_plot_graph_creates_an_empty_state_chart(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(example, "ARTIFACT_DIR", tmp_path)
+    context = ToolExecutionContext(run_id="empty-chart")
+    example._store_dataset(
+        [],
+        columns=["month", "revenue", "orders"],
+        context=context,
+    )
+    monkeypatch.setattr(example, "_load_pyplot", lambda: _FakePyplot())
+
+    result = example.plot_graph.function(
+        x_column="month",
+        y_column="revenue",
+        title="빈 기간",
+        chart_type="line",
+        context=context,
+    )
+
+    assert result["point_count"] == 0
+    assert Path(result["chart_path"]).read_bytes() == b"empty-chart"
