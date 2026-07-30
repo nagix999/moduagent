@@ -2,20 +2,24 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator, Iterable, Mapping
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import BaseModel
 
 from moduagent.composition import (
     AgentSpec,
     ExecutionProfile,
+    PlanExecutionProfile,
+    StandardExecutionProfile,
     compose_agent,
 )
-from moduagent.config import AgentConfig
-from moduagent.decision import DecisionPolicy
+from moduagent.config import AgentConfig, RetryConfig, RunLimits
+from moduagent.decision import DecisionPolicy, LLMPlanGenerator
 from moduagent.execution import ExecutionEngine
 from moduagent.memory import ConversationMemoryPolicy
 from moduagent.models import ModelClient
 from moduagent.observability import DiagnosticSink, EventSink
-from moduagent.output import OutputCodec
+from moduagent.output import OutputCodec, PydanticOutputCodec
 from moduagent.persistence import (
     CheckpointStore,
     ConversationStore,
@@ -30,6 +34,51 @@ from moduagent.tools import (
 
 class Agent:
     """Small public facade that delegates execution to :class:`AgentRuntime`."""
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        model: ModelClient,
+        instructions: str,
+        name: str = "agent",
+        tools: Iterable[Tool] = (),
+        execution: Literal["standard", "plan"] | ExecutionProfile = "standard",
+        output: type[BaseModel] | OutputCodec | None = None,
+        limits: RunLimits | None = None,
+        retry: RetryConfig | None = None,
+        memory: ConversationMemoryPolicy | None = None,
+    ) -> Agent:
+        """Create an Agent from the common high-level configuration.
+
+        This is an additive convenience API. It resolves to the same
+        :class:`AgentConfig`, execution profiles, output codecs, and runtime as
+        the full constructor. Applications that need stores, sinks,
+        authorization, checkpoints, Skills, or custom engines should continue
+        to use :class:`Agent` directly.
+        """
+
+        resolved_limits = limits if limits is not None else RunLimits()
+        resolved_retry = retry if retry is not None else RetryConfig()
+        execution_profile = _quick_execution_profile(
+            execution,
+            model=model,
+            limits=resolved_limits,
+        )
+        output_codec = _quick_output_codec(output)
+        return cls(
+            config=AgentConfig(
+                name=name,
+                instructions=instructions,
+                limits=resolved_limits,
+                retry=resolved_retry,
+            ),
+            model=model,
+            tools=tools,
+            execution_profile=execution_profile,
+            output_codec=output_codec,
+            conversation_memory_policy=memory,
+        )
 
     def __init__(
         self,
@@ -109,6 +158,28 @@ class Agent:
             skill_mode=skill_mode,
         )
         return await self.runtime.execute(request)
+
+    async def ask(
+        self,
+        text: str,
+        *,
+        session_id: str | None = None,
+        user_context: Mapping[str, Any] | None = None,
+        resume_run_id: str | None = None,
+        skills: Iterable[str] = (),
+        skill_mode: str | None = None,
+    ) -> Any:
+        """Run the Agent and return its decoded output, raising on failure."""
+
+        result = await self.run(
+            text,
+            session_id=session_id,
+            user_context=user_context,
+            resume_run_id=resume_run_id,
+            skills=skills,
+            skill_mode=skill_mode,
+        )
+        return result.unwrap()
 
     def stream(
         self,
@@ -194,3 +265,38 @@ class Agent:
             requested_skills=requested_skills,
             skill_mode=resolved_skill_mode,
         )
+
+
+def _quick_execution_profile(
+    execution: Literal["standard", "plan"] | ExecutionProfile,
+    *,
+    model: ModelClient,
+    limits: RunLimits,
+) -> ExecutionProfile:
+    if execution == "standard":
+        return StandardExecutionProfile()
+    if execution == "plan":
+        return PlanExecutionProfile(
+            LLMPlanGenerator(model, max_steps=limits.max_steps),
+            max_step_attempts=limits.max_step_attempts,
+            max_replans=limits.max_replans,
+        )
+    if isinstance(execution, (StandardExecutionProfile, PlanExecutionProfile)):
+        return execution
+    if isinstance(execution, str):
+        raise ValueError(
+            "execution must be 'standard', 'plan', or an execution profile"
+        )
+    raise TypeError("execution must be 'standard', 'plan', or an execution profile")
+
+
+def _quick_output_codec(
+    output: type[BaseModel] | OutputCodec | None,
+) -> OutputCodec | None:
+    if output is None:
+        return None
+    if isinstance(output, type) and issubclass(output, BaseModel):
+        return PydanticOutputCodec(output)
+    if isinstance(output, OutputCodec):
+        return output
+    raise TypeError("output must be a Pydantic model class or an OutputCodec")

@@ -20,7 +20,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from moduagent.decision.base import DecisionKind, ExecutionDecision
 from moduagent.messages import Message, ToolCall
-from moduagent.models import ModelClient, ModelRequest, ModelResponse
+from moduagent.models import (
+    ModelClient,
+    ModelProtocolError,
+    ModelRequest,
+    ModelResponse,
+)
 from moduagent.tools import (
     ToolRecoveryAction,
     fingerprint_tool_arguments,
@@ -1123,15 +1128,15 @@ class LLMPlanGenerator:
             plan.start_current()
             return plan
         except (TypeError, ValueError, KeyError) as exc:
-            raise ValueError(f"invalid plan response: {exc}") from exc
+            raise ModelProtocolError(f"invalid plan response: {exc}") from exc
 
     @staticmethod
     def _validate_response(response: ModelResponse) -> None:
         finish_reason = (response.finish_reason or "").lower()
         if finish_reason in {"timeout", "length", "max_tokens"}:
-            raise ValueError(f"incomplete plan response ({finish_reason})")
+            raise ModelProtocolError(f"incomplete plan response ({finish_reason})")
         if response.tool_calls or response.message.tool_calls:
-            raise ValueError("planner response cannot contain tool calls")
+            raise ModelProtocolError("planner response cannot contain tool calls")
 
     def _available_tools(self) -> frozenset[str] | None:
         return self._configured_available_tools
@@ -1554,13 +1559,24 @@ class PlanAndExecutePolicy:
 
         try:
             result = self._decode_step_result(response)
-        except (TypeError, ValueError) as exc:
-            return self._retry_invalid_result(
-                context,
-                state,
-                str(exc),
-                validation_code="step_result_schema_invalid",
-                validation_location="step_result",
+        except (TypeError, ValueError):
+            # A syntactically malformed or schema-incompatible structured
+            # response is a protocol failure, not a transient provider
+            # failure. Repeating the same request can create an unbounded
+            # model loop, so fail the active step immediately without exposing
+            # the model payload or validation detail.
+            state.pending_step_result = None
+            state.validation_error = "StepResult protocol validation failed"
+            state.fail_current_step()
+            self._sync(context, state)
+            return ExecutionDecision(
+                DecisionKind.FAIL,
+                error_message=state.validation_error,
+                metadata={
+                    **self._metadata(state),
+                    "validation_code": "step_result_schema_invalid",
+                    "validation_location": "step_result",
+                },
             )
 
         step = state.current_step
@@ -2273,6 +2289,13 @@ class PlanAndExecutePolicy:
                 feedback,
             )
         except Exception as exc:
+            # A run-wide model guard is already a terminal, secret-safe
+            # decision. Preserve its type so the coordinator can emit the
+            # correct finish reason, counters, and non-resumable state.
+            from moduagent.runtime.model_guard import ModelGuardTripped
+
+            if isinstance(exc, ModelGuardTripped):
+                raise
             step = state.current_step
             await self._capture_policy_exception(
                 context,

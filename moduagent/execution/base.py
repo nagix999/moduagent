@@ -59,17 +59,25 @@ class ExecutionBudget:
     max_tool_repair_attempts: int
     parallel_tool_calls: bool = False
     max_parallel_tools: int = 4
+    # Appended for 0.5 positional compatibility with the 0.4 budget contract.
+    max_model_turns: int = 32
+    no_progress_model_turn_threshold: int = 3
 
     def __post_init__(self) -> None:
         for field_name in (
             "max_steps",
             "max_step_attempts",
             "max_parallel_tools",
+            "max_model_turns",
         ):
             if type(getattr(self, field_name)) is not int:
                 raise TypeError(f"{field_name} must be an integer")
             if getattr(self, field_name) < 1:
                 raise ValueError(f"{field_name} must be at least 1")
+        if type(self.no_progress_model_turn_threshold) is not int:
+            raise TypeError("no_progress_model_turn_threshold must be an integer")
+        if self.no_progress_model_turn_threshold < 2:
+            raise ValueError("no_progress_model_turn_threshold must be at least 2")
         for field_name in (
             "max_tool_calls",
             "max_replans",
@@ -93,6 +101,8 @@ class ExecutionBudget:
             max_tool_repair_attempts=limits.max_tool_repair_attempts,
             parallel_tool_calls=limits.parallel_tool_calls,
             max_parallel_tools=limits.max_parallel_tools,
+            max_model_turns=limits.max_model_turns,
+            no_progress_model_turn_threshold=(limits.no_progress_model_turn_threshold),
         )
 
 

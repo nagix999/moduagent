@@ -7,6 +7,12 @@ from .base import (
     ModelResponse,
     validate_request_capabilities,
 )
+from .errors import (
+    ModelErrorClassification,
+    ModelProtocolError,
+    classify_model_error,
+    is_retryable_model_error,
+)
 from .ollama import OllamaClient
 from .openai_compatible import OpenAICompatibleClient
 from .transport import HttpTransport, HttpxTransport
@@ -18,11 +24,15 @@ __all__ = [
     "ModelCapabilities",
     "ModelChunk",
     "ModelClient",
+    "ModelErrorClassification",
     "ModelGateway",
+    "ModelProtocolError",
     "ModelRequest",
     "ModelResponse",
     "OllamaClient",
     "OpenAICompatibleClient",
     "VLLMClient",
+    "classify_model_error",
+    "is_retryable_model_error",
     "validate_request_capabilities",
 ]

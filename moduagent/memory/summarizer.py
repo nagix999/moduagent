@@ -11,7 +11,13 @@ from moduagent.memory.token import (
     VLLMTokenCounter,
 )
 from moduagent.messages import Message, Usage
-from moduagent.models import ModelClient, ModelGateway, ModelRequest
+from moduagent.models import (
+    ModelClient,
+    ModelGateway,
+    ModelProtocolError,
+    ModelRequest,
+    ModelResponse,
+)
 
 
 _DEFAULT_INSTRUCTIONS = (
@@ -185,17 +191,23 @@ class ModelConversationSummarizer:
                     phase="memory_summary",
                 )
             )
+            if not isinstance(response, ModelResponse):
+                raise ModelProtocolError(
+                    "conversation summarizer must return ModelResponse"
+                )
             calls = response.tool_calls or response.message.tool_calls
             if calls:
-                raise RuntimeError("conversation summarizer returned Tool Calls")
+                raise ModelProtocolError("conversation summarizer returned Tool Calls")
             content = (response.message.content or "").strip()
             if not content:
-                raise RuntimeError("conversation summarizer returned an empty summary")
+                raise ModelProtocolError(
+                    "conversation summarizer returned an empty summary"
+                )
             summary = content
             usage = usage + response.usage
 
         if summary is None:
-            raise RuntimeError("conversation summarizer produced no summary")
+            raise ModelProtocolError("conversation summarizer produced no summary")
         return SummaryResult(summary, usage)
 
     def _request(

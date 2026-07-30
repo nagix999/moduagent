@@ -4,6 +4,8 @@ import asyncio
 import json
 from dataclasses import replace
 
+import pytest
+
 from moduagent.memory import (
     ApproximateTokenCounter,
     CachingTokenCounter,
@@ -20,7 +22,11 @@ from moduagent.memory import (
     TokenBudgetConversationMemoryPolicy,
 )
 from moduagent.messages import Message, ToolCall, Usage
-from moduagent.models import ModelRequest, ModelResponse
+from moduagent.models import ModelProtocolError, ModelRequest, ModelResponse
+from moduagent.runtime.model_guard import (
+    ModelTurnBudgetExceeded,
+    NoProgressCircuitBreaker,
+)
 
 
 class SimpleTokenCounter:
@@ -422,6 +428,51 @@ def test_summary_failure_falls_back_to_recent_turns() -> None:
     asyncio.run(scenario())
 
 
+def test_summary_model_guard_failure_is_not_used_as_fallback() -> None:
+    async def scenario() -> None:
+        breaker = NoProgressCircuitBreaker(max_model_turns=1)
+        breaker.before_model_attempt({"phase": "memory_summary"})
+        breaker.abandon_model_attempt()
+        with pytest.raises(ModelTurnBudgetExceeded) as raised:
+            breaker.before_model_attempt({"phase": "memory_summary"})
+
+        class GuardGateway:
+            async def complete(self, model, request, *, phase):
+                del model, request, phase
+                raise raised.value
+
+        summary_model = RecordingSummaryModel()
+        policy = SummarizingConversationMemoryPolicy(
+            budget=TokenBudget(100_000),
+            token_counter=SimpleTokenCounter(),
+            summarizer=ModelConversationSummarizer(
+                model=summary_model,  # type: ignore[arg-type]
+                token_counter=PromptLengthCounter(),
+            ),
+            max_history_turns=0,
+        )
+        request = replace(
+            _memory_request(
+                (
+                    Message.system("system"),
+                    Message.user("old"),
+                    Message.assistant("old answer"),
+                    Message.user("current"),
+                ),
+                protected_from=3,
+            ),
+            model_gateway=GuardGateway(),
+        )
+
+        with pytest.raises(ModelTurnBudgetExceeded) as propagated:
+            await policy.prepare(request)
+
+        assert propagated.value is raised.value
+        assert summary_model.requests == []
+
+    asyncio.run(scenario())
+
+
 def test_summarizing_policy_does_not_call_model_below_limits() -> None:
     async def scenario() -> None:
         class UnexpectedSummarizer:
@@ -495,7 +546,7 @@ def test_model_summarizer_batches_and_folds_a_large_single_message() -> None:
     asyncio.run(scenario())
 
 
-def test_model_summarizer_rejects_tool_calls_and_blank_output() -> None:
+def test_model_summarizer_types_response_contract_violations() -> None:
     async def scenario() -> None:
         call = ToolCall("call-summary", "unexpected", {})
 
@@ -518,12 +569,27 @@ def test_model_summarizer_rejects_tool_calls_and_blank_output() -> None:
                 token_counter=PromptLengthCounter(),
                 max_input_tokens=2_000,
             )
-            try:
+            with pytest.raises(ModelProtocolError, match=expected):
                 await summarizer.summarize((Message.user("old"),))
-            except RuntimeError as exc:
-                assert expected in str(exc)
-            else:
-                raise AssertionError("invalid summary response must fail")
+
+    asyncio.run(scenario())
+
+
+def test_model_summarizer_rejects_non_response_contract() -> None:
+    async def scenario() -> None:
+        class InvalidModel:
+            async def complete(self, request: ModelRequest) -> object:
+                del request
+                return object()
+
+        summarizer = ModelConversationSummarizer(
+            model=InvalidModel(),  # type: ignore[arg-type]
+            token_counter=PromptLengthCounter(),
+            max_input_tokens=2_000,
+        )
+
+        with pytest.raises(ModelProtocolError, match="must return ModelResponse"):
+            await summarizer.summarize((Message.user("old"),))
 
     asyncio.run(scenario())
 

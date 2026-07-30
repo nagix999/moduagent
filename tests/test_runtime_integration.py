@@ -93,7 +93,7 @@ def test_runtime_streams_model_deltas_and_terminal_result() -> None:
 def test_runtime_retries_model_without_emitted_tokens() -> None:
     async def scenario() -> None:
         model = ScriptedModel(
-            [RuntimeError("temporary"), ModelResponse(Message.assistant("복구"))]
+            [ConnectionError("temporary"), ModelResponse(Message.assistant("복구"))]
         )
         agent = Agent(
             config=AgentConfig(

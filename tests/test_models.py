@@ -6,12 +6,14 @@ from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 import httpx
+import pytest
 
 from moduagent.messages import Message, ToolCall
 from moduagent.memory import VLLMTokenCounter
 from moduagent.models import (
     HttpxTransport,
     ModelCapabilities,
+    ModelProtocolError,
     ModelRequest,
     ModelResponse,
     OllamaClient,
@@ -241,6 +243,38 @@ def test_openai_sse_stream_assembles_text_tools_usage_and_terminal_response() ->
         assert response.usage.total_tokens == 12
         assert response.finish_reason == "tool_calls"
         assert transport.requests[0]["json"]["stream"] is True
+
+    asyncio.run(scenario())
+
+
+def test_openai_sse_stream_rejects_clean_eof_without_terminal_marker() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport(
+            lines=[
+                "data: "
+                + json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "delta": {"content": "partial"},
+                                "finish_reason": None,
+                            }
+                        ]
+                    }
+                )
+            ]
+        )
+        client = OpenAICompatibleClient(
+            base_url="http://model/v1",
+            model="m",
+            transport=transport,
+        )
+
+        with pytest.raises(ModelProtocolError, match="terminal marker"):
+            _ = [
+                chunk
+                async for chunk in client.stream(ModelRequest((Message.user("go"),)))
+            ]
 
     asyncio.run(scenario())
 
@@ -502,6 +536,36 @@ def test_ollama_jsonl_stream_always_ends_with_assembled_response() -> None:
         assert chunks[-1].response is not None
         assert chunks[-1].response.message.content == "안녕하세요"
         assert chunks[-1].response.usage.total_tokens == 6
+
+    asyncio.run(scenario())
+
+
+def test_ollama_jsonl_stream_rejects_clean_eof_without_done_marker() -> None:
+    async def scenario() -> None:
+        client = OllamaClient(
+            base_url="http://ollama",
+            model="qwen",
+            transport=FakeTransport(
+                lines=[
+                    json.dumps(
+                        {
+                            "model": "qwen",
+                            "message": {
+                                "role": "assistant",
+                                "content": "partial",
+                            },
+                            "done": False,
+                        }
+                    )
+                ]
+            ),
+        )
+
+        with pytest.raises(ModelProtocolError, match="terminal marker"):
+            _ = [
+                chunk
+                async for chunk in client.stream(ModelRequest((Message.user("hi"),)))
+            ]
 
     asyncio.run(scenario())
 

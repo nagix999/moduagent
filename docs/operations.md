@@ -1,6 +1,6 @@
 # ModuAgent Operations
 
-이 문서는 ModuAgent 0.4를 사내 운영 환경에 배포할 때 확인할 항목을 정리합니다.
+이 문서는 ModuAgent 0.5를 사내 운영 환경에 배포할 때 확인할 항목을 정리합니다.
 
 ## Deadline과 예산
 
@@ -19,12 +19,78 @@ config = AgentConfig(
         max_step_attempts=2,
         max_replans=1,
         max_tool_repair_attempts=1,
+        max_model_turns=32,
+        no_progress_model_turn_threshold=3,
         timeout_seconds=120,
     ),
 )
 ```
 
 모델 client timeout, Tool timeout, DB statement timeout은 전체 deadline보다 짧게 설정해 정리와 checkpoint 저장 시간을 남기세요. 출력 token 상한과 provider의 context window도 별도로 설정해야 합니다.
+
+### 모델 retry 분류
+
+`RetryConfig.max_attempts`는 모든 예외를 반복하는 옵션이 아닙니다. 0.5는 원인 chain을 allowlist로 분류하고 다음 일시적 실패만 재시도합니다.
+
+| 분류 | retry | 안전한 진단 code |
+|---|---:|---|
+| timeout, HTTP 408 | 예 | `model_timeout` |
+| connection/network 오류 | 예 | `model_connection_error` |
+| HTTP 5xx | 예 | `model_http_5xx` |
+| HTTP 4xx와 429 | 아니요 | `model_http_4xx` |
+| 잘못된 요청 값 | 아니요 | `model_request_invalid` |
+| client type/contract 오류 | 아니요 | `model_client_contract_error` |
+| 응답 protocol·JSON decoding 오류 | 아니요 | `model_protocol_error` |
+| 분류되지 않은 실행 오류 | 아니요 | `model_invocation_failed` |
+
+provider가 HTTP 200을 반환했더라도 body, `choices`, Tool call, Tool arguments JSON, stream chunk 또는 terminal response가 adapter 계약에 맞지 않으면 `ModelProtocolError`다. 같은 응답을 다시 받아도 해결되지 않는 결정적 실패이므로 즉시 종료하고 provider retry를 소비하지 않습니다. Plan JSON이 잘못된 경우도 catch-all 계획으로 바꾸지 않습니다.
+
+strict Plan의 schema-only `StepResult`가 잘못된 JSON이거나 Pydantic schema에 맞지 않으면 현재 단계를 즉시 `failed`로 전이하고 `step_result_schema_invalid`를 반환합니다. 같은 `StepResult` 요청을 반복하거나 `max_step_attempts`만큼 재생성하지 않습니다. 최종 Pydantic output 검증 실패도 provider retry가 아니라 terminal output validation 실패입니다.
+
+stream에서 아직 delta를 공개하지 않은 transient 오류만 재시도할 수 있습니다. 하나 이상의 delta를 이미 내보낸 뒤 연결이 끊기면 중복 출력을 막기 위해 retryable transport 오류라도 같은 stream을 다시 시작하지 않습니다. `RETRY` 이벤트와 `error_summary`에는 정제된 category와 code만 기록되고 원본 provider 메시지는 포함되지 않습니다.
+
+### 모델 turn 예산과 무진전 차단
+
+`max_steps`는 계획 단계 수이며 모델 호출 수가 아닙니다. 0.5의 `max_model_turns`는 한 run에서 `ModelGateway`를 통과하는 실제 provider 시도 수입니다.
+
+- 기본값은 `32`입니다.
+- PLAN, ACT, `StepResult`, FINALIZE와 ModelGateway를 통과하는 보조 모델 요청을 합산합니다.
+- `RetryConfig`의 첫 시도와 재시도를 각각 한 turn으로 셉니다.
+- 실패해서 normalized response를 만들지 못한 시도도 provider를 호출했으므로 예산을 소비합니다.
+- streaming은 chunk 수가 아니라 stream provider 시도 하나를 한 turn으로 셉니다.
+- 다음 시도가 상한을 초과하기 직전에 종료하므로 provider 호출 수는 설정값을 넘지 않습니다.
+
+예를 들어 `max_model_turns=1`, `RetryConfig(max_attempts=3)`이면 첫 호출이 connection 오류로 실패해도 두 번째 provider 호출 전에 `FinishReason.MAX_MODEL_TURNS`로 종료합니다.
+
+`CheckpointStore`가 설정되어 있으면 첫 시도와 각 retry의 turn 예약을 실제 provider I/O 직전 `before_model` durable boundary에 저장합니다. 예약 저장에 실패하면 provider를 호출하지 않습니다. 요청 중 프로세스가 강제 종료되더라도 resume은 저장된 카운터에서 이어지므로 이미 전송했을 수 있는 시도를 다시 사용하지 않습니다.
+
+기본 planner, memory summarizer와 Skill selector는 public `Agent`에서 이 gateway를 사용합니다. custom 정책·selector·planner도 `MemoryRequest.model_gateway`, `SkillSelectionRequest.model_gateway` 또는 `RunContext.model_gateway`를 사용해야 합니다. 이를 무시하고 provider를 직접 호출하거나 custom `ModelClient` 내부에서 자체 retry하면 프레임워크는 숨겨진 요청을 별도 turn으로 셀 수 없습니다. 전체 예산 보장이 필요한 확장 구성 요소의 계약 테스트에 이 조건을 포함하세요.
+
+`no_progress_model_turn_threshold`는 같은 실행 의미 상태에서 모델이 같은 의미 응답을 연속 반환하는 loop를 차단합니다. 기본값 `3`은 첫 관찰을 1로 세며 세 번째 동일 관찰에서 종료합니다. 즉 한 번의 중복 응답은 허용하지만 그다음 동일 응답은 실행하지 않습니다.
+
+비교 대상은 다음과 같습니다.
+
+- 상태: Engine ID, phase, 현재 logical step ID
+- 응답: content, finish reason, Tool 이름과 JSON arguments
+
+provider가 매번 새로 만드는 Tool call ID, token usage와 provider metadata는 의미 비교에서 제외됩니다. 따라서 call ID만 바꾼 동일 Tool 요청은 진전으로 보지 않습니다.
+
+별도로 검증되는 진전 경계는 다음과 같습니다.
+
+- 성공한 Tool outcome의 Tool 이름, 실제 검증된 인자와 정규화된 결과로 만든 run-salted fingerprint가 직전 성공 outcome과 다를 때
+- 새 대화 record batch를 소비한 `memory_summary` 호출이 성공했을 때
+- Plan step이 커밋되었을 때
+
+같은 Tool이 같은 유효 인자와 같은 결과로 성공하는 반복은 fingerprint가 같으므로 streak를 초기화하지 않습니다. provider call ID, 실행 시간이나 retry 횟수만 달라진 경우도 새 outcome이 아닙니다. Tool 결과가 실제로 바뀌면 새 fingerprint이므로 진전으로 인정합니다.
+
+회로 차단기는 원본 프롬프트, 모델 출력 또는 Tool arguments/results를 상태에 저장하지 않습니다. checkpoint에는 숫자 카운터, run별 무작위 salt와 HMAC-SHA-256 관찰 digest만 저장하며, 성공한 Tool outcome 비교값도 raw payload가 아닌 run-salted fingerprint로 저장합니다. resume은 같은 run의 이 상태를 이어갑니다. terminal 결과는 다음처럼 구분됩니다.
+
+| `FinishReason` | error summary code | 의미 |
+|---|---|---|
+| `MAX_MODEL_TURNS` (`"max_model_turns"`) | `max_model_turns_exceeded` | 다음 provider 시도가 전체 turn 예산을 초과함 |
+| `NO_PROGRESS` (`"no_progress"`) | `model_no_progress` | 동일 상태·동일 의미 응답이 설정한 threshold에 도달함 |
+
+두 결과 모두 `RUN_FAILED`이며 `retryable=False`, `resumable=False`입니다. guard가 이미 소비한 turn 예산이나 terminal circuit 상태를 resume으로 되돌릴 수 없습니다. `AgentResult.metadata["error_summary"]`에는 원문 대신 `model_turns`, `max_model_turns`, `no_progress_model_turns`, `no_progress_model_turn_threshold`가 포함됩니다.
 
 ## 동기 Tool과 timeout
 
@@ -99,9 +165,9 @@ checkpoints = RedisCheckpointStore(
 
 `RedisConversationStore`는 list mode와 `EVAL`을 제공하는 client에서 atomic `append_once`를 지원합니다. `get/set` fallback 또는 `EVAL`이 없는 client는 checkpointed Agent에 사용할 수 없습니다. DB adapter는 repository의 단일 transaction/unique constraint로 `append_messages_once(session_id, idempotency_key, rows, digest) -> bool`을 구현하세요.
 
-0.4는 outer schema v4와 Engine별 `state_version`을 분리합니다. v1-v3 checkpoint는 읽을 때 복사·검증 후 v4로 migration하며 원본 payload를 변경하지 않습니다. pending repair는 원래 실패 call을 재실행하지 않고 repair turn에서 재개하고, 의미가 불명확한 partial batch는 fail closed합니다. v4를 v3로 downgrade하지 않습니다.
+0.4는 outer schema v4와 Engine별 `state_version`을 분리합니다. v1-v3 checkpoint는 읽을 때 복사·검증 후 v4로 migration하며 원본 payload를 변경하지 않습니다. pending repair는 원래 실패 call을 재실행하지 않고 repair turn에서 재개하고, 의미가 불명확한 partial batch는 fail closed합니다. v4를 v3로 downgrade하지 않습니다. 0.5는 outer schema를 올리지 않고 model guard의 카운터, run별 salt와 HMAC-SHA-256 digest를 compatibility policy state에 추가하므로 0.5에서 생성한 checkpoint를 resume하면 이미 소비한 model turn과 no-progress streak를 이어갑니다. 새 guard 한도는 Agent fingerprint에도 포함되므로 일반적인 0.4 active checkpoint는 0.5 worker에서 fail closed합니다. 먼저 0.4 worker에서 active run을 drain하거나 버전별 worker/store namespace에 고정하세요. checkpointing이 활성화된 모델 시도는 provider 호출 직전 durable하게 예약되며, 저장에 실패한 시도는 provider에 전송되지 않습니다.
 
-같은 `run_id`와 `session_id`, 호환되는 Agent fingerprint, Engine ID와 state version으로만 resume하세요. 배포 전 [0.4 마이그레이션](migration-0.4.md)의 fixture 검증을 실행하는 것이 좋습니다.
+같은 `run_id`와 `session_id`, 호환되는 Agent fingerprint, Engine ID와 state version으로만 resume하세요. 배포 전 [0.4 마이그레이션](migration-0.4.md)의 fixture 검증과 [0.5 마이그레이션](migration-0.5.md)의 model guard rolling 배포 점검을 실행하는 것이 좋습니다.
 
 ## 이벤트와 관측성
 
@@ -148,6 +214,8 @@ Runtime 내부 이벤트 handoff는 bounded이며, 가득 차면 메모리를 �
 
 `RUN_FAILED`만 보인다면 terminal result의 안전한 오류와 내부 sink의 직전 이벤트를 함께 확인합니다. `RUN_STARTED` 다음 즉시 실패하면 구성 capability, checkpoint 호환성, 첫 모델 요청 전 Memory overflow를 우선 점검합니다.
 
+0.5의 terminal `finish_reason`에는 기존 `completed`, `max_steps`, `max_tool_calls`, `timeout`, `cancelled`, `error`에 `max_model_turns`와 `no_progress`가 추가됩니다. event consumer는 알려지지 않은 enum 값을 받을 수 있는 additive parsing을 사용하고 두 값도 실패 terminal로 처리해야 합니다.
+
 0.4.1부터는 선택적인 `DiagnosticSink`를 설정하여 terminal
 `result.failure_id`나 도구 추적의 `failure_id`로 정제된 예외 원인을 연결할 수
 있습니다. 원본 예외, SQL, 프롬프트, 도구 입출력은 수집하지 않습니다. 구성과
@@ -179,6 +247,9 @@ Runtime 내부 이벤트 handoff는 bounded이며, 가득 차면 메모리를 �
 - `Agent.inspect()` 결과와 `agent_fingerprint`를 배포 artifact에 기록
 - Tool별 안전 Profile과 예외 allowlist 검토
 - model/Tool/DB/전체 run timeout의 계층화
+- `RetryConfig`가 일시적 transport 오류에만 적용되는지 fault injection으로 확인
+- `max_model_turns`와 `no_progress_model_turn_threshold`의 업무별 상한 검토
+- `max_model_turns`, `no_progress` terminal event와 alert routing 확인
 - Conversation·checkpoint TTL, backup, 암호화, tenant 격리 확인
 - v3 fixture의 v4 migration과 resume 테스트
 - public/internal event 분리와 sink 장애 격리 테스트

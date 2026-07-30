@@ -533,7 +533,7 @@ def test_diagnostics_are_default_off_and_do_not_change_fingerprint() -> None:
         assert default_result.metadata["error_summary"] == {
             "category": "model_invocation",
             "code": "model_invocation_failed",
-            "retryable": True,
+            "retryable": False,
             "resumable": False,
         }
 

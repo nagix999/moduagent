@@ -296,3 +296,9 @@ def function_tool(
     if function is None:
         return decorate
     return decorate(function)
+
+
+# Short, discoverable spelling for the same conservative FunctionTool adapter.
+# It is an alias rather than a second decorator implementation, so both entry
+# points always share validation and safety semantics.
+tool = function_tool

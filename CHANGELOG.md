@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.5.0
+
+- Added the additive `Agent.create()` Quick API for Standard and strict Plan
+  execution while retaining the existing `Agent(...)` and `compose_agent()`
+  composition paths.
+- Added `Agent.ask()`, `AgentResult.unwrap()`, `raise_for_error()`, and
+  `explain()` with a secret-safe, structured `AgentRunError`.
+- Added `@tool` as an alias of the conservative `@function_tool` adapter and
+  `VLLMClient.from_env()` for the documented `VLLM_*` settings.
+- Added `ModelProtocolError` and a strict retry allowlist: only timeouts,
+  connection failures, HTTP 408, and HTTP 5xx responses are retryable; JSON,
+  protocol, HTTP 4xx (including 429), validation, and programming failures
+  terminate immediately.
+- Changed malformed Plan and StepResult protocol responses to fail immediately
+  instead of consuming step or provider retry budgets.
+- Added the per-run `RunLimits.max_model_turns` budget and the
+  `no_progress_model_turn_threshold` circuit breaker across PLAN, ACT, repair,
+  memory, Skill, and FINALIZE model calls.
+- Counted a successful Tool outcome as progress only when its run-salted
+  fingerprint is new, so a loop of identical successful calls cannot
+  continually reset the no-progress breaker. Successful memory-summary batches
+  and committed Plan steps remain explicit progress boundaries.
+- Persisted only model-guard counters, a per-run salt, HMAC-SHA-256 observation
+  digests, and run-salted successful-outcome fingerprints in checkpoints; raw
+  prompts, output text, Tool arguments/results, usage, provider metadata, and
+  Tool call IDs are not retained by the guard.
+- Durably reserved each model attempt immediately before provider I/O when
+  checkpointing is enabled, including retry attempts, and made both terminal
+  guard outcomes non-retryable and non-resumable.
+- Kept domain prompts, schemas, Tool implementations, safety declarations,
+  storage, authorization, and database protections application-owned; 0.5.0
+  adds no domain-specific Recipe or Workflow layer.
+
 ## 0.4.2
 
 - Removed Engine-state encoding and compatibility copies when no checkpoint store is configured.

@@ -20,7 +20,7 @@ from moduagent.memory.summarizer import (
     ConversationSummarizer,
     GatewayConversationSummarizer,
 )
-from moduagent.models import ModelGateway, ModelRequest
+from moduagent.models import ModelGateway, ModelProtocolError, ModelRequest
 from moduagent.memory.token import (
     ApproximateTokenCounter,
     TokenBudget,
@@ -261,7 +261,17 @@ class TokenBudgetConversationMemoryPolicy(_ImmutableSemanticConfiguration):
                     selected_tokens = summary_tokens
                 else:
                     summary_message = None
+            except ModelProtocolError:
+                raise
             except Exception as exc:
+                # A tripped run-wide model guard is a terminal execution
+                # decision, not an optional summarization failure. Import
+                # lazily to keep the Memory package independent of Runtime
+                # initialization.
+                from moduagent.runtime.model_guard import ModelGuardTripped
+
+                if isinstance(exc, ModelGuardTripped):
+                    raise
                 summary_message = None
                 summary_error = type(exc).__name__
 

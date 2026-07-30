@@ -13,6 +13,7 @@ from .base import (
     ModelResponse,
     validate_request_capabilities,
 )
+from .errors import ModelProtocolError
 from .openai_compatible import (
     _StreamingToolCalls,
     _content_text,
@@ -115,19 +116,23 @@ class OllamaClient:
 
     def _parse_response(self, value: Mapping[str, Any]) -> ModelResponse:
         if value.get("error"):
-            raise RuntimeError(f"model endpoint error: {value['error']}")
+            raise ModelProtocolError("model endpoint returned an error response")
         raw_message = value.get("message")
         if not isinstance(raw_message, Mapping):
-            raise ValueError("Ollama response contains no message")
+            raise ModelProtocolError("Ollama response contains no message")
         calls = _tool_calls_from_provider(raw_message.get("tool_calls"))
         message = Message.assistant(_content_text(raw_message.get("content")), calls)
         finish_reason = value.get("done_reason")
         if finish_reason is None and value.get("done"):
             finish_reason = "stop"
+        try:
+            usage = Usage.from_provider(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ModelProtocolError("Ollama response contains invalid usage") from exc
         return ModelResponse(
             message=message,
             tool_calls=calls,
-            usage=Usage.from_provider(value),
+            usage=usage,
             finish_reason=str(finish_reason) if finish_reason is not None else None,
             provider_metadata=_provider_metadata(value, "ollama"),
         )
@@ -166,15 +171,23 @@ class OllamaClient:
             timeout=self.timeout,
         )
         rows = value.get("embeddings")
-        if not isinstance(rows, Sequence):
-            raise ValueError("Ollama embedding response contains no embeddings")
+        if not isinstance(rows, Sequence) or isinstance(
+            rows,
+            (str, bytes, bytearray),
+        ):
+            raise ModelProtocolError("Ollama embedding response contains no embeddings")
         embeddings: list[tuple[float, ...]] = []
         for vector in rows:
             if not isinstance(vector, Sequence) or isinstance(
                 vector, (str, bytes, bytearray)
             ):
-                raise ValueError("Ollama returned an invalid embedding vector")
-            embeddings.append(tuple(float(value) for value in vector))
+                raise ModelProtocolError("Ollama returned an invalid embedding vector")
+            try:
+                embeddings.append(tuple(float(value) for value in vector))
+            except (TypeError, ValueError) as exc:
+                raise ModelProtocolError(
+                    "Ollama returned a non-numeric embedding vector"
+                ) from exc
         return tuple(embeddings)
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelChunk]:
@@ -184,6 +197,7 @@ class OllamaClient:
         usage = Usage()
         finish_reason: str | None = None
         metadata: dict[str, Any] = {"provider": "ollama"}
+        saw_terminal_marker = False
 
         async for raw_line in self.transport.stream_lines(
             self.endpoint,
@@ -192,7 +206,12 @@ class OllamaClient:
             timeout=self.timeout,
         ):
             if isinstance(raw_line, bytes):
-                raw_line = raw_line.decode("utf-8")
+                try:
+                    raw_line = raw_line.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ModelProtocolError(
+                        "Ollama returned invalid UTF-8 JSONL"
+                    ) from exc
             for raw_part in raw_line.splitlines() or (raw_line,):
                 line = raw_part.strip()
                 if not line:
@@ -200,13 +219,17 @@ class OllamaClient:
                 try:
                     value = json.loads(line)
                 except json.JSONDecodeError as exc:
-                    raise ValueError("Ollama returned invalid JSONL") from exc
+                    raise ModelProtocolError("Ollama returned invalid JSONL") from exc
                 if not isinstance(value, Mapping):
-                    raise ValueError("Ollama returned a non-object JSONL event")
+                    raise ModelProtocolError("Ollama returned a non-object JSONL event")
                 if value.get("error"):
-                    raise RuntimeError(f"model endpoint error: {value['error']}")
+                    raise ModelProtocolError(
+                        "model endpoint returned an error JSONL event"
+                    )
                 metadata.update(_provider_metadata(value, "ollama"))
                 raw_message = value.get("message")
+                if raw_message is not None and not isinstance(raw_message, Mapping):
+                    raise ModelProtocolError("Ollama returned an invalid JSONL message")
                 if isinstance(raw_message, Mapping):
                     text = _content_text(raw_message.get("content"))
                     if text:
@@ -214,10 +237,20 @@ class OllamaClient:
                         yield ModelChunk(delta=text, provider_metadata=metadata)
                     tool_calls.add(raw_message.get("tool_calls"))
                 if value.get("done"):
+                    saw_terminal_marker = True
                     reason = value.get("done_reason")
                     finish_reason = str(reason) if reason is not None else "stop"
-                    usage = Usage.from_provider(value)
+                    try:
+                        usage = Usage.from_provider(value)
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        raise ModelProtocolError(
+                            "Ollama returned invalid JSONL usage"
+                        ) from exc
 
+        if not saw_terminal_marker:
+            raise ModelProtocolError(
+                "Ollama JSONL stream ended without a terminal marker"
+            )
         calls = tool_calls.build()
         content = "".join(content_parts)
         message = Message.assistant(content if content or not calls else None, calls)

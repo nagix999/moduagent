@@ -291,6 +291,10 @@ class AgentSpec:
                 "max_step_attempts": self.limits.max_step_attempts,
                 "max_replans": self.limits.max_replans,
                 "max_tool_repair_attempts": (self.limits.max_tool_repair_attempts),
+                "max_model_turns": self.limits.max_model_turns,
+                "no_progress_model_turn_threshold": (
+                    self.limits.no_progress_model_turn_threshold
+                ),
             },
             "retry": {
                 "max_attempts": self.retry.max_attempts,

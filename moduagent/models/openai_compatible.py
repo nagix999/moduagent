@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
 
@@ -13,6 +14,7 @@ from .base import (
     ModelResponse,
     validate_request_capabilities,
 )
+from .errors import ModelProtocolError
 from .transport import HttpTransport, HttpxTransport
 
 
@@ -85,13 +87,13 @@ def _arguments_from_provider(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
     if not isinstance(value, str):
-        raise ValueError("tool arguments must be a JSON object")
+        raise ModelProtocolError("model tool arguments must be a JSON object")
     try:
         decoded = json.loads(value)
     except json.JSONDecodeError as exc:
-        raise ValueError("model returned invalid JSON tool arguments") from exc
+        raise ModelProtocolError("model returned invalid JSON tool arguments") from exc
     if not isinstance(decoded, Mapping):
-        raise ValueError("model returned non-object tool arguments")
+        raise ModelProtocolError("model returned non-object tool arguments")
     return dict(decoded)
 
 
@@ -99,18 +101,18 @@ def _tool_calls_from_provider(value: Any) -> tuple[ToolCall, ...]:
     if not value:
         return ()
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-        raise ValueError("model returned invalid tool_calls")
+        raise ModelProtocolError("model returned invalid tool_calls")
 
     calls: list[ToolCall] = []
     for index, item in enumerate(value):
         if not isinstance(item, Mapping):
-            raise ValueError("model returned an invalid tool call")
+            raise ModelProtocolError("model returned an invalid tool call")
         function = item.get("function", item)
         if not isinstance(function, Mapping):
-            raise ValueError("model returned an invalid function call")
+            raise ModelProtocolError("model returned an invalid function call")
         name = function.get("name") or item.get("name")
         if not name:
-            raise ValueError("model tool call has no function name")
+            raise ModelProtocolError("model tool call has no function name")
         call_id = item.get("id") or f"call-{index + 1}"
         arguments = function.get("arguments", item.get("arguments"))
         calls.append(
@@ -133,11 +135,18 @@ class _StreamingToolCalls:
         if not isinstance(chunks, Sequence) or isinstance(
             chunks, (str, bytes, bytearray)
         ):
-            raise ValueError("model returned invalid streaming tool_calls")
+            raise ModelProtocolError("model returned invalid streaming tool_calls")
         for position, item in enumerate(chunks):
             if not isinstance(item, Mapping):
-                raise ValueError("model returned an invalid streaming tool call")
-            index = int(item.get("index", position))
+                raise ModelProtocolError(
+                    "model returned an invalid streaming tool call"
+                )
+            try:
+                index = int(item.get("index", position))
+            except (TypeError, ValueError) as exc:
+                raise ModelProtocolError(
+                    "model returned an invalid streaming tool call index"
+                ) from exc
             state = self._calls.setdefault(
                 index, {"id": None, "name": None, "argument_parts": [], "arguments": {}}
             )
@@ -145,7 +154,9 @@ class _StreamingToolCalls:
                 state["id"] = str(item["id"])
             function = item.get("function", item)
             if not isinstance(function, Mapping):
-                raise ValueError("model returned an invalid streaming function call")
+                raise ModelProtocolError(
+                    "model returned an invalid streaming function call"
+                )
             if function.get("name"):
                 state["name"] = str(function["name"])
             arguments = function.get("arguments", item.get("arguments"))
@@ -159,7 +170,7 @@ class _StreamingToolCalls:
         for index, state in sorted(self._calls.items()):
             name = state["name"]
             if not name:
-                raise ValueError("streamed tool call has no function name")
+                raise ModelProtocolError("streamed tool call has no function name")
             argument_text = "".join(state["argument_parts"])
             arguments = dict(state["arguments"])
             if argument_text:
@@ -202,6 +213,10 @@ class OpenAICompatibleClient:
             raise ValueError("base_url cannot be empty")
         if not model.strip():
             raise ValueError("model cannot be empty")
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise TypeError("timeout must be a finite number")
+        if not math.isfinite(float(timeout)):
+            raise ValueError("timeout must be finite")
         if timeout <= 0:
             raise ValueError("timeout must be positive")
         normalized_url = base_url.rstrip("/")
@@ -273,23 +288,30 @@ class OpenAICompatibleClient:
 
     def _parse_response(self, value: Mapping[str, Any]) -> ModelResponse:
         choices = value.get("choices")
-        if not isinstance(choices, Sequence) or not choices:
+        if (
+            not isinstance(choices, Sequence)
+            or isinstance(choices, (str, bytes, bytearray))
+            or not choices
+        ):
             error = value.get("error")
             if error:
-                raise RuntimeError(f"model endpoint error: {error}")
-            raise ValueError("model response contains no choices")
+                raise ModelProtocolError("model endpoint returned an error response")
+            raise ModelProtocolError("model response contains no choices")
         choice = choices[0]
         if not isinstance(choice, Mapping):
-            raise ValueError("model response contains an invalid choice")
+            raise ModelProtocolError("model response contains an invalid choice")
         raw_message = choice.get("message")
         if not isinstance(raw_message, Mapping):
-            raise ValueError("model response choice contains no message")
+            raise ModelProtocolError("model response choice contains no message")
         calls = _tool_calls_from_provider(raw_message.get("tool_calls"))
         message = Message.assistant(_content_text(raw_message.get("content")), calls)
         usage_value = value.get("usage")
-        usage = Usage.from_provider(
-            usage_value if isinstance(usage_value, Mapping) else None
-        )
+        try:
+            usage = Usage.from_provider(
+                usage_value if isinstance(usage_value, Mapping) else None
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ModelProtocolError("model response contains invalid usage") from exc
         return ModelResponse(
             message=message,
             tool_calls=calls,
@@ -334,20 +356,37 @@ class OpenAICompatibleClient:
             timeout=self.timeout,
         )
         rows = value.get("data")
-        if not isinstance(rows, Sequence):
-            raise ValueError("embedding response contains no data")
-        ordered = sorted(
-            (row for row in rows if isinstance(row, Mapping)),
-            key=lambda row: int(row.get("index", 0)),
-        )
+        if not isinstance(rows, Sequence) or isinstance(
+            rows,
+            (str, bytes, bytearray),
+        ):
+            raise ModelProtocolError("embedding response contains no data")
+        if any(not isinstance(row, Mapping) for row in rows):
+            raise ModelProtocolError("embedding response contains an invalid row")
+        try:
+            ordered = sorted(
+                rows,
+                key=lambda row: int(row.get("index", 0)),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ModelProtocolError(
+                "embedding response contains an invalid index"
+            ) from exc
         embeddings: list[tuple[float, ...]] = []
         for row in ordered:
             vector = row.get("embedding")
             if not isinstance(vector, Sequence) or isinstance(
                 vector, (str, bytes, bytearray)
             ):
-                raise ValueError("embedding response contains an invalid vector")
-            embeddings.append(tuple(float(value) for value in vector))
+                raise ModelProtocolError(
+                    "embedding response contains an invalid vector"
+                )
+            try:
+                embeddings.append(tuple(float(value) for value in vector))
+            except (TypeError, ValueError) as exc:
+                raise ModelProtocolError(
+                    "embedding response contains a non-numeric vector"
+                ) from exc
         return tuple(embeddings)
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelChunk]:
@@ -357,6 +396,7 @@ class OpenAICompatibleClient:
         usage = Usage()
         finish_reason: str | None = None
         metadata: dict[str, Any] = {"provider": self._provider_name()}
+        saw_terminal_marker = False
 
         async for raw_line in self.transport.stream_lines(
             self.endpoint,
@@ -365,7 +405,12 @@ class OpenAICompatibleClient:
             timeout=self.timeout,
         ):
             if isinstance(raw_line, bytes):
-                raw_line = raw_line.decode("utf-8")
+                try:
+                    raw_line = raw_line.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ModelProtocolError(
+                        "model returned invalid UTF-8 SSE data"
+                    ) from exc
             for raw_part in raw_line.splitlines() or (raw_line,):
                 line = raw_part.strip()
                 if not line or line.startswith(":") or line.startswith("event:"):
@@ -373,37 +418,55 @@ class OpenAICompatibleClient:
                 if line.startswith("data:"):
                     line = line[5:].strip()
                 if line == "[DONE]":
+                    saw_terminal_marker = True
                     continue
                 try:
                     value = json.loads(line)
                 except json.JSONDecodeError as exc:
-                    raise ValueError("model returned invalid SSE JSON") from exc
+                    raise ModelProtocolError("model returned invalid SSE JSON") from exc
                 if not isinstance(value, Mapping):
-                    raise ValueError("model returned a non-object SSE event")
+                    raise ModelProtocolError("model returned a non-object SSE event")
                 if value.get("error"):
-                    raise RuntimeError(f"model endpoint error: {value['error']}")
+                    raise ModelProtocolError(
+                        "model endpoint returned an error SSE event"
+                    )
                 metadata.update(_provider_metadata(value, self._provider_name()))
                 raw_usage = value.get("usage")
                 if isinstance(raw_usage, Mapping):
-                    usage = Usage.from_provider(raw_usage)
+                    try:
+                        usage = Usage.from_provider(raw_usage)
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        raise ModelProtocolError(
+                            "model returned invalid SSE usage"
+                        ) from exc
 
                 choices = value.get("choices")
-                if not isinstance(choices, Sequence):
+                if choices is None and isinstance(raw_usage, Mapping):
                     continue
+                if not isinstance(choices, Sequence) or isinstance(
+                    choices,
+                    (str, bytes, bytearray),
+                ):
+                    raise ModelProtocolError("model returned invalid SSE choices")
                 for choice in choices:
                     if not isinstance(choice, Mapping):
-                        continue
+                        raise ModelProtocolError("model returned an invalid SSE choice")
                     if choice.get("finish_reason") is not None:
                         finish_reason = str(choice["finish_reason"])
+                        saw_terminal_marker = True
                     delta = choice.get("delta") or choice.get("message") or {}
                     if not isinstance(delta, Mapping):
-                        continue
+                        raise ModelProtocolError(
+                            "model returned an invalid SSE message delta"
+                        )
                     text = _content_text(delta.get("content"))
                     if text:
                         content_parts.append(text)
                         yield ModelChunk(delta=text, provider_metadata=metadata)
                     tool_calls.add(delta.get("tool_calls"))
 
+        if not saw_terminal_marker:
+            raise ModelProtocolError("model SSE stream ended without a terminal marker")
         calls = tool_calls.build()
         content = "".join(content_parts)
         message = Message.assistant(content if content or not calls else None, calls)

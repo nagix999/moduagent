@@ -1,6 +1,6 @@
 # Plan-and-Execute
 
-상태: ModuAgent 0.4의 `PlanExecutionEngine`은 검증된 단계 결과와 공개 최종 응답을 분리하는 strict 상태 머신이다. 기존 `PlanAndExecutePolicy`는 호환 facade로 유지된다. `Agent`의 기본 실행은 계속 Standard이며, Plan-and-Execute가 필요한 Agent에 명시적으로 설정한다.
+상태: ModuAgent 0.5의 `PlanExecutionEngine`은 검증된 단계 결과와 공개 최종 응답을 분리하는 strict 상태 머신이다. 기존 `PlanAndExecutePolicy`는 호환 facade로 유지된다. `Agent`의 기본 실행은 계속 Standard이며, Plan-and-Execute가 필요한 Agent에 명시적으로 설정한다.
 
 ## 핵심 계약
 
@@ -37,6 +37,36 @@ PLAN
 기본 `StepValidator`는 단계 ID, terminal status, 완료 조건별 비어 있지 않은 근거 수를 결정적으로 검사한다. 사실의 의미적 진위를 판정하지는 않으므로 더 강한 검증이 필요하면 `StepValidator`를 확장해 주입한다.
 
 ## 기본 사용
+
+같은 모델로 계획과 실행을 수행하는 일반적인 경우에는 Quick API를 사용할 수 있다.
+
+```python
+from moduagent import Agent, RunLimits
+
+planning_agent = Agent.create(
+    name="planning-agent",
+    instructions="검증된 단계 결과만 사용해 간결하게 답한다.",
+    model=model,
+    tools=tools,
+    execution="plan",
+    limits=RunLimits(
+        max_steps=4,
+        max_step_attempts=2,
+        max_replans=1,
+        max_tool_calls=8,
+        max_model_turns=32,
+        no_progress_model_turn_threshold=3,
+        timeout_seconds=120,
+    ),
+)
+
+result = await planning_agent.run(
+    "요청을 여러 검증 가능한 단계로 수행해줘",
+    session_id="plan-session",
+)
+```
+
+`execution="plan"`은 같은 `model`과 `limits.max_steps`를 사용하는 `LLMPlanGenerator`와 `PlanExecutionProfile`로 변환된다. 별도 planning model, custom `PlanGenerator`, checkpoint 또는 상세 복구 설정이 필요하면 다음 명시적 API를 사용한다.
 
 ```python
 from moduagent import (
@@ -84,9 +114,27 @@ result = await planning_agent.run(
 | `max_tool_repair_attempts` | 모델이 실패한 Tool call의 인자를 교정해 새 call을 만들 수 있는 최대 횟수 |
 | `max_replans` | 미완료 계획을 수정할 수 있는 최대 횟수 |
 | `max_tool_calls` | 한 run에서 실행할 business Tool 호출 수 |
+| `max_model_turns` | provider retry를 포함한 실제 모델 시도 수. 기본값 32 |
+| `no_progress_model_turn_threshold` | 동일 의미 상태·동일 의미 응답의 연속 관찰 threshold. 기본값 3 |
 | `timeout_seconds` | PLAN, 모든 ACT/검증, 재계획, FINALIZE, 저장 작업을 포함한 전체 시간 |
 
 Tool 왕복 자체는 단계 시도 횟수를 증가시키지 않는다. Tool 실패 시 `revise_on_tool_failure=True`이면 완료된 단계와 결과를 보존한 채 미완료 범위를 재계획하며 `max_replans`를 소비한다.
+
+## 모델 retry와 실행 loop 차단
+
+`RetryConfig.max_attempts`의 각 provider 시도는 성공 여부와 관계없이 `max_model_turns`를 하나씩 소비한다. PLAN, ACT_TOOL, `StepResult`, 재계획과 FINALIZE 호출도 같은 run 예산을 공유한다. streaming에서는 chunk가 아니라 stream 시도 하나를 한 turn으로 센다. 다음 시도가 상한을 넘기기 전에 `FinishReason.MAX_MODEL_TURNS`와 `max_model_turns_exceeded`로 종료한다.
+
+`CheckpointStore`가 있으면 각 turn은 실제 provider 호출 직전 `before_model` durable boundary에 예약된다. retry 시도도 각각 먼저 저장되며, 저장이 실패하면 provider I/O를 시작하지 않는다. provider 요청 중 hard crash가 발생해도 resume은 저장된 turn 수에서 이어진다.
+
+provider retry는 timeout·HTTP 408, connection/network 오류와 HTTP 5xx만 허용한다. HTTP 4xx/429, 잘못된 요청, client contract 오류, JSON decoding과 protocol 오류는 같은 요청을 반복해도 수정되지 않으므로 즉시 실패한다. stream이 일부 delta를 이미 방출한 뒤 끊기면 중복 출력을 방지하기 위해 transient 오류도 재시도하지 않는다. 전체 분류표는 [Operations](operations.md)를 참고한다.
+
+`no_progress_model_turn_threshold`는 동일한 Engine ID, phase와 logical step ID에서 동일한 의미 응답이 반복되는 경우를 센다. 의미 응답에는 content, finish reason, Tool 이름과 arguments가 포함되며 provider call ID, usage와 provider metadata는 제외된다. 기본값 3은 첫 응답을 1로 계산하여 세 번째 동일 응답에서 `FinishReason.NO_PROGRESS`와 `model_no_progress`로 종료한다.
+
+성공한 Tool outcome은 Tool 이름, 실제 검증된 인자와 정규화된 결과의 run-salted fingerprint가 직전 성공 outcome과 다를 때만 진전이다. 같은 Tool이 같은 인자와 같은 결과로 성공하는 loop는 streak를 초기화하지 않는다. provider call ID, 실행 시간이나 retry 횟수만 바뀐 경우도 동일 outcome이다. 반면 새 source record를 소비한 각 `memory_summary` batch와 Plan step commit은 명시적인 진전이므로 streak를 초기화한다.
+
+비교를 위해 원본 프롬프트, 출력이나 Tool 인자·결과를 보관하지 않는다. model guard checkpoint에는 run별 무작위 salt, HMAC-SHA-256 관찰 digest와 숫자 카운터만 저장하고, 성공 outcome도 raw payload가 아닌 run-salted fingerprint로 비교한다. resume 후에도 같은 run의 예산과 streak를 이어간다. `MAX_MODEL_TURNS`와 `NO_PROGRESS` terminal은 모두 `retryable=False`, `resumable=False`다.
+
+Planner 응답이 비어 있거나 잘못된 JSON·schema·Tool 이름을 포함하면 catch-all 단계를 생성하지 않고 `ModelProtocolError`로 즉시 실패한다. FINALIZE가 Tool call, 빈 응답 또는 잘린 응답을 반환한 경우도 protocol 실패다. 이러한 실패는 provider retry 대상이 아니다.
 
 ## Tool 실패 복구
 
@@ -231,6 +279,8 @@ ACT의 내부 출력은 다음 `StepResult` 필드만 허용한다.
 
 `extra="forbid"`가 적용되므로 `final_answer` 같은 단계 밖의 필드를 넣으면 커밋되지 않는다. 커밋된 결과는 canonical JSON의 SHA-256 `result_ref`와 함께 저장된다. 재계획은 기존 완료 단계의 ID, 상태, 결과 참조와 `committed_results`를 보존한다.
 
+0.5에서는 schema-only `StepResult`가 JSON 문법 오류, 빈 응답, 허용되지 않은 필드 또는 Pydantic schema 불일치를 가지면 현재 단계를 즉시 `failed`로 전이한다. 이 경우 `validation_code="step_result_schema_invalid"`, `validation_location="step_result"`가 기록되며 같은 응답을 `max_step_attempts`만큼 반복 생성하지 않는다. `max_step_attempts`는 schema를 통과한 결과의 완료 근거 검증처럼 다시 시도해 의미가 있는 단계 검증에 사용한다.
+
 검증 재시도, Tool 실패 복구 또는 재계획 한도를 소진해 Policy가 terminal 실패를 결정하면 현재 `PlanStep.status`도 `failed`로 전이한다. 다음 단계는 실행되지 않았으므로 `pending`으로 남는다. 일시적인 transport 오류나 전체 run timeout처럼 checkpoint에서 재개 가능한 중단은 `in_progress`로 남을 수 있지만, 이는 동기 DB 조회나 Tool 함수가 백그라운드에서 계속 실행 중이라는 뜻이 아니다.
 
 ## 허용 Tool과 실제 Tool 호출
@@ -373,12 +423,15 @@ allowed-tools: lookup
 - pending 결과와 원문을 제외한 Tool 복구 상태
 - FINALIZE 원문, 저장 여부, 공개 방출 여부와 호출 횟수
 - phase-scoped Skill 활성화 상태
+- 실제 model turn 수, no-progress streak, run별 salt와 원문 없는 HMAC-SHA-256 관찰 digest
 
 0.4는 v1-v3 checkpoint를 copy-on-migrate 방식으로 읽고 검증된 v4 snapshot으로 변환한다. v4를 v3로 downgrade하지 않으므로 rolling 배포에서는 store/key namespace를 버전별로 분리하거나 진행 중 run을 0.4 worker에 고정한다.
 
-v3 checkpoint를 변환해 재개하면 완료 단계와 원래 실패한 repair call을 다시 실행하지 않는다. 의미가 불명확한 partial-success 또는 실행 중 Tool 상태는 자동 replay하지 않고 `manual_required`로 fail closed한다. 자세한 절차는 [0.4 마이그레이션](migration-0.4.md)을 참고한다.
+v3 checkpoint를 변환해 재개하면 완료 단계와 원래 실패한 repair call을 다시 실행하지 않는다. 의미가 불명확한 partial-success 또는 실행 중 Tool 상태는 자동 replay하지 않고 `manual_required`로 fail closed한다. 자세한 절차는 [0.4 마이그레이션](migration-0.4.md)을 참고한다. 0.4 애플리케이션을 0.5로 올릴 때의 additive API와 새 terminal reason 대응은 [0.5 마이그레이션](migration-0.5.md)을 참고한다.
 
-checkpoint에는 모델이 만든 원본 Tool 인자와 결과를 복제하지 않고 call identity와 arguments fingerprint, 안전한 실패 code만 보존한다. conversation과 checkpoint 저장소에는 암호화, 접근 제어와 TTL을 적용한다.
+checkpoint에는 모델이 만든 원본 Tool 인자와 결과를 복제하지 않고 call identity와 arguments fingerprint, 성공 outcome의 run-salted fingerprint, 안전한 실패 code만 보존한다. conversation과 checkpoint 저장소에는 암호화, 접근 제어와 TTL을 적용한다.
+
+모든 모델 시도는 provider I/O 직전 `before_model` boundary에서 turn을 durable하게 예약한다. 이 저장이 성공해야 provider를 호출하며, retry도 동일하다. 따라서 호출 도중 프로세스가 종료되어도 resume이 이미 소비한 turn을 다시 제공하지 않는다. model guard가 `MAX_MODEL_TURNS` 또는 `NO_PROGRESS`로 terminal 전이한 checkpoint는 자동 resume 대상이 아니다.
 
 동기 Tool은 event loop를 막지 않도록 worker thread에서 실행된다. Python thread는 강제로 안전하게 취소할 수 없으므로 `pd.read_sql` 같은 blocking 호출은 Tool 또는 run timeout 결과가 반환된 뒤에도 해당 worker에서 끝날 때까지 계속될 수 있다. 0.4는 Tool 본체 호출 전에 `tool_invocation_pending` checkpoint를 `manual_required`로 저장하고, 저장 실패 시 Tool을 호출하지 않는다. 이 상태는 자동 resume되지 않는다. DB driver의 query timeout, connection timeout과 서버 측 statement timeout도 함께 설정해야 한다.
 

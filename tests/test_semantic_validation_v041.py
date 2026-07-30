@@ -85,7 +85,7 @@ def _log_payloads(handler: _CaptureHandler) -> list[dict[str, Any]]:
     return payloads
 
 
-def test_schema_invalid_retry_and_max_attempt_are_structurally_observable() -> None:
+def test_schema_invalid_fails_immediately_and_is_structurally_observable() -> None:
     async def scenario() -> None:
         secret = "PRIVATE-MODEL-VALUE"
         malformed = f'{{"step_id":"S1","facts":["{secret}"]'
@@ -106,7 +106,6 @@ def test_schema_invalid_retry_and_max_attempt_are_structurally_observable() -> N
             model=_ScriptedModel(
                 [
                     ModelResponse(Message.assistant(malformed)),
-                    ModelResponse(Message.assistant(malformed)),
                 ]
             ),
             decision_policy=PlanAndExecutePolicy(_StaticPlanGenerator()),
@@ -122,32 +121,28 @@ def test_schema_invalid_retry_and_max_attempt_are_structurally_observable() -> N
         ]
         result = events[-1].data["result"]
 
-        retry = next(event for event in events if event.type is EventType.STEP_RETRY)
         failed = next(event for event in events if event.type is EventType.STEP_FAILED)
-        assert retry.data["validation_code"] == "step_result_schema_invalid"
-        assert retry.data["validation_location"] == "step_result"
-        assert failed.data["validation_code"] == ("step_result_max_attempts_exceeded")
-        assert failed.data["validation_cause_code"] == ("step_result_schema_invalid")
+        assert not any(event.type is EventType.STEP_RETRY for event in events)
+        assert failed.data["validation_code"] == "step_result_schema_invalid"
 
         assert result.finish_reason is FinishReason.ERROR
         assert result.metadata["validation_failure"] == {
-            "code": "step_result_max_attempts_exceeded",
+            "code": "step_result_schema_invalid",
             "location": "step_result",
             "phase": "failed",
             "step_id": "S1",
-            "attempt": 2,
-            "cause_code": "step_result_schema_invalid",
+            "attempt": 1,
         }
         assert result.metadata["error_summary"] == {
             "category": "step_validation",
-            "code": "step_result_max_attempts_exceeded",
+            "code": "step_result_schema_invalid",
             "component": "policy",
             "operation": "step_result",
             "retryable": False,
             "resumable": False,
             "phase": "failed",
             "step_id": "S1",
-            "attempt": 2,
+            "attempt": 1,
         }
 
         projected = [
@@ -157,15 +152,10 @@ def test_schema_invalid_retry_and_max_attempt_are_structurally_observable() -> N
             in {EventType.STEP_RETRY.value, EventType.STEP_FAILED.value}
         ]
         assert [payload["data"]["validation_code"] for payload in projected] == [
-            "step_result_schema_invalid",
-            "step_result_max_attempts_exceeded",
-        ]
-        assert projected[-1]["data"]["validation_cause_code"] == (
             "step_result_schema_invalid"
-        )
+        ]
         assert [record["data"]["validation_code"] for record in audit_records] == [
-            "step_result_schema_invalid",
-            "step_result_max_attempts_exceeded",
+            "step_result_schema_invalid"
         ]
         serialized = json.dumps(
             {
