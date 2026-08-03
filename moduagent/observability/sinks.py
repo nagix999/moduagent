@@ -117,9 +117,29 @@ _OBSERVABILITY_EVENT_FIELDS: Mapping[EventType, tuple[str, ...]] = {
     EventType.SKILL_SKIPPED: ("name", "skill_name"),
     EventType.SKILL_DENIED: ("name", "skill_name", "error_type"),
     EventType.SKILL_ERROR: ("error_type",),
-    EventType.MODEL_STARTED: ("step", "attempt", "phase"),
+    EventType.MODEL_STARTED: (
+        "step",
+        "attempt",
+        "model_turn",
+        "phase",
+        "message_count",
+        "tool_count",
+        "has_output_schema",
+        "streaming",
+    ),
     EventType.MODEL_DELTA: (),
     EventType.MODEL_COMPLETED: (),
+    EventType.MODEL_FAILED: (
+        "step",
+        "attempt",
+        "model_turn",
+        "phase",
+        "duration_seconds",
+        "error_type",
+        "code",
+        "retryable",
+        "terminal",
+    ),
     EventType.MEMORY_COMPACTED: (
         "phase",
         "original_tokens",
@@ -175,7 +195,16 @@ _OBSERVABILITY_EVENT_FIELDS: Mapping[EventType, tuple[str, ...]] = {
     EventType.FINALIZATION_STARTED: ("phase", "count"),
     EventType.FINAL_DELTA: (),
     EventType.FINALIZATION_COMPLETED: ("phase", "count", "persisted"),
-    EventType.RETRY: ("operation", "attempt", "phase", "error_type"),
+    EventType.RETRY: (
+        "operation",
+        "attempt",
+        "model_turn",
+        "phase",
+        "duration_seconds",
+        "error_type",
+        "code",
+        "retryable",
+    ),
     EventType.RUN_COMPLETED: (),
     EventType.RUN_FAILED: (),
 }
@@ -260,14 +289,28 @@ class LoggingEventSink:
         level: int = logging.INFO,
         sensitive_keys: Iterable[str] = DEFAULT_SENSITIVE_KEYS,
         replacement: str = "[REDACTED]",
+        include_deltas: bool = False,
     ) -> None:
+        if type(include_deltas) is not bool:
+            raise TypeError("include_deltas must be a bool")
         self.logger = logger or logging.getLogger("moduagent.events")
         self.level = level
         self.sensitive_keys = frozenset(_normalize_key(key) for key in sensitive_keys)
         self.replacement = replacement
+        self.include_deltas = include_deltas
         self.last_error: BaseException | None = None
 
     async def publish(self, event: AgentEvent) -> None:
+        if (
+            event.type
+            in {
+                EventType.MODEL_DELTA,
+                EventType.STEP_MODEL_DELTA,
+                EventType.FINAL_DELTA,
+            }
+            and not self.include_deltas
+        ):
+            return
         try:
             payload = mask_sensitive(
                 _observability_event_to_dict(event),
@@ -385,6 +428,19 @@ class MetricsEventSink:
                         "model.duration_seconds",
                         duration,
                         labels={"phase": _metric_phase(event.data)},
+                    )
+            if event.type is EventType.MODEL_FAILED:
+                labels = {
+                    "phase": _metric_phase(event.data),
+                    "code": _metric_code(event.data),
+                }
+                await self._increment("model.calls.failed", labels=labels)
+                duration = _metric_duration(event.data)
+                if duration is not None:
+                    await self._observe(
+                        "model.failed_duration_seconds",
+                        duration,
+                        labels=labels,
                     )
 
             if event.type is EventType.TOOL_COMPLETED and _event_failed(event.data):
@@ -670,6 +726,7 @@ def _observability_event_to_dict(event: AgentEvent) -> dict[str, Any]:
             {
                 "step": event.data.get("step"),
                 "attempt": event.data.get("attempt"),
+                "model_turn": event.data.get("model_turn"),
                 "phase": event.data.get("phase"),
                 "duration_seconds": event.data.get("duration_seconds"),
                 "finish_reason": finish_reason,
@@ -678,6 +735,7 @@ def _observability_event_to_dict(event: AgentEvent) -> dict[str, Any]:
             (
                 "step",
                 "attempt",
+                "model_turn",
                 "phase",
                 "duration_seconds",
                 "finish_reason",
@@ -791,6 +849,8 @@ def _safe_observability_field(key: str, value: Any) -> Any:
 def _event_log_level(event: AgentEvent, configured_level: int) -> int:
     if event.type in {EventType.RETRY, EventType.STEP_RETRY}:
         return logging.WARNING
+    if event.type is EventType.MODEL_FAILED:
+        return logging.ERROR if event.data.get("terminal") is True else logging.WARNING
     if event.type in {EventType.RUN_FAILED, EventType.STEP_FAILED}:
         return logging.ERROR
     if event.type is EventType.TOOL_COMPLETED and _event_failed(event.data):
@@ -840,6 +900,9 @@ def _safe_error_summary(metadata: Any) -> dict[str, Any] | None:
     attempt = raw.get("attempt")
     if type(attempt) is int and 0 <= attempt <= 1_000_000:
         summary["attempt"] = attempt
+    provider_finish_reason = raw.get("provider_finish_reason")
+    if provider_finish_reason in {"timeout", "length", "max_tokens"}:
+        summary["provider_finish_reason"] = provider_finish_reason
     return summary or None
 
 
@@ -982,6 +1045,17 @@ def _metric_phase(data: Mapping[str, Any]) -> str:
     return "unknown"
 
 
+def _metric_code(data: Mapping[str, Any]) -> str:
+    code = data.get("code")
+    if (
+        isinstance(code, str)
+        and len(code) <= 128
+        and _STABLE_CODE_PATTERN.fullmatch(code) is not None
+    ):
+        return code
+    return "unknown"
+
+
 def _metric_duration(data: Mapping[str, Any]) -> float | None:
     value = data.get("duration_seconds")
     if (
@@ -1034,18 +1108,21 @@ def _json_safe(value: Any) -> Any:
 
 
 def _normalize_key(key: str) -> str:
-    return str(key).strip().lower().replace("-", "_").replace(" ", "_")
+    return re.sub(r"[^a-z0-9]", "", str(key).strip().lower())
 
 
 def _is_sensitive_key(key: str, sensitive_keys: frozenset[str]) -> bool:
     normalized = _normalize_key(key)
     return (
         normalized in sensitive_keys
-        or normalized.endswith("_password")
-        or normalized.endswith("_secret")
-        or normalized.endswith("_token")
-        or normalized.endswith("_api_key")
-        or normalized.endswith("_private_key")
+        or normalized.endswith("password")
+        or normalized.endswith("secret")
+        or normalized.endswith("token")
+        or normalized.endswith("apikey")
+        or normalized.endswith("privatekey")
+        or normalized.endswith("credential")
+        or normalized.endswith("credentials")
+        or normalized.endswith("authorization")
     )
 
 

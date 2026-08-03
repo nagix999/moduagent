@@ -227,7 +227,13 @@ class OpenAICompatibleClient:
         self.endpoint = normalized_url
         self.model = model
         self.timeout = timeout
-        self.transport = transport or HttpxTransport()
+        if transport is None:
+            owned_transport = HttpxTransport()
+            self.transport: HttpTransport = owned_transport
+            self._owned_transport: HttpxTransport | None = owned_transport
+        else:
+            self.transport = transport
+            self._owned_transport = None
         self._capabilities = capabilities or ModelCapabilities()
         self.default_options = dict(default_options or {})
         self.default_provider_options = dict(provider_options or {})
@@ -242,6 +248,24 @@ class OpenAICompatibleClient:
     @property
     def capabilities(self) -> ModelCapabilities:
         return self._capabilities
+
+    async def aclose(self) -> None:
+        """Close the internally created HTTP transport, if any.
+
+        A transport supplied by the caller remains caller-owned.
+        """
+
+        transport = self._owned_transport
+        if transport is None:
+            return
+        self._owned_transport = None
+        await transport.aclose()
+
+    async def __aenter__(self) -> OpenAICompatibleClient:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.aclose()
 
     def _provider_name(self) -> str:
         return "openai-compatible"

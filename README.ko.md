@@ -11,11 +11,17 @@ ModuAgent는 자체 모델 엔드포인트와 Python 함수를 바탕으로 AI �
 계획-실행(Plan-and-Execute), 체크포인트 복구, 스킬, 관측성 기능을 추가할 수
 있습니다.
 
-> 현재 버전: **0.5.0 (Alpha)** · Python **3.10+** · **MIT License**
+> 현재 버전: **0.5.1a1 (Alpha)** · Python **3.10+** · **MIT License**
 
 ModuAgent를 처음 사용한다면 아래의 짧은 다섯 단계를 따라갑니다. 이 단계는
 0.5 Quick API를 사용하며, 고급 조합에는 명시적인 구성 요소 API를 그대로
 사용할 수 있습니다.
+한 번에 개념 하나씩 추가하는 실행 가능한 파일은
+[초급 예제](https://github.com/nagix999/moduagent/blob/main/examples/README.md)부터
+시작하세요.
+여러 도구를 연결하는 작업을 시작할 준비가 되었다면
+[중급 예제](https://github.com/nagix999/moduagent/blob/main/examples/INTERMEDIATE.ko.md)로
+이어가세요.
 
 ## ModuAgent가 제공하는 기능
 
@@ -70,10 +76,10 @@ ModuAgent에는 Python 3.10 이상이 필요합니다. 접근 가능한 모델 �
 패키지를 설치합니다.
 
 ```bash
-python -m pip install "moduagent==0.5.0"
+python -m pip install "moduagent==0.5.1a1"
 ```
 
-패키지 인덱스에 아직 `0.5.0`이 없고 이미 0.5 소스를 체크아웃했다면 저장소
+패키지 인덱스에 아직 `0.5.1a1`이 없고 이미 0.5 소스를 체크아웃했다면 저장소
 루트에서 설치합니다.
 
 ```bash
@@ -107,17 +113,19 @@ from moduagent import Agent, VLLMClient
 
 
 async def main() -> None:
-    model = VLLMClient.from_env()
-    agent = Agent.create(
-        model=model,
-        instructions="Answer accurately and concisely.",
-    )
+    async with VLLMClient.from_env(
+        default_options={"temperature": 0, "max_tokens": 256},
+    ) as model:
+        agent = Agent.create(
+            model=model,
+            instructions="Answer accurately and concisely.",
+        )
 
-    answer = await agent.ask(
-        "Explain what an AI agent is in one paragraph.",
-        session_id="getting-started",
-    )
-    print(answer)
+        answer = await agent.ask(
+            "Explain what an AI agent is in one paragraph.",
+            session_id="getting-started",
+        )
+        print(answer)
 
 
 if __name__ == "__main__":
@@ -183,19 +191,22 @@ def add(a: int, b: int) -> int:
 
 
 async def main() -> None:
-    calculator = Agent.create(
-        model=VLLMClient.from_env(),
-        instructions=(
-            "Use the add Tool whenever addition is required. "
-            "Do not invent a calculated result."
-        ),
-        tools=[add],
-    )
-    answer = await calculator.ask(
-        "What is 12 plus 30?",
-        session_id="calculator-demo",
-    )
-    print(answer)
+    async with VLLMClient.from_env(
+        default_options={"temperature": 0, "max_tokens": 256},
+    ) as model:
+        calculator = Agent.create(
+            model=model,
+            instructions=(
+                "Use the add Tool whenever addition is required. "
+                "Do not invent a calculated result."
+            ),
+            tools=[add],
+        )
+        answer = await calculator.ask(
+            "What is 12 plus 30?",
+            session_id="calculator-demo",
+        )
+        print(answer)
 
 
 asyncio.run(main())
@@ -253,23 +264,24 @@ class Answer(BaseModel):
     confidence: float = Field(ge=0, le=1)
 
 
-structured_agent = Agent.create(
-    model=VLLMClient.from_env(),
-    instructions=(
-        "Use the add Tool for every arithmetic operation, then return "
-        "the answer in the requested format."
-    ),
-    tools=[add],
-    output=Answer,
-)
-
-
 async def main() -> None:
-    answer: Answer = await structured_agent.ask(
-        "What is 20 plus 22?",
-        session_id="structured-demo",
-    )
-    print(answer.answer, answer.confidence)
+    async with VLLMClient.from_env(
+        default_options={"temperature": 0, "max_tokens": 256},
+    ) as model:
+        structured_agent = Agent.create(
+            model=model,
+            instructions=(
+                "Use the add Tool for every arithmetic operation, then return "
+                "the answer in the requested format."
+            ),
+            tools=[add],
+            output=Answer,
+        )
+        answer: Answer = await structured_agent.ask(
+            "What is 20 plus 22?",
+            session_id="structured-demo",
+        )
+        print(answer.answer, answer.confidence)
 
 
 if __name__ == "__main__":
@@ -311,34 +323,33 @@ class Answer(BaseModel):
     answer: str
     confidence: float = Field(ge=0, le=1)
 
-model = VLLMClient.from_env()
-
-planning_agent = Agent.create(
-    model=model,
-    instructions=(
-        "Use the add Tool for every arithmetic operation. "
-        "Complete multi-step requests using only validated and committed "
-        "step results."
-    ),
-    tools=[add],
-    output=Answer,
-    execution="plan",
-    limits=RunLimits(
-        max_steps=4,
-        max_step_attempts=2,
-        max_replans=1,
-        max_tool_calls=8,
-        timeout_seconds=120,
-    ),
-)
-
-
 async def main() -> None:
-    answer: Answer = await planning_agent.ask(
-        "Calculate 10 + 20, then add 5 to that verified result.",
-        session_id="plan-demo",
-    )
-    print(answer)
+    async with VLLMClient.from_env(
+        default_options={"temperature": 0, "max_tokens": 512},
+    ) as model:
+        planning_agent = Agent.create(
+            model=model,
+            instructions=(
+                "Use the add Tool for every arithmetic operation. "
+                "Complete multi-step requests using only validated and committed "
+                "step results."
+            ),
+            tools=[add],
+            output=Answer,
+            execution="plan",
+            limits=RunLimits(
+                max_steps=4,
+                max_step_attempts=2,
+                max_replans=1,
+                max_tool_calls=8,
+                timeout_seconds=120,
+            ),
+        )
+        answer: Answer = await planning_agent.ask(
+            "Calculate 10 + 20, then add 5 to that verified result.",
+            session_id="plan-demo",
+        )
+        print(answer)
 
 
 if __name__ == "__main__":
@@ -370,7 +381,8 @@ PLAN → ACT_TOOL → STEP_RESULT → VALIDATE/COMMIT → VERIFY → FINALIZE
 
 `ask()`는 `run()`을 호출한 뒤 `unwrap()`을 호출하는 것과 같습니다. 성공한
 경우 디코딩된 출력만 필요하다면 다음과 같이 사용합니다. 이 단계의 예제는
-4단계에서 만든 `planning_agent`를 사용합니다.
+이미 구성한 `planning_agent`가 있다고 가정하며, 호출하는 동안 모델 client의
+비동기 context를 열어 두어야 합니다.
 
 ```python
 import asyncio
@@ -422,6 +434,9 @@ answer = result.output
 | `run_id` | 오류 연관 관계 및 체크포인트 식별자 |
 | `messages` | 외부에 공개되는 대화 메시지 |
 | `metadata` | 크기가 제한된 도구 추적 정보, 계획 요약, 안전한 오류 범주 |
+| `run_usage` | 변경할 수 없는 모델 turn·도구 호출·경과시간 요약 |
+| `tool_trace` | 실행된 도구의 변경할 수 없고 크기가 제한된 projection |
+| `error_summary` | 변경할 수 없는 안전한 종료 오류 분류 |
 
 종료 이유는 다음과 같습니다.
 
@@ -486,6 +501,7 @@ retrying_agent = Agent.create(
 
 - HTTP `429`를 포함한 그 밖의 모든 HTTP `4xx`
 - 잘못된 JSON, 유효하지 않은 도구 인자 또는 provider 프로토콜/파싱 오류
+- provider 출력이 `timeout`, `length`, `max_tokens`로 끝난 경우
 - 구조화 출력 검증 오류
 - 잘못된 요청, capability 불일치, `TypeError` 또는 프로그래밍 오류
 
@@ -493,6 +509,11 @@ retrying_agent = Agent.create(
 도구 재시도와 repair는 별도 계약이며 도구가 선언한 안전성 프로필도 충족해야
 합니다. 모델 재시도를 활성화했다는 이유만으로 도구 재실행이 안전해지지
 않습니다.
+
+provider의 부분 응답은 `model_output_incomplete` code로 실패합니다.
+`result.error_summary["provider_finish_reason"]` 또는
+`AgentRunError.provider_finish_reason`에서 `timeout`, `length`, `max_tokens`를
+구분할 수 있으며, 부분 출력과 provider metadata는 보존하지 않습니다.
 
 ### 전체 실행 모델 보호 장치
 
@@ -687,27 +708,30 @@ async def stream_result() -> None:
 
 ```python
 import asyncio
+import logging
 
-from moduagent import InMemoryDiagnosticSink, LoggingEventSink
+from moduagent import Agent, InMemoryDiagnosticSink, LoggingEventSink
 
+logging.basicConfig(level=logging.INFO)
 diagnostics = InMemoryDiagnosticSink(max_records=1_000)
 
-observable_agent = Agent(
-    config=AgentConfig(
-        name="observable-agent",
-        instructions="Complete the request using the available Tools.",
-    ),
+observable_agent = Agent.create(
+    name="observable-agent",
+    instructions="Complete the request using the available Tools.",
     model=model,
     tools=[add],
     event_sink=LoggingEventSink(),
     diagnostic_sink=diagnostics,
-    diagnostic_timeout_seconds=0.25,
-    diagnostic_max_pending_deliveries=1_024,
 )
 
 
 async def main() -> None:
     result = await observable_agent.run("Use add for 20 + 22.")
+    print(dict(result.run_usage))
+    for trace in result.tool_trace:
+        print(dict(trace))
+    if result.error_summary:
+        print(dict(result.error_summary))
 
     if result.failure_id is not None:
         failure = diagnostics.get(result.failure_id)
@@ -721,7 +745,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`result.metadata["tool_trace"]`에는 실제 실행된 도구와 연관 ID가 기록됩니다.
+`result.tool_trace`에는 실제 실행된 도구와 연관 ID가 기록됩니다.
 `result.failure_id`는 종료된 실행의 근본 오류를 가리킵니다. 연관된 도구
 레코드의 `terminal`은 최종 결과가 아니라 수집 당시 복구 가능성을 뜻하므로,
 이후 Plan 정책이 중단을 결정한 경우에도 `False`일 수 있습니다. 복구된 도구

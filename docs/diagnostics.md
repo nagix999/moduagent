@@ -1,6 +1,6 @@
 # Diagnostics
 
-ModuAgent 0.4.1 separates execution events from failure diagnostics.
+ModuAgent 0.5.1a1 separates execution events from failure diagnostics.
 
 - An `EventSink` receives safe lifecycle events such as model attempts, Tool
   calls, Plan steps, retries, and terminal results.
@@ -138,6 +138,24 @@ deltas, Tool arguments and results, provider payloads, unknown fields, and
 free-form failure or validation reasons are omitted. Where a framework-owned,
 code-like reason is supported, only its bounded stable code is retained.
 
+Framework-managed model attempts expose a content-free timeline:
+
+- `MODEL_STARTED` records `attempt`, `model_turn`, `phase`, `message_count`,
+  `tool_count`, `has_output_schema`, and whether the actual request streams.
+- `MODEL_COMPLETED` records duration, usage, finish reason, and Tool-call count.
+- `MODEL_FAILED` records duration, exception type, stable code, effective
+  retryability, and whether the attempt is terminal.
+- `RETRY` keeps the failed attempt's code, retryability, model turn, and
+  duration so it can be correlated without a provider body.
+
+These events never contain a prompt, message content, Tool arguments, or raw
+provider request/response body. `LoggingEventSink` skips `MODEL_DELTA`,
+`STEP_MODEL_DELTA`, and `FINAL_DELTA` by default to avoid a log entry for every
+stream chunk. Use `LoggingEventSink(include_deltas=True)` only when chunk-size
+evidence is needed; even then the built-in projection logs character and byte
+counts, not delta content. Built-in key masking treats acronym, camel-case,
+underscore, hyphen, and case variants of known secret names equivalently.
+
 Step and Tool correlation values such as `step_id`, `call_id`,
 `failed_call_id`, and `result_ref` are written as SHA-256 hashes. This keeps
 events joinable without disclosing their original identifiers. A terminal
@@ -163,8 +181,17 @@ the raw reason.
 ## Default behavior and delivery
 
 Diagnostics are disabled when `diagnostic_sink` is omitted. Explicitly using
-`NoopDiagnosticSink` also produces no stored record or failure ID. This keeps
-the public 0.4 behavior unchanged.
+`NoopDiagnosticSink` also produces no stored record or failure ID. Safe
+`error_summary` fields do not depend on diagnostic delivery: when
+`RuntimeServices` captures a failure, it keeps the primary component,
+operation, phase, attempt, category, code, and retryability even when a sink is
+absent, returns no ID, or fails. Output codec exceptions are likewise reported
+consistently as `output_validation` / `output_validation_failed`; enabling
+diagnostics only adds a correlation ID and protected diagnostic record.
+An incomplete provider response uses `model_output_incomplete` and exposes only
+the allowlisted `provider_finish_reason` (`timeout`, `length`, or `max_tokens`)
+in both `error_summary` and diagnostic `safe_details`. Partial response content
+and arbitrary provider metadata are never retained.
 
 Two `Agent` options bound delivery:
 

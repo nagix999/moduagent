@@ -209,9 +209,17 @@ class ToolRuntime:
         self.registry = (
             registry if isinstance(registry, ToolRegistry) else ToolRegistry(registry)
         )
-        self.authorizer = authorizer or AllowAllAuthorizer()
-        self.retry = retry or retry_config or RetryConfig()
-        self.failure_projector = failure_projector or FailureProjector()
+        self.authorizer = AllowAllAuthorizer() if authorizer is None else authorizer
+        self.retry = (
+            retry
+            if retry is not None
+            else retry_config
+            if retry_config is not None
+            else RetryConfig()
+        )
+        self.failure_projector = (
+            FailureProjector() if failure_projector is None else failure_projector
+        )
         self.diagnostic_reporter = diagnostic_reporter
         self.default_timeout_seconds = default_timeout_seconds
         self.max_result_bytes = max_result_bytes

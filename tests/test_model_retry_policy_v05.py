@@ -14,6 +14,7 @@ from moduagent.messages import Message
 from moduagent.models import (
     ModelCapabilities,
     ModelChunk,
+    ModelOutputIncompleteError,
     ModelProtocolError,
     ModelRequest,
     ModelResponse,
@@ -45,6 +46,11 @@ def _http_error(status_code: int) -> httpx.HTTPStatusError:
         (_http_error(400), False, "model_http_4xx"),
         (_http_error(429), False, "model_http_4xx"),
         (ModelProtocolError("bad response"), False, "model_protocol_error"),
+        (
+            ModelOutputIncompleteError("max_tokens"),
+            False,
+            "model_output_incomplete",
+        ),
         (httpx.RemoteProtocolError("invalid HTTP"), False, "model_protocol_error"),
         (json.JSONDecodeError("bad JSON", "{", 0), False, "model_protocol_error"),
         (ValueError("invalid request"), False, "model_request_invalid"),
@@ -74,6 +80,14 @@ def test_model_retry_classification_preserves_typed_cause() -> None:
 
     assert classification.retryable is True
     assert classification.code == "model_connection_error"
+
+
+def test_incomplete_output_classification_is_terminal_model_protocol() -> None:
+    classification = classify_model_error(ModelOutputIncompleteError("length"))
+
+    assert classification.retryable is False
+    assert classification.category == "model_protocol"
+    assert classification.code == "model_output_incomplete"
 
 
 class _CompleteSequenceModel:
@@ -140,7 +154,35 @@ def test_complete_retries_only_typed_transient_failures(
         assert len(retries) == 1
         assert retries[0].data["retryable"] is True
         assert retries[0].data["code"] == expected_code
+        assert retries[0].data["model_turn"] == 1
+        assert retries[0].data["duration_seconds"] >= 0
+        started = [event for event in events if event.type is EventType.MODEL_STARTED]
+        assert [event.data["model_turn"] for event in started] == [1, 2]
+        assert all(
+            {
+                "message_count": 2,
+                "tool_count": 0,
+                "has_output_schema": False,
+                "streaming": False,
+            }.items()
+            <= event.data.items()
+            for event in started
+        )
+        failed = [event for event in events if event.type is EventType.MODEL_FAILED]
+        assert len(failed) == 1
+        assert failed[0].data["attempt"] == 1
+        assert failed[0].data["model_turn"] == 1
+        assert failed[0].data["code"] == expected_code
+        assert failed[0].data["retryable"] is True
+        assert failed[0].data["terminal"] is False
+        assert failed[0].data["duration_seconds"] >= 0
+        completed = [
+            event for event in events if event.type is EventType.MODEL_COMPLETED
+        ]
+        assert len(completed) == 1
+        assert completed[0].data["model_turn"] == 2
         assert "PRIVATE-CONNECTION" not in repr(retries[0].to_dict())
+        assert "PRIVATE-CONNECTION" not in repr(failed[0].to_dict())
         assert events[-1].data["result"].output == "recovered"
 
     asyncio.run(scenario())
@@ -150,6 +192,10 @@ def test_complete_retries_only_typed_transient_failures(
     ("error", "expected_code"),
     [
         (ModelProtocolError("PRIVATE-PROTOCOL"), "model_protocol_error"),
+        (
+            ModelOutputIncompleteError("timeout"),
+            "model_output_incomplete",
+        ),
         (
             json.JSONDecodeError("PRIVATE-JSON", "{", 0),
             "model_protocol_error",
@@ -174,9 +220,17 @@ def test_complete_does_not_retry_terminal_failures(
 
         assert model.calls == 1
         assert not any(event.type is EventType.RETRY for event in events)
+        failed = [event for event in events if event.type is EventType.MODEL_FAILED]
+        assert len(failed) == 1
+        assert failed[0].data["terminal"] is True
+        assert failed[0].data["retryable"] is False
+        assert failed[0].data["code"] == expected_code
         result = events[-1].data["result"]
         assert result.metadata["error_summary"]["retryable"] is False
         assert result.metadata["error_summary"]["code"] == expected_code
+        assert result.metadata["error_summary"]["component"] == "model"
+        assert result.metadata["error_summary"]["operation"] == "complete"
+        assert result.metadata["error_summary"]["attempt"] == 1
         assert "PRIVATE" not in repr(events[-1].to_dict())
 
     asyncio.run(scenario())
@@ -261,6 +315,10 @@ def test_stream_does_not_retry_after_emitting_output(
 
         assert model.calls == 1
         assert not any(event.type is EventType.RETRY for event in events)
+        failed = [event for event in events if event.type is EventType.MODEL_FAILED]
+        assert len(failed) == 1
+        assert failed[0].data["retryable"] is False
+        assert failed[0].data["terminal"] is True
         summary = events[-1].data["result"].metadata["error_summary"]
         assert summary["code"] == "model_connection_error"
         assert summary["retryable"] is False

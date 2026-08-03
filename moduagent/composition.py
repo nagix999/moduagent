@@ -419,10 +419,16 @@ def compose_agent(
         if conversation_memory_policy is not None
         else FullConversationMemoryPolicy()
     )
-    resolved_output = output_codec or TextOutputCodec()
-    resolved_conversation_store = conversation_store or InMemoryConversationStore()
-    resolved_event_sink = event_sink or NoopEventSink()
-    resolved_diagnostic_sink = diagnostic_sink or NoopDiagnosticSink()
+    resolved_output = TextOutputCodec() if output_codec is None else output_codec
+    resolved_conversation_store = (
+        InMemoryConversationStore()
+        if conversation_store is None
+        else conversation_store
+    )
+    resolved_event_sink = NoopEventSink() if event_sink is None else event_sink
+    resolved_diagnostic_sink = (
+        NoopDiagnosticSink() if diagnostic_sink is None else diagnostic_sink
+    )
     diagnostic_reporter = (
         None
         if diagnostic_sink is None
@@ -434,7 +440,9 @@ def compose_agent(
     )
     tool_executor = ToolExecutor(
         tool_registry,
-        authorizer=tool_authorizer or AllowAllAuthorizer(),
+        authorizer=(
+            AllowAllAuthorizer() if tool_authorizer is None else tool_authorizer
+        ),
         retry=config.retry,
         diagnostic_reporter=diagnostic_reporter,
     )
@@ -633,7 +641,9 @@ def _resolve_execution(
         )
     compatibility: dict[str, Any] = {}
     if execution_profile is None:
-        policy = decision_policy or StandardDecisionPolicy()
+        policy = (
+            StandardDecisionPolicy() if decision_policy is None else decision_policy
+        )
         is_plan = isinstance(policy, PlanAndExecutePolicy)
         profile = ResolvedExecutionProfile(
             kind="plan" if is_plan else "standard",
@@ -650,7 +660,11 @@ def _resolve_execution(
         return policy, profile, compatibility
 
     if isinstance(execution_profile, StandardExecutionProfile):
-        policy = execution_profile.decision_policy or StandardDecisionPolicy()
+        policy = (
+            StandardDecisionPolicy()
+            if execution_profile.decision_policy is None
+            else execution_profile.decision_policy
+        )
         if isinstance(policy, PlanAndExecutePolicy):
             raise ConfigurationError(
                 "StandardExecutionProfile cannot use PlanAndExecutePolicy"

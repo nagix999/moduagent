@@ -9,11 +9,15 @@ from pydantic import BaseModel
 from moduagent import (
     Agent,
     AgentConfig,
+    InMemoryConversationStore,
+    InMemoryDiagnosticSink,
     ModelRequest,
     ModelResponse,
+    NoopEventSink,
     PydanticOutputCodec,
     RunLimits,
     StandardExecutionProfile,
+    ToolCall,
 )
 from moduagent.errors import AgentRunError
 from moduagent.messages import FinishReason, Message, Usage
@@ -88,6 +92,36 @@ def test_create_accepts_an_existing_output_codec() -> None:
     )
 
     assert agent.runtime.output_codec is codec
+
+
+def test_create_accepts_common_persistence_and_observability_components() -> None:
+    store = InMemoryConversationStore()
+    event_sink = NoopEventSink()
+    diagnostic_sink = InMemoryDiagnosticSink()
+    agent = Agent.create(
+        model=ScriptedModel([]),
+        instructions="Answer.",
+        conversation_store=store,
+        event_sink=event_sink,
+        diagnostic_sink=diagnostic_sink,
+        tool_trace_mode="arguments",
+    )
+
+    assert agent.runtime.conversation_store is store
+    assert agent.runtime.event_sink is event_sink
+    assert agent.diagnostic_reporter is not None
+    assert agent.diagnostic_reporter.sink is diagnostic_sink
+    assert agent.config.tool_trace_mode == "arguments"
+    assert agent.inspect().stream_policy["tool_trace_mode"] == "arguments"
+
+
+def test_create_rejects_an_invalid_tool_trace_mode() -> None:
+    with pytest.raises(ValueError, match="tool_trace_mode"):
+        Agent.create(
+            model=ScriptedModel([]),
+            instructions="Answer.",
+            tool_trace_mode="raw",  # type: ignore[arg-type]
+        )
 
 
 def test_create_plan_uses_the_resolved_run_limit_for_plan_generation() -> None:
@@ -197,6 +231,134 @@ def test_agent_result_failure_raises_a_sanitized_error() -> None:
     assert result.explain() == str(error)
     with pytest.raises(TypeError):
         error.error_summary["code"] = "changed"  # type: ignore[index]
+
+
+def test_agent_result_convenience_properties_are_bounded_and_secret_safe() -> None:
+    result = AgentResult(
+        run_id="run-safe",
+        output=None,
+        messages=(),
+        usage=Usage(),
+        finish_reason=FinishReason.ERROR,
+        metadata={
+            "error_summary": {
+                "category": "tool",
+                "code": "failed",
+                "retryable": False,
+                "raw_provider_error": "must-not-leak",
+            },
+            "tool_trace": [
+                {
+                    "call_id": "call-1",
+                    "tool_name": "lookup",
+                    "success": False,
+                    "attempts": 1,
+                    "duration_seconds": 0.25,
+                    "arguments": {
+                        "query": "select 1",
+                        "api_key": "must-not-leak",
+                        "APIKey": "must-not-leak",
+                        "ACCESS_TOKEN": "must-not-leak",
+                        "nested": {"accessToken": "must-not-leak"},
+                    },
+                    "arguments_source": "validated",
+                    "private": "must-not-leak",
+                }
+            ],
+            "run_usage": {
+                "model_turns": 2,
+                "tool_calls": 1,
+                "duration_seconds": 0.5,
+                "private": "must-not-leak",
+            },
+        },
+    )
+
+    assert dict(result.error_summary) == {
+        "category": "tool",
+        "code": "failed",
+        "retryable": False,
+    }
+    assert dict(result.run_usage) == {
+        "model_turns": 2,
+        "tool_calls": 1,
+        "duration_seconds": 0.5,
+    }
+    assert len(result.tool_trace) == 1
+    trace = result.tool_trace[0]
+    assert "private" not in trace
+    assert trace["arguments"]["query"] == "select 1"
+    assert trace["arguments"]["api_key"] == "[REDACTED]"
+    assert trace["arguments"]["APIKey"] == "[REDACTED]"
+    assert trace["arguments"]["ACCESS_TOKEN"] == "[REDACTED]"
+    assert trace["arguments"]["nested"]["accessToken"] == "[REDACTED]"
+    with pytest.raises(TypeError):
+        result.error_summary["code"] = "changed"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        result.run_usage["tool_calls"] = 2  # type: ignore[index]
+    with pytest.raises(TypeError):
+        trace["arguments"]["query"] = "changed"  # type: ignore[index]
+
+
+def test_coordinator_attaches_run_usage_and_tool_trace_on_success() -> None:
+    @tool
+    def add(a: int, b: int) -> int:
+        """Add two integers."""
+
+        return a + b
+
+    async def scenario() -> None:
+        model = ScriptedModel(
+            [
+                ModelResponse(
+                    Message.assistant(
+                        None,
+                        (ToolCall("call-1", "add", {"a": 2, "b": 3}),),
+                    ),
+                    usage=Usage(5, 2, 7),
+                ),
+                ModelResponse(
+                    Message.assistant("5"),
+                    usage=Usage(7, 1, 8),
+                ),
+            ]
+        )
+        agent = Agent.create(
+            model=model,
+            instructions="Use add for arithmetic.",
+            tools=[add],
+        )
+
+        result = await agent.run("2 + 3")
+
+        assert result.finish_reason is FinishReason.COMPLETED
+        assert result.run_usage["model_turns"] == 2
+        assert result.run_usage["tool_calls"] == 1
+        assert result.run_usage["duration_seconds"] >= 0
+        assert len(result.tool_trace) == 1
+        assert result.tool_trace[0]["tool_name"] == "add"
+
+    asyncio.run(scenario())
+
+
+def test_coordinator_attaches_run_usage_on_failure() -> None:
+    class FailingModel:
+        async def complete(self, request: ModelRequest) -> ModelResponse:
+            del request
+            raise RuntimeError("private provider failure")
+
+    async def scenario() -> None:
+        result = await Agent.create(
+            model=FailingModel(),
+            instructions="Answer.",
+        ).run("Hello")
+
+        assert result.finish_reason is FinishReason.ERROR
+        assert result.run_usage["model_turns"] == 1
+        assert result.run_usage["tool_calls"] == 0
+        assert result.run_usage["duration_seconds"] >= 0
+
+    asyncio.run(scenario())
 
 
 def test_ask_unwraps_runtime_failures() -> None:

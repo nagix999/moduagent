@@ -7,7 +7,7 @@
 0.5는 기존 `Agent(config=..., model=..., ...)`, 실행 Profile, `function_tool`, `run()`과 저장 계약을 유지하면서 일반적인 구성을 위한 Quick API를 추가합니다. 도메인 Tool, 프롬프트, schema, 안전 정책과 운영 컴포넌트는 계속 애플리케이션이 결정합니다.
 
 ```bash
-python -m pip install --upgrade "moduagent==0.5.0"
+python -m pip install --upgrade "moduagent==0.5.1a1"
 ```
 
 대부분의 코드는 생성 방식을 즉시 바꿀 필요가 없습니다. 다만 모델 retry가 strict allowlist로 바뀌고 모든 run에 유한한 model turn/no-progress guard가 적용되므로, 먼저 기존 API 그대로 회귀 테스트한 뒤 Quick API를 점진적으로 적용하세요.

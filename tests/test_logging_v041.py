@@ -74,6 +74,7 @@ def test_terminal_log_projects_bounded_error_and_safe_summary() -> None:
                 "failure_id": "failure-123",
                 "operation": "model",
                 "phase": "finalize",
+                "provider_finish_reason": "timeout",
                 "step_id": "S2",
                 "attempt": 3,
                 "traceback": "raw traceback must not be logged",
@@ -109,6 +110,7 @@ def test_terminal_log_projects_bounded_error_and_safe_summary() -> None:
         "failure_id": "failure-123",
         "operation": "model",
         "phase": "finalize",
+        "provider_finish_reason": "timeout",
         "step_id": _correlation_hash("S2"),
         "retryable": True,
         "resumable": False,
@@ -173,6 +175,151 @@ def test_model_completed_uses_top_level_diagnostic_fields() -> None:
     assert second["finish_reason"] == "completed"
     assert "tool_call_count" not in second
     assert "ignored-response-secret" not in handler.records[0].getMessage()
+
+
+def test_model_attempt_logs_keep_only_safe_evidence() -> None:
+    sink, handler = _logging_sink()
+    secret = "PRIVATE prompt, tool arguments, and provider body"
+    events = (
+        AgentEvent(
+            EventType.MODEL_STARTED,
+            "run-model-evidence",
+            {
+                "step": 2,
+                "attempt": 1,
+                "model_turn": 4,
+                "phase": "act",
+                "message_count": 5,
+                "tool_count": 2,
+                "has_output_schema": True,
+                "streaming": False,
+                "messages": [{"content": secret}],
+                "tools": [{"arguments": secret}],
+            },
+        ),
+        AgentEvent(
+            EventType.MODEL_FAILED,
+            "run-model-evidence",
+            {
+                "step": 2,
+                "attempt": 1,
+                "model_turn": 4,
+                "phase": "act",
+                "duration_seconds": 0.25,
+                "error_type": "ReadTimeout",
+                "code": "model_timeout",
+                "retryable": True,
+                "terminal": False,
+                "provider_body": secret,
+            },
+        ),
+        AgentEvent(
+            EventType.RETRY,
+            "run-model-evidence",
+            {
+                "operation": "model",
+                "attempt": 1,
+                "model_turn": 4,
+                "phase": "act",
+                "duration_seconds": 0.25,
+                "error_type": "ReadTimeout",
+                "code": "model_timeout",
+                "retryable": True,
+                "error": secret,
+            },
+        ),
+    )
+
+    for event in events:
+        _publish(sink, event)
+
+    assert _payload(handler.records[0])["data"] == {
+        "step": 2,
+        "attempt": 1,
+        "model_turn": 4,
+        "phase": "act",
+        "message_count": 5,
+        "tool_count": 2,
+        "has_output_schema": True,
+        "streaming": False,
+    }
+    assert _payload(handler.records[1])["data"] == {
+        "step": 2,
+        "attempt": 1,
+        "model_turn": 4,
+        "phase": "act",
+        "duration_seconds": 0.25,
+        "error_type": "ReadTimeout",
+        "code": "model_timeout",
+        "retryable": True,
+        "terminal": False,
+    }
+    assert _payload(handler.records[2])["data"] == {
+        "operation": "model",
+        "attempt": 1,
+        "model_turn": 4,
+        "phase": "act",
+        "duration_seconds": 0.25,
+        "error_type": "ReadTimeout",
+        "code": "model_timeout",
+        "retryable": True,
+    }
+    assert [record.levelno for record in handler.records] == [
+        logging.INFO,
+        logging.WARNING,
+        logging.WARNING,
+    ]
+    assert secret not in "\n".join(record.getMessage() for record in handler.records)
+
+
+def test_logging_sink_skips_deltas_by_default_and_can_opt_in() -> None:
+    sink, handler = _logging_sink()
+    delta_events = tuple(
+        AgentEvent(event_type, "run-deltas", {"delta": "private output"})
+        for event_type in (
+            EventType.MODEL_DELTA,
+            EventType.STEP_MODEL_DELTA,
+            EventType.FINAL_DELTA,
+        )
+    )
+
+    for event in delta_events:
+        _publish(sink, event)
+    assert handler.records == []
+
+    logger = logging.Logger("test.moduagent.logging-deltas", level=logging.DEBUG)
+    enabled_handler = _CaptureHandler()
+    logger.addHandler(enabled_handler)
+    enabled = LoggingEventSink(logger, include_deltas=True)
+    for event in delta_events:
+        _publish(enabled, event)
+
+    assert len(enabled_handler.records) == 3
+    assert all(
+        _payload(record)["data"] == {"delta_chars": 14, "delta_bytes": 14}
+        for record in enabled_handler.records
+    )
+    assert "private output" not in "\n".join(
+        record.getMessage() for record in enabled_handler.records
+    )
+
+
+def test_logging_mask_handles_acronym_and_separator_secret_keys() -> None:
+    masked = observability_sinks.mask_sensitive(
+        {
+            "APIKey": "PRIVATE-API-KEY",
+            "ACCESS_TOKEN": "PRIVATE-ACCESS-TOKEN",
+            "client-secret": "PRIVATE-CLIENT-SECRET",
+            "safe": "visible",
+        }
+    )
+
+    assert masked == {
+        "APIKey": "[REDACTED]",
+        "ACCESS_TOKEN": "[REDACTED]",
+        "client-secret": "[REDACTED]",
+        "safe": "visible",
+    }
 
 
 def test_tool_log_preserves_safe_correlation_and_failure_fields() -> None:

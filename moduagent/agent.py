@@ -48,12 +48,17 @@ class Agent:
         limits: RunLimits | None = None,
         retry: RetryConfig | None = None,
         memory: ConversationMemoryPolicy | None = None,
+        conversation_store: ConversationStore | None = None,
+        event_sink: EventSink | None = None,
+        diagnostic_sink: DiagnosticSink | None = None,
+        tool_trace_mode: Literal["off", "summary", "arguments"] = "summary",
     ) -> Agent:
         """Create an Agent from the common high-level configuration.
 
         This is an additive convenience API. It resolves to the same
         :class:`AgentConfig`, execution profiles, output codecs, and runtime as
-        the full constructor. Applications that need stores, sinks,
+        the full constructor. The most common persistence and observability
+        components are accepted directly; applications that need
         authorization, checkpoints, Skills, or custom engines should continue
         to use :class:`Agent` directly.
         """
@@ -72,11 +77,15 @@ class Agent:
                 instructions=instructions,
                 limits=resolved_limits,
                 retry=resolved_retry,
+                tool_trace_mode=tool_trace_mode,
             ),
             model=model,
             tools=tools,
             execution_profile=execution_profile,
             output_codec=output_codec,
+            conversation_store=conversation_store,
+            event_sink=event_sink,
+            diagnostic_sink=diagnostic_sink,
             conversation_memory_policy=memory,
         )
 

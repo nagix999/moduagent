@@ -9,6 +9,7 @@ from .base import (
 )
 from .errors import (
     ModelErrorClassification,
+    ModelOutputIncompleteError,
     ModelProtocolError,
     classify_model_error,
     is_retryable_model_error,
@@ -26,6 +27,7 @@ __all__ = [
     "ModelClient",
     "ModelErrorClassification",
     "ModelGateway",
+    "ModelOutputIncompleteError",
     "ModelProtocolError",
     "ModelRequest",
     "ModelResponse",

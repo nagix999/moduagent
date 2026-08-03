@@ -203,9 +203,7 @@ def test_pydantic_output_failure_records_locations_without_input() -> None:
     run(scenario())
 
 
-def test_output_codec_failure_preserves_v040_classification_when_diagnostics_off() -> (
-    None
-):
+def test_output_codec_failure_has_stable_classification_when_diagnostics_off() -> None:
     class Answer(BaseModel):
         total: int
 
@@ -230,8 +228,8 @@ def test_output_codec_failure_preserves_v040_classification_when_diagnostics_off
             assert result.error == "run failed"
             assert result.failure_id is None
             assert result.metadata["error_summary"] == {
-                "category": "execution",
-                "code": "run_failed",
+                "category": "output_validation",
+                "code": "output_validation_failed",
                 "retryable": False,
                 "resumable": False,
             }
@@ -535,6 +533,10 @@ def test_diagnostics_are_default_off_and_do_not_change_fingerprint() -> None:
             "code": "model_invocation_failed",
             "retryable": False,
             "resumable": False,
+            "component": "model",
+            "operation": "complete",
+            "phase": "act",
+            "attempt": 1,
         }
 
     run(scenario())

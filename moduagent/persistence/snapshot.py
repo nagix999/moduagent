@@ -4,14 +4,13 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from importlib.metadata import PackageNotFoundError, version
 from typing import Any, TypeVar
 
 from moduagent.execution.state import EngineSnapshot, EngineStateCodec
 
 SNAPSHOT_SCHEMA_VERSION = 4
 DEFAULT_ENGINE_STATE_VERSION = 1
-SNAPSHOT_RUNTIME_VERSION = "0.5.0"
+SNAPSHOT_RUNTIME_VERSION = "0.5.1a1"
 StateT = TypeVar("StateT")
 
 
@@ -370,17 +369,9 @@ class RunSnapshot:
 
 
 def current_runtime_version() -> str:
-    try:
-        detected = version("moduagent")
-    except PackageNotFoundError:
-        return SNAPSHOT_RUNTIME_VERSION
-    # An editable source checkout can coexist with stale installed metadata.
-    # Only trust distribution metadata from the same 0.5 release line.
-    return (
-        detected
-        if detected == "0.5" or detected.startswith("0.5.")
-        else SNAPSHOT_RUNTIME_VERSION
-    )
+    # Keep checkpoints tied to the source runtime. Importlib distribution
+    # metadata can be stale while developing from an editable checkout.
+    return SNAPSHOT_RUNTIME_VERSION
 
 
 def encode_engine_snapshot(

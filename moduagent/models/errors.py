@@ -20,6 +20,31 @@ class ModelProtocolError(ModelInvocationError, ValueError):
     """
 
 
+_INCOMPLETE_FINISH_REASONS = frozenset({"timeout", "length", "max_tokens"})
+
+
+class ModelOutputIncompleteError(ModelProtocolError):
+    """A provider ended a model response before output was complete.
+
+    Only provider finish reasons with stable, payload-free meaning are accepted.
+    The response content and provider metadata are deliberately not retained.
+    """
+
+    __slots__ = ("_finish_reason",)
+
+    def __init__(self, finish_reason: str) -> None:
+        if type(finish_reason) is not str:
+            raise TypeError("finish_reason must be a string")
+        if finish_reason not in _INCOMPLETE_FINISH_REASONS:
+            raise ValueError("unsupported incomplete model finish_reason")
+        self._finish_reason = finish_reason
+        super().__init__("model output incomplete")
+
+    @property
+    def finish_reason(self) -> str:
+        return self._finish_reason
+
+
 @dataclass(frozen=True, slots=True)
 class ModelErrorClassification:
     """Safe retry and diagnostic attributes for one model failure."""
@@ -33,6 +58,11 @@ _PROTOCOL = ModelErrorClassification(
     retryable=False,
     category="model_protocol",
     code="model_protocol_error",
+)
+_OUTPUT_INCOMPLETE = ModelErrorClassification(
+    retryable=False,
+    category="model_protocol",
+    code="model_output_incomplete",
 )
 _TIMEOUT = ModelErrorClassification(
     retryable=True,
@@ -108,6 +138,9 @@ def classify_model_error(error: BaseException) -> ModelErrorClassification:
         raise TypeError("error must be an exception")
     chain = _exception_chain(error)
 
+    if any(isinstance(item, ModelOutputIncompleteError) for item in chain):
+        return _OUTPUT_INCOMPLETE
+
     # A response parse failure remains terminal even when its cause happens to
     # be a broad ValueError or a provider exception with incidental metadata.
     if any(
@@ -171,6 +204,7 @@ def is_retryable_model_error(error: BaseException) -> bool:
 
 __all__ = [
     "ModelErrorClassification",
+    "ModelOutputIncompleteError",
     "ModelProtocolError",
     "classify_model_error",
     "is_retryable_model_error",

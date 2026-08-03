@@ -1,17 +1,55 @@
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from itertools import islice
+from types import MappingProxyType
 from typing import Any, Mapping
 
-from moduagent.errors import AgentRunError
+from moduagent.errors import AgentRunError, _safe_agent_error_summary
 from moduagent.messages import FinishReason, Message, MessageRole, Usage
 from moduagent.models import ModelGateway
 
 
 _SKILL_MODES = frozenset({"disabled", "explicit", "auto", "hybrid"})
 _SKILL_PHASES = ("plan", "act", "finalize")
+_RESULT_SENSITIVE_KEYS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "access_token",
+        "auth_token",
+        "authorization",
+        "bearer",
+        "bearer_token",
+        "client_secret",
+        "cookie",
+        "credential",
+        "credentials",
+        "password",
+        "private_key",
+        "refresh_token",
+        "secret",
+        "set_cookie",
+        "token",
+    }
+)
+_RESULT_SENSITIVE_SUFFIXES = (
+    "_api_key",
+    "_authorization",
+    "_credential",
+    "_credentials",
+    "_password",
+    "_private_key",
+    "_refresh_token",
+    "_secret",
+    "_token",
+)
+_RESULT_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_RESULT_OMIT = object()
 
 
 def _safe_run_id(value: Any) -> str:
@@ -276,13 +314,31 @@ class AgentResult:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @property
+    def error_summary(self) -> Mapping[str, Any]:
+        """Return an immutable allowlisted terminal failure summary."""
+
+        summary = self.metadata.get("error_summary")
+        return MappingProxyType(
+            _safe_agent_error_summary(summary if isinstance(summary, Mapping) else None)
+        )
+
+    @property
+    def tool_trace(self) -> tuple[Mapping[str, Any], ...]:
+        """Return an immutable, bounded projection of the public Tool trace."""
+
+        return _safe_tool_trace(self.metadata.get("tool_trace"))
+
+    @property
+    def run_usage(self) -> Mapping[str, int | float]:
+        """Return immutable Coordinator counters and wall-clock duration."""
+
+        return MappingProxyType(_safe_run_usage(self.metadata.get("run_usage")))
+
+    @property
     def failure_id(self) -> str | None:
         """Return the terminal failure correlation ID when diagnostics are enabled."""
 
-        summary = self.metadata.get("error_summary")
-        if not isinstance(summary, Mapping):
-            return None
-        value = summary.get("failure_id")
+        value = self.error_summary.get("failure_id")
         return value if isinstance(value, str) and value else None
 
     def raise_for_error(self) -> None:
@@ -290,7 +346,6 @@ class AgentResult:
 
         if self.finish_reason == FinishReason.COMPLETED and self.error is None:
             return
-        summary = self.metadata.get("error_summary")
         raise AgentRunError(
             run_id=self.run_id,
             finish_reason=(
@@ -298,7 +353,7 @@ class AgentResult:
                 if isinstance(self.finish_reason, FinishReason)
                 else str(self.finish_reason)
             ),
-            error_summary=summary if isinstance(summary, Mapping) else None,
+            error_summary=self.error_summary,
         )
 
     def unwrap(self) -> Any:
@@ -318,7 +373,6 @@ class AgentResult:
                 f"output_tokens={self.usage.output_tokens}, "
                 f"total_tokens={self.usage.total_tokens})"
             )
-        summary = self.metadata.get("error_summary")
         return str(
             AgentRunError(
                 run_id=self.run_id,
@@ -327,6 +381,176 @@ class AgentResult:
                     if isinstance(self.finish_reason, FinishReason)
                     else str(self.finish_reason)
                 ),
-                error_summary=summary if isinstance(summary, Mapping) else None,
+                error_summary=self.error_summary,
             )
         )
+
+
+def _safe_run_usage(value: Any) -> dict[str, int | float]:
+    if not isinstance(value, Mapping):
+        return {}
+    safe: dict[str, int | float] = {}
+    for key in ("model_turns", "tool_calls"):
+        item = value.get(key)
+        if type(item) is int and 0 <= item <= 1_000_000_000:
+            safe[key] = item
+    duration = value.get("duration_seconds")
+    if (
+        not isinstance(duration, bool)
+        and isinstance(duration, (int, float))
+        and math.isfinite(float(duration))
+        and duration >= 0
+    ):
+        safe["duration_seconds"] = float(duration)
+    return safe
+
+
+def _safe_tool_trace(value: Any) -> tuple[Mapping[str, Any], ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    projected: list[Mapping[str, Any]] = []
+    for raw in value[:1_000]:
+        if not isinstance(raw, Mapping):
+            continue
+        entry: dict[str, Any] = {}
+        for key in (
+            "step_id",
+            "call_id",
+            "tool_name",
+            "recovery_of_call_id",
+            "failure_id",
+            "arguments_fingerprint",
+        ):
+            text = _safe_result_text(raw.get(key), limit=512)
+            if text:
+                entry[key] = text
+        success = raw.get("success")
+        if type(success) is bool:
+            entry["success"] = success
+        attempts = raw.get("attempts")
+        if type(attempts) is int and 0 <= attempts <= 1_000_000:
+            entry["attempts"] = attempts
+        duration = raw.get("duration_seconds")
+        if (
+            not isinstance(duration, bool)
+            and isinstance(duration, (int, float))
+            and math.isfinite(float(duration))
+            and duration >= 0
+        ):
+            entry["duration_seconds"] = float(duration)
+        error = _safe_tool_error(raw.get("error"))
+        if error:
+            entry["error"] = error
+        arguments = raw.get("arguments")
+        if isinstance(arguments, Mapping):
+            safe_arguments = _safe_trace_value(arguments)
+            if safe_arguments is not _RESULT_OMIT:
+                entry["arguments"] = safe_arguments
+                entry["arguments_source"] = (
+                    "validated"
+                    if raw.get("arguments_source") == "validated"
+                    else "requested"
+                )
+        if entry:
+            projected.append(MappingProxyType(entry))
+    return tuple(projected)
+
+
+def _safe_tool_error(value: Any) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        return MappingProxyType({})
+    safe: dict[str, Any] = {}
+    for key in ("type", "reason", "recovery"):
+        text = _safe_result_text(value.get(key), limit=128)
+        if _RESULT_LABEL_PATTERN.fullmatch(text):
+            safe[key] = text
+    retryable = value.get("retryable")
+    if type(retryable) is bool:
+        safe["retryable"] = retryable
+    return MappingProxyType(safe)
+
+
+def _safe_trace_value(
+    value: Any,
+    *,
+    key: str = "",
+    depth: int = 0,
+) -> Any:
+    if _is_sensitive_result_key(key):
+        return "[REDACTED]"
+    if depth > 8:
+        return _RESULT_OMIT
+    if isinstance(value, Mapping):
+        safe: dict[str, Any] = {}
+        for item_key, item in islice(value.items(), 100):
+            if not isinstance(item_key, str):
+                continue
+            projected = _safe_trace_value(
+                item,
+                key=item_key,
+                depth=depth + 1,
+            )
+            if projected is not _RESULT_OMIT:
+                safe[item_key[:256]] = projected
+        return MappingProxyType(safe)
+    if isinstance(value, (list, tuple)):
+        projected_items = (
+            _safe_trace_value(item, depth=depth + 1) for item in value[:100]
+        )
+        return tuple(item for item in projected_items if item is not _RESULT_OMIT)
+    if value is None or type(value) in {bool, int}:
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else _RESULT_OMIT
+    if isinstance(value, str):
+        return _safe_result_text(value, limit=4_096)
+    return _RESULT_OMIT
+
+
+def _safe_result_text(value: Any, *, limit: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    return "".join(
+        character if character.isprintable() else " " for character in value
+    )[:limit]
+
+
+def _is_sensitive_result_key(value: str) -> bool:
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    compact = re.sub(r"[^a-z0-9]", "", value.lower())
+    return (
+        normalized in _RESULT_SENSITIVE_KEYS
+        or normalized.endswith(_RESULT_SENSITIVE_SUFFIXES)
+        or compact
+        in {
+            "apikey",
+            "accesstoken",
+            "authtoken",
+            "authorization",
+            "bearer",
+            "bearertoken",
+            "clientsecret",
+            "cookie",
+            "credential",
+            "credentials",
+            "password",
+            "privatekey",
+            "refreshtoken",
+            "secret",
+            "setcookie",
+            "token",
+        }
+        or compact.endswith(
+            (
+                "apikey",
+                "authorization",
+                "credential",
+                "credentials",
+                "password",
+                "privatekey",
+                "refreshtoken",
+                "secret",
+                "token",
+            )
+        )
+    )

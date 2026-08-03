@@ -156,21 +156,8 @@ def test_v4_snapshot_has_dual_version_guard_and_shared_engine_contract() -> None
     assert isinstance(restored.engine, ExecutionEngineSnapshot)
 
 
-def test_snapshot_runtime_version_tracks_the_v05_release_line(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    assert SNAPSHOT_RUNTIME_VERSION == "0.5.0"
-
-    monkeypatch.setattr(
-        "moduagent.persistence.snapshot.version",
-        lambda package: "0.5.7",
-    )
-    assert current_runtime_version() == "0.5.7"
-
-    monkeypatch.setattr(
-        "moduagent.persistence.snapshot.version",
-        lambda package: "0.4.2",
-    )
+def test_snapshot_runtime_version_tracks_the_source_release() -> None:
+    assert SNAPSHOT_RUNTIME_VERSION == "0.5.1a1"
     assert current_runtime_version() == SNAPSHOT_RUNTIME_VERSION
 
 

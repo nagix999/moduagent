@@ -67,6 +67,7 @@ from moduagent.models import (
     ModelCapabilities,
     ModelChunk,
     ModelClient,
+    ModelOutputIncompleteError,
     ModelProtocolError,
     ModelRequest,
     ModelResponse,
@@ -186,7 +187,7 @@ from moduagent.tools import (
     tool,
 )
 
-__version__ = "0.5.0"
+__version__ = "0.5.1a1"
 
 __all__ = [
     "__version__",
@@ -260,6 +261,7 @@ __all__ = [
     "ModelCapabilities",
     "ModelChunk",
     "ModelClient",
+    "ModelOutputIncompleteError",
     "ModelProtocolError",
     "ModelRequest",
     "ModelResponse",

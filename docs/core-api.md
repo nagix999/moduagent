@@ -5,7 +5,7 @@
 ## 설치
 
 ```bash
-python -m pip install moduagent==0.5.0
+python -m pip install moduagent==0.5.1a1
 ```
 
 Python 3.10 이상이 필요합니다. Redis adapter를 사용하면 `redis` 패키지도 설치합니다.
@@ -27,20 +27,23 @@ def add(a: int, b: int) -> int:
 
 
 async def main() -> None:
-    agent = Agent.create(
-        model=VLLMClient.from_env(),
-        name="calculator",
-        instructions="계산에는 add Tool을 사용해 간결하게 답한다.",
-        tools=[add],
-    )
-    answer = await agent.ask("12와 30을 더해줘", session_id="demo")
-    print(answer)
+    async with VLLMClient.from_env(
+        default_options={"temperature": 0, "max_tokens": 256},
+    ) as model:
+        agent = Agent.create(
+            model=model,
+            name="calculator",
+            instructions="계산에는 add Tool을 사용해 간결하게 답한다.",
+            tools=[add],
+        )
+        answer = await agent.ask("12와 30을 더해줘", session_id="demo")
+        print(answer)
 
 
 asyncio.run(main())
 ```
 
-`VLLMClient.from_env()`는 `VLLM_MODEL`을 필수로 읽고 `VLLM_BASE_URL`, `VLLM_API_KEY`, `VLLM_TIMEOUT`을 선택적으로 읽습니다. endpoint를 코드나 다른 설정 시스템에서 가져오려면 기존 생성자를 사용합니다.
+`VLLMClient.from_env()`는 `VLLM_MODEL`을 필수로 읽고 `VLLM_BASE_URL`, `VLLM_API_KEY`, `VLLM_TIMEOUT`을 선택적으로 읽습니다. endpoint를 코드나 다른 설정 시스템에서 가져오려면 기존 생성자를 사용합니다. 내장 HTTP client는 `async with` 또는 `aclose()`로 종료합니다.
 
 `tool`은 `function_tool`의 짧은 별칭이며 동작과 안전 기본값이 같습니다. `idempotent`, `repair_safe`, timeout과 오류 분류를 함수 이름이나 구현에서 추론하지 않으므로 필요한 항목은 사용자가 명시해야 합니다.
 
@@ -58,8 +61,11 @@ asyncio.run(main())
 | `output=SomePydanticModel` | `PydanticOutputCodec(SomePydanticModel)` |
 | `output=codec` | 사용자가 만든 `OutputCodec`을 그대로 사용 |
 | `memory=policy` | `ConversationMemoryPolicy`로 전달 |
+| `conversation_store=store` | 대화 저장소로 전달 |
+| `event_sink=sink`, `diagnostic_sink=sink` | 실행 이벤트와 실패 진단 sink로 전달 |
+| `tool_trace_mode="off"|"summary"|"arguments"` | 결과에 포함할 Tool trace 수준을 선택 |
 
-Plan Quick API는 `max_steps`를 `RunLimits`에 한 번만 지정하면 Planner와 Engine에 같은 값이 적용됩니다. 별도 planning model, custom `PlanGenerator`, 저장소, checkpoint, sink, 권한, Skill 또는 custom Engine이 필요하면 아래의 명시적 생성자를 사용합니다.
+Plan Quick API는 `max_steps`를 `RunLimits`에 한 번만 지정하면 Planner와 Engine에 같은 값이 적용됩니다. 별도 planning model, custom `PlanGenerator`, checkpoint, 권한, Skill 또는 custom Engine이 필요하면 아래의 명시적 생성자를 사용합니다.
 
 ### 고급 확장 경로
 
@@ -86,7 +92,17 @@ print(result.explain())
 result.raise_for_error()
 answer = result.unwrap()
 print(result.usage.total_tokens)
+print(dict(result.run_usage))
+for trace in result.tool_trace:
+    print(dict(trace))
 ```
+
+`run_usage`에는 Coordinator가 관찰한 `model_turns`, `tool_calls`, `duration_seconds`가 성공과 실패 모두에 포함됩니다. `error_summary`, `tool_trace`, `run_usage` 편의 속성은 임의 metadata를 제외한 immutable projection입니다. 실패한 실행은 `dict(result.error_summary)`로 정제된 분류를 확인할 수 있습니다. `tool_trace_mode="arguments"`는 비밀정보로 알려진 키를 마스킹하지만 일반 비즈니스 입력은 노출할 수 있으므로 접근 통제된 환경에서만 사용합니다.
+
+provider가 `timeout`, `length`, `max_tokens`로 부분 응답을 끝내면
+`error_summary`의 code는 `model_output_incomplete`이고
+`provider_finish_reason`에는 해당 allowlist 값만 포함됩니다. 응답 본문이나
+provider metadata는 공개 오류에 포함되지 않습니다.
 
 `raise_for_error()`는 `FinishReason.COMPLETED`가 아니거나 error가 있으면 예외를 발생시키고, `unwrap()`은 같은 검사를 한 뒤 output을 반환합니다. `AgentRunError`와 `explain()`은 allowlist된 요약만 유지하며 원본 프롬프트, 모델 출력, Tool 인자나 임의 metadata를 복제하지 않습니다. 전체 진단은 원래 `AgentResult`와 접근 통제된 sink에서 확인합니다.
 
@@ -115,25 +131,24 @@ def add(a: int, b: int) -> int:
 
 
 async def main() -> None:
-    model = VLLMClient(
+    async with VLLMClient(
         base_url="http://localhost:8000/v1",
         model="company-model",
         api_key="token",
-    )
-    agent = Agent(
-        config=AgentConfig(
-            name="calculator",
-            instructions="필요할 때 계산 Tool을 사용해 간결하게 답한다.",
-        ),
-        model=model,
-        tools=[add],
-        execution_profile=StandardExecutionProfile(),
-    )
+    ) as model:
+        agent = Agent(
+            config=AgentConfig(
+                name="calculator",
+                instructions="필요할 때 계산 Tool을 사용해 간결하게 답한다.",
+            ),
+            model=model,
+            tools=[add],
+            execution_profile=StandardExecutionProfile(),
+        )
 
-    result = await agent.run("12와 30을 더해줘", session_id="demo")
-    if result.error:
-        raise RuntimeError(result.error)
-    print(result.output)
+        result = await agent.run("12와 30을 더해줘", session_id="demo")
+        result.raise_for_error()
+        print(result.output)
 
 
 asyncio.run(main())
