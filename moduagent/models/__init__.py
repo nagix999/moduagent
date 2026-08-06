@@ -1,4 +1,5 @@
 from .base import (
+    AuxiliaryModelRequestPreparer,
     ModelCapabilities,
     ModelChunk,
     ModelClient,
@@ -20,6 +21,7 @@ from .transport import HttpTransport, HttpxTransport
 from .vllm import VLLMClient
 
 __all__ = [
+    "AuxiliaryModelRequestPreparer",
     "HttpTransport",
     "HttpxTransport",
     "ModelCapabilities",

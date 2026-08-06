@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from moduagent import (
     Agent,
     AgentConfig,
+    AuthorizationDecision,
     InMemoryConversationStore,
     InMemoryDiagnosticSink,
     ModelRequest,
@@ -16,6 +17,9 @@ from moduagent import (
     NoopEventSink,
     PydanticOutputCodec,
     RunLimits,
+    SkillLimits,
+    SkillRegistry,
+    SkillSelectionResult,
     StandardExecutionProfile,
     ToolCall,
 )
@@ -34,6 +38,39 @@ class ScriptedModel:
     async def complete(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
         return self.responses.pop(0)
+
+
+class _Falsey:
+    def __bool__(self) -> bool:
+        return False
+
+
+class FalseyCheckpointStore(_Falsey):
+    async def load(self, run_id: str) -> None:
+        del run_id
+
+    async def save(self, run_id: str, context: Any) -> None:
+        del run_id, context
+
+    async def delete(self, run_id: str) -> None:
+        del run_id
+
+
+class FalseyAuthorizer(_Falsey):
+    async def authorize(self, *args: Any, **kwargs: Any) -> AuthorizationDecision:
+        del args, kwargs
+        return AuthorizationDecision.allow()
+
+
+class FalseySkillSelector(_Falsey):
+    async def select(self, request: Any) -> SkillSelectionResult:
+        del request
+        return SkillSelectionResult()
+
+
+class FalseySkillLimits(SkillLimits):
+    def __bool__(self) -> bool:
+        return False
 
 
 class Answer(BaseModel):
@@ -113,6 +150,110 @@ def test_create_accepts_common_persistence_and_observability_components() -> Non
     assert agent.diagnostic_reporter.sink is diagnostic_sink
     assert agent.config.tool_trace_mode == "arguments"
     assert agent.inspect().stream_policy["tool_trace_mode"] == "arguments"
+
+
+def test_create_passes_production_composition_and_config_fields_through() -> None:
+    checkpoint_store = FalseyCheckpointStore()
+    authorizer = FalseyAuthorizer()
+    registry = SkillRegistry()
+    selector = FalseySkillSelector()
+    skill_limits = FalseySkillLimits(
+        max_active_skills=2,
+        max_catalog_tokens=17,
+    )
+    diagnostic_sink = InMemoryDiagnosticSink()
+    conversation_store = InMemoryConversationStore()
+
+    assert not checkpoint_store
+    assert not authorizer
+    assert not registry
+    assert not selector
+    assert not skill_limits
+
+    agent = Agent.create(
+        model=ScriptedModel([]),
+        name="production-agent",
+        instructions="Answer safely.",
+        model_options={"temperature": 0.1, "provider": {"seed": 7}},
+        metadata={"environment": "production"},
+        finalization_mode="always",
+        stream_visibility="all",
+        conversation_store=conversation_store,
+        checkpoint_store=checkpoint_store,
+        diagnostic_sink=diagnostic_sink,
+        diagnostic_timeout_seconds=0.75,
+        diagnostic_max_pending_deliveries=7,
+        tool_authorizer=authorizer,
+        skill_registry=registry,
+        skill_selector=selector,
+        skill_limits=skill_limits,
+    )
+
+    assert agent.config.model_options == {
+        "temperature": 0.1,
+        "provider": {"seed": 7},
+    }
+    assert agent.config.metadata == {"environment": "production"}
+    assert agent.config.finalization_mode == "always"
+    assert agent.config.stream_visibility == "all"
+    assert agent.runtime.checkpoint_store is checkpoint_store
+    assert agent.tool_executor.authorizer is authorizer
+    assert agent.skill_runtime is not None
+    assert agent.skill_runtime.registry is registry
+    assert agent.skill_runtime.selector is selector
+    assert agent.skill_runtime.limits is skill_limits
+    assert agent.skill_runtime.limits.max_catalog_tokens == 17
+    assert agent.diagnostic_reporter is not None
+    assert agent.diagnostic_reporter.sink is diagnostic_sink
+    assert agent.diagnostic_reporter.timeout_seconds == 0.75
+    assert agent.diagnostic_reporter.max_pending_deliveries == 7
+    assert agent.inspect().stream_policy["visibility"] == "all"
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"model_options": []}, "model_options"),
+        ({"metadata": []}, "metadata"),
+        ({"finalization_mode": "sometimes"}, "finalization_mode"),
+        ({"stream_visibility": "private"}, "stream_visibility"),
+    ],
+)
+def test_create_validates_common_agent_config_fields(
+    options: dict[str, Any],
+    message: str,
+) -> None:
+    with pytest.raises((TypeError, ValueError), match=message):
+        Agent.create(
+            model=ScriptedModel([]),
+            instructions="Answer.",
+            **options,
+        )
+
+
+def test_create_validates_production_composition_settings() -> None:
+    with pytest.raises(ValueError, match="skill_selector requires skill_registry"):
+        Agent.create(
+            model=ScriptedModel([]),
+            instructions="Answer.",
+            skill_selector=FalseySkillSelector(),
+        )
+
+    with pytest.raises(ValueError, match="diagnostic timeout_seconds"):
+        Agent.create(
+            model=ScriptedModel([]),
+            instructions="Answer.",
+            diagnostic_sink=InMemoryDiagnosticSink(),
+            diagnostic_timeout_seconds=0,
+        )
+
+    with pytest.raises(ValueError, match="max_pending_deliveries"):
+        Agent.create(
+            model=ScriptedModel([]),
+            instructions="Answer.",
+            diagnostic_sink=InMemoryDiagnosticSink(),
+            diagnostic_max_pending_deliveries=0,
+        )
 
 
 def test_create_rejects_an_invalid_tool_trace_mode() -> None:

@@ -546,7 +546,11 @@ class AgentRuntime:
                     messages=tuple(context.messages),
                     tools=tool_schemas,
                     output_schema=None if staged_finalization else output_schema,
-                    options=dict(self.config.model_options),
+                    options={
+                        key: value
+                        for key, value in self.config.model_options.items()
+                        if key != "tools"
+                    },
                 )
                 request_model, memory_event = await self._prepare_model_request(
                     context,
@@ -1193,6 +1197,7 @@ class AgentRuntime:
                     getattr(policy, "step_result_schema")() if extracting else None
                 )
                 options = dict(self.config.model_options)
+                options.pop("tools", None)
                 if not request_tools:
                     options.pop("tool_choice", None)
                     options.pop("parallel_tool_calls", None)
@@ -2128,6 +2133,7 @@ class AgentRuntime:
             context.status = RunStatus.WAITING_FOR_MODEL
             await self._save_checkpoint(context, deadline)
             options = dict(self.config.model_options)
+            options.pop("tools", None)
             options.pop("tool_choice", None)
             options.pop("parallel_tool_calls", None)
             payload = getattr(policy, "finalization_payload")(context)
@@ -2974,18 +2980,27 @@ class AgentRuntime:
         skill_phase: str | None = None,
         protected_from: int | None = None,
     ) -> tuple[ModelRequest, AgentEvent | None]:
+        base_messages = tuple(request.messages)
         request = replace(
             request,
             messages=compose_skill_prompt(
-                request.messages,
+                base_messages,
                 context.skill_messages,
                 phase=skill_phase,
             ),
         )
-        protected_boundary = (
-            context.current_run_start + len(context.skill_messages)
-            if protected_from is None
-            else protected_from
+        insertion = 0
+        while (
+            insertion < len(base_messages)
+            and base_messages[insertion].role is MessageRole.SYSTEM
+        ):
+            insertion += 1
+        inserted_skills = len(request.messages) - len(base_messages)
+        base_boundary = (
+            context.current_run_start if protected_from is None else protected_from
+        )
+        protected_boundary = base_boundary + (
+            inserted_skills if base_boundary >= insertion else 0
         )
         usage_before_memory = context.usage
         memory_started = asyncio.get_running_loop().time()
@@ -3049,6 +3064,7 @@ class AgentRuntime:
             context.status = RunStatus.WAITING_FOR_MODEL
             await self._save_checkpoint(context, deadline)
             options = dict(self.config.model_options)
+            options.pop("tools", None)
             options.pop("tool_choice", None)
             options.pop("parallel_tool_calls", None)
             request = ModelRequest(

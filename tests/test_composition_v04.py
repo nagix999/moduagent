@@ -8,6 +8,7 @@ from moduagent import (
     Agent,
     AgentConfig,
     AuthorizationDecision,
+    LLMPlanGenerator,
     ModelCapabilities,
     Plan,
     PlanExecutionProfile,
@@ -153,6 +154,41 @@ def test_explicit_execution_profiles_resolve_without_changing_core_api() -> None
     assert standard.inspect().execution_profile.kind == "standard"
     assert plan.inspect().execution_profile.kind == "plan"
     assert plan.inspect().execution_profile.state_version == 1
+
+
+def test_planner_options_are_redacted_and_change_agent_fingerprint() -> None:
+    model = StaticModel()
+    first = Agent(
+        config=AgentConfig("plan-options-1", "Plan safely."),
+        model=model,
+        execution_profile=PlanExecutionProfile(
+            LLMPlanGenerator(
+                model,
+                options={"temperature": 0.1, "api_key": "planner-secret"},
+                provider_options={"seed": 7},
+            )
+        ),
+    )
+    second = Agent(
+        config=AgentConfig("plan-options-1", "Plan safely."),
+        model=model,
+        execution_profile=PlanExecutionProfile(
+            LLMPlanGenerator(
+                model,
+                options={"temperature": 0.9, "api_key": "planner-secret"},
+                provider_options={"seed": 7},
+            )
+        ),
+    )
+
+    details = first.inspect().execution_profile.details["plan_generator"]
+    assert details["options"] == {
+        "temperature": 0.1,
+        "api_key": "[REDACTED]",
+    }
+    assert details["provider_options"] == {"seed": 7}
+    assert "planner-secret" not in repr(first.inspect().to_dict())
+    assert first.inspect().agent_fingerprint != second.inspect().agent_fingerprint
 
 
 def test_falsey_injected_components_are_not_replaced_by_defaults() -> None:

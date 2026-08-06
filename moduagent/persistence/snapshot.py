@@ -10,7 +10,7 @@ from moduagent.execution.state import EngineSnapshot, EngineStateCodec
 
 SNAPSHOT_SCHEMA_VERSION = 4
 DEFAULT_ENGINE_STATE_VERSION = 1
-SNAPSHOT_RUNTIME_VERSION = "0.5.1a1"
+SNAPSHOT_RUNTIME_VERSION = "0.5.2"
 StateT = TypeVar("StateT")
 
 

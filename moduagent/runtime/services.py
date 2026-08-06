@@ -197,6 +197,37 @@ class RuntimeServices:
             raise ExecutionInvariantError("ModelGateway is not bound to a run")
         return await self._complete_model(context, model, request, phase=phase)
 
+    async def prepare_auxiliary_model_request(
+        self,
+        request: ModelRequest,
+        *,
+        model: ModelClient,
+        phase: str,
+        skill_phase: str | None,
+        protected_from: int,
+    ) -> ModelRequest:
+        """Apply the run's Memory and Skill view to planner-style requests."""
+
+        context = self._bound_context
+        if context is None:
+            raise ExecutionInvariantError("ModelGateway is not bound to a run")
+        options = (
+            dict(context.config.model_options) if model is self.runtime.model else {}
+        )
+        options.update(request.options)
+        options.pop("tools", None)
+        if not request.tools:
+            options.pop("tool_choice", None)
+            options.pop("parallel_tool_calls", None)
+        request = replace(request, options=options)
+        return await self.prepare_model_request(
+            context,
+            request,
+            phase=phase,
+            skill_phase=skill_phase,
+            protected_from=protected_from,
+        )
+
     async def _before_model_attempt(
         self,
         context: EngineContext,
@@ -1954,6 +1985,7 @@ def _memory_phase(value: str) -> MemoryPhase:
     normalized = value.lower()
     aliases = {
         "act_tool": MemoryPhase.ACT,
+        "replan": MemoryPhase.PLAN,
         "tool_recovery": MemoryPhase.ACT,
         "tool_repair": MemoryPhase.ACT,
     }

@@ -395,7 +395,12 @@ def test_vllm_finalization_drops_tool_only_default_options() -> None:
             default_options={
                 "tool_choice": "auto",
                 "parallel_tool_calls": True,
+                "tools": [{"type": "function", "function": {"name": "unsafe"}}],
                 "temperature": 0,
+            },
+            extra_body={
+                "tools": [{"type": "function", "function": {"name": "unsafe-2"}}],
+                "tool_choice": "required",
             },
         )
 
@@ -403,14 +408,43 @@ def test_vllm_finalization_drops_tool_only_default_options() -> None:
             ModelRequest(
                 (Message.user("finalize"),),
                 output_schema={"type": "object", "properties": {}},
+                provider_options={"parallel_tool_calls": True},
             )
         )
 
         body = transport.requests[0]["json"]
         assert "tool_choice" not in body
         assert "parallel_tool_calls" not in body
+        assert "tools" not in body
         assert body["temperature"] == 0
         assert body["response_format"]["type"] == "json_schema"
+
+    asyncio.run(scenario())
+
+
+def test_ollama_no_tool_request_drops_provider_supplied_tools() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport(
+            response={
+                "done": True,
+                "done_reason": "stop",
+                "message": {"role": "assistant", "content": "ok"},
+            }
+        )
+        client = OllamaClient(
+            base_url="http://ollama",
+            model="qwen",
+            transport=transport,
+            provider_options={
+                "extra_body": {
+                    "tools": [{"type": "function", "function": {"name": "unsafe"}}]
+                }
+            },
+        )
+
+        await client.complete(ModelRequest((Message.user("answer directly"),)))
+
+        assert "tools" not in transport.requests[0]["json"]
 
     asyncio.run(scenario())
 

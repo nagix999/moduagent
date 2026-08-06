@@ -11,7 +11,7 @@ ModuAgent는 자체 모델 엔드포인트와 Python 함수를 바탕으로 AI �
 계획-실행(Plan-and-Execute), 체크포인트 복구, 스킬, 관측성 기능을 추가할 수
 있습니다.
 
-> 현재 버전: **0.5.1a1 (Alpha)** · Python **3.10+** · **MIT License**
+> 현재 버전: **0.5.2** · 상태: **Alpha** · Python **3.10+** · **MIT License**
 
 ModuAgent를 처음 사용한다면 아래의 짧은 다섯 단계를 따라갑니다. 이 단계는
 0.5 Quick API를 사용하며, 고급 조합에는 명시적인 구성 요소 API를 그대로
@@ -76,10 +76,10 @@ ModuAgent에는 Python 3.10 이상이 필요합니다. 접근 가능한 모델 �
 패키지를 설치합니다.
 
 ```bash
-python -m pip install "moduagent==0.5.1a1"
+python -m pip install "moduagent==0.5.2"
 ```
 
-패키지 인덱스에 아직 `0.5.1a1`이 없고 이미 0.5 소스를 체크아웃했다면 저장소
+패키지 인덱스에 아직 `0.5.2`가 없고 이미 0.5 소스를 체크아웃했다면 저장소
 루트에서 설치합니다.
 
 ```bash
@@ -173,6 +173,34 @@ model = OllamaClient(
     model="qwen3:14b",
 )
 ```
+
+OpenAI 호환 및 Ollama 클라이언트는 검증된 임베딩 경계도 제공합니다. 임베딩
+엔드포인트용 클라이언트를 구성하고 `embed()`를 직접 호출합니다. 결정적인
+벡터 생성에는 에이전트가 필요하지 않습니다.
+
+```python
+from moduagent import ModelCapabilities, VLLMClient
+
+async with VLLMClient(
+    base_url="http://localhost:8001/v1",
+    model="BAAI/bge-m3",
+    capabilities=ModelCapabilities(
+        chat=False,
+        streaming=False,
+        tool_calling=False,
+        parallel_tool_calling=False,
+        structured_output=False,
+        embeddings=True,
+        tool_calling_with_structured_output=False,
+    ),
+) as embedding_model:
+    vectors = await embedding_model.embed(["첫 번째 문서", "두 번째 문서"])
+```
+
+반환된 배치 수는 입력 수와 같아야 합니다. 벡터는 비어 있지 않고 모든 값이
+유한하며 차원이 일관되어야 합니다. OpenAI 호환 응답 index는 정확히 한 번씩
+나타나는 `0..N-1`이어야 합니다. 잘못된 응답은 문서나 provider 응답 내용을
+포함하지 않는 `ModelProtocolError`로 종료됩니다.
 
 ## 2단계: 도구 추가
 
@@ -572,28 +600,26 @@ Quick API는 반복되는 프레임워크 연결 코드만 줄입니다. 도메�
 
 ## 고급 조합: 대화 메모리
 
-동일한 `session_id`를 사용하면 대화를 이어갈 수 있습니다. 저장소, sink,
-인가, 체크포인트, 스킬, 사용자 정의 engine 또는 그 밖의 고급 구성 요소를
-선택해야 한다면 명시적인 `Agent(...)` 생성자를 사용합니다.
+동일한 `session_id`를 사용하면 대화를 이어갈 수 있습니다. `Agent.create()`는
+일반적인 저장소, 메모리 정책, 인가, 체크포인트, 스킬과 관측성 구성 요소를
+받습니다. 별도 planning model, 사용자 정의 planner·정책, 세부 Tool recovery 또는
+사용자 정의 Engine처럼 저수준 조합이 필요할 때 명시적인 생성자를 사용합니다.
 
 ```python
-from moduagent import (
-    Agent,
-    AgentConfig,
-    InMemoryConversationStore,
-    RecentTurnsConversationMemoryPolicy,
+from moduagent import Agent, InMemoryConversationStore, RecentTurnsConversationMemoryPolicy
+
+conversations = InMemoryConversationStore(
+    ttl_seconds=3600,
+    max_sessions=1_000,
+    max_total_bytes=16_000_000,
 )
 
-conversations = InMemoryConversationStore(ttl_seconds=3600)
-
-memory_agent = Agent(
-    config=AgentConfig(
-        name="memory-assistant",
-        instructions="Use relevant conversation context when answering.",
-    ),
+memory_agent = Agent.create(
+    name="memory-assistant",
+    instructions="Use relevant conversation context when answering.",
     model=model,
     conversation_store=conversations,
-    conversation_memory_policy=RecentTurnsConversationMemoryPolicy(max_turns=6),
+    memory=RecentTurnsConversationMemoryPolicy(max_turns=6),
 )
 
 async def demonstrate_memory() -> None:
@@ -797,11 +823,9 @@ from moduagent import InMemoryCheckpointStore
 
 checkpoints = InMemoryCheckpointStore()
 
-resumable_agent = Agent(
-    config=AgentConfig(
-        name="resumable-agent",
-        instructions="Complete the request safely.",
-    ),
+resumable_agent = Agent.create(
+    name="resumable-agent",
+    instructions="Complete the request safely.",
     model=model,
     tools=[add],
     conversation_store=InMemoryConversationStore(),
@@ -877,11 +901,9 @@ def lookup_invoice(invoice_id: str) -> dict[str, object]:
 
 skills = SkillRegistry.from_paths("./examples/skills")
 
-agent = Agent(
-    config=AgentConfig(
-        name="invoice-agent",
-        instructions="Use verified evidence only.",
-    ),
+agent = Agent.create(
+    name="invoice-agent",
+    instructions="Use verified evidence only.",
     model=model,
     tools=[lookup_invoice],
     skill_registry=skills,
@@ -1004,6 +1026,9 @@ Redis 또는 영속 사용자 정의 저장소를 사용합니다.
   지원하는 엄격한 계획-실행 예제입니다.
 - [청구서 검토 스킬](https://github.com/nagix999/moduagent/tree/main/examples/skills/invoice-review):
   스킬 지침, 참고 자료, 자산 예제입니다.
+- [프로덕션 제어](https://github.com/nagix999/moduagent/blob/main/examples/PRODUCTION.ko.md):
+  인가된 멱등 쓰기, 제한된 메모리, 영속 재개, 취소와 동시 세션 운영
+  가이드입니다.
 
 ## 문서
 

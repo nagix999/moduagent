@@ -14,6 +14,7 @@ from .base import (
     ModelResponse,
     validate_request_capabilities,
 )
+from ._embeddings import normalize_embedding_inputs, normalize_embedding_vectors
 from .errors import ModelProtocolError
 from .transport import HttpTransport, HttpxTransport
 
@@ -296,6 +297,7 @@ class OpenAICompatibleClient:
         else:
             # Tool-selection options are invalid on PLAN/FINALIZE requests that do
             # not expose tools. This also neutralizes client-level defaults.
+            payload.pop("tools", None)
             payload.pop("tool_choice", None)
             payload.pop("parallel_tool_calls", None)
         if request.output_schema is not None:
@@ -366,11 +368,14 @@ class OpenAICompatibleClient:
     ) -> tuple[tuple[float, ...], ...]:
         if not self.capabilities.embeddings:
             raise ValueError("the configured model does not support embeddings")
+        normalized_inputs, expected_count = normalize_embedding_inputs(inputs)
+        if expected_count == 0:
+            return ()
         payload: dict[str, Any] = {
             **self.default_options,
             **dict(options or {}),
             "model": self.model,
-            "input": inputs if isinstance(inputs, str) else list(inputs),
+            "input": normalized_inputs,
         }
         endpoint = self.endpoint.rsplit("/chat/completions", 1)[0] + "/embeddings"
         value = await self.transport.post_json(
@@ -385,33 +390,32 @@ class OpenAICompatibleClient:
             (str, bytes, bytearray),
         ):
             raise ModelProtocolError("embedding response contains no data")
+        if len(rows) != expected_count:
+            raise ModelProtocolError(
+                "embedding response count does not match embedding input count"
+            )
         if any(not isinstance(row, Mapping) for row in rows):
             raise ModelProtocolError("embedding response contains an invalid row")
-        try:
-            ordered = sorted(
-                rows,
-                key=lambda row: int(row.get("index", 0)),
-            )
-        except (TypeError, ValueError) as exc:
-            raise ModelProtocolError(
-                "embedding response contains an invalid index"
-            ) from exc
-        embeddings: list[tuple[float, ...]] = []
-        for row in ordered:
-            vector = row.get("embedding")
-            if not isinstance(vector, Sequence) or isinstance(
-                vector, (str, bytes, bytearray)
-            ):
+
+        indexed_rows: dict[int, Mapping[str, Any]] = {}
+        for row in rows:
+            index = row.get("index")
+            if type(index) is not int or not 0 <= index < expected_count:
+                raise ModelProtocolError("embedding response contains an invalid index")
+            if index in indexed_rows:
                 raise ModelProtocolError(
-                    "embedding response contains an invalid vector"
+                    "embedding response contains duplicate indices"
                 )
-            try:
-                embeddings.append(tuple(float(value) for value in vector))
-            except (TypeError, ValueError) as exc:
-                raise ModelProtocolError(
-                    "embedding response contains a non-numeric vector"
-                ) from exc
-        return tuple(embeddings)
+            indexed_rows[index] = row
+        if set(indexed_rows) != set(range(expected_count)):
+            raise ModelProtocolError(
+                "embedding response indices do not match embedding input positions"
+            )
+
+        vectors = [
+            indexed_rows[index].get("embedding") for index in range(expected_count)
+        ]
+        return normalize_embedding_vectors(vectors, expected_count=expected_count)
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelChunk]:
         payload = self._build_payload(request, stream=True)

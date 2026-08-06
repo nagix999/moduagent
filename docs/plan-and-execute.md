@@ -104,7 +104,7 @@ result = await planning_agent.run(
 )
 ```
 
-`LLMPlanGenerator.max_steps`는 모델이 반환한 계획을 제한하고, `RunLimits.max_steps`는 custom `PlanGenerator`를 포함한 최종 계획의 단계 수를 검사한다. strict Plan-and-Execute에서 `max_steps`는 모델 호출 횟수가 아니라 계획 단계 수다.
+`LLMPlanGenerator.max_steps`는 모델이 반환한 계획을 제한하고, `RunLimits.max_steps`는 custom `PlanGenerator`를 포함한 최종 계획의 단계 수를 검사한다. strict Plan-and-Execute에서 `max_steps`는 모델 호출 횟수가 아니라 계획 단계 수다. Quick API처럼 실행 모델과 planning 모델이 같은 객체이면 `AgentConfig.model_options`가 PLAN/replan에도 적용된다. 별도 planning 모델을 사용할 때는 main 모델 옵션을 상속하지 않으며 `LLMPlanGenerator(options=..., provider_options=...)`로 planner 전용 값을 지정한다.
 
 추가 제한은 서로 독립적이다.
 

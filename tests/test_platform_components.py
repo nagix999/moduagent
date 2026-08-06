@@ -18,6 +18,7 @@ from moduagent.observability import (
 )
 from moduagent.output import PydanticOutputCodec, TextOutputCodec
 from moduagent.persistence import (
+    ConversationStoreCapacityError,
     DatabaseConversationStore,
     InMemoryCheckpointStore,
     InMemoryConversationStore,
@@ -103,6 +104,86 @@ def test_in_memory_conversation_append_once_is_atomic_and_detects_key_reuse() ->
             )
 
     asyncio.run(scenario())
+
+
+def test_in_memory_conversation_store_evicts_sessions_by_lru_capacity() -> None:
+    async def scenario() -> None:
+        store = InMemoryConversationStore(max_sessions=2)
+        await store.append("session-1", [Message.user("one")])
+        await store.append("session-2", [Message.user("two")])
+
+        # A read refreshes recency without extending the session TTL.
+        assert await store.load("session-1") == [Message.user("one")]
+        await store.append("session-3", [Message.user("three")])
+
+        assert await store.load("session-1") == [Message.user("one")]
+        assert await store.load("session-2") == []
+        assert await store.load("session-3") == [Message.user("three")]
+        stats = await store.stats()
+        assert stats["sessions"] == 2
+        assert stats["total_bytes"] > 0
+
+    asyncio.run(scenario())
+
+
+def test_in_memory_conversation_store_bounds_serialized_bytes_atomically() -> None:
+    async def scenario() -> None:
+        message = Message.user("bounded")
+        probe = InMemoryConversationStore()
+        await probe.append("probe", [message])
+        row_bytes = (await probe.stats())["total_bytes"]
+
+        store = InMemoryConversationStore(max_total_bytes=row_bytes)
+        await store.append("session-1", [message])
+        await store.append("session-2", [message])
+        assert await store.load("session-1") == []
+        assert await store.load("session-2") == [message]
+
+        before = await store.stats()
+        with pytest.raises(
+            ConversationStoreCapacityError,
+            match="exceeds max_total_bytes",
+        ):
+            await store.append("session-2", [Message.user("too large")])
+        assert await store.load("session-2") == [message]
+        assert await store.stats() == before
+
+    asyncio.run(scenario())
+
+
+def test_in_memory_conversation_store_sweeps_expired_sessions_lazily() -> None:
+    async def scenario() -> None:
+        now = [1.0]
+        store = InMemoryConversationStore(
+            ttl_seconds=2,
+            ttl_sweep_interval_seconds=10,
+            clock=lambda: now[0],
+        )
+        await store.append("session-1", [Message.user("one")])
+        await store.append("session-2", [Message.user("two")])
+        now[0] = 3.0
+
+        assert await store.sweep_expired() == 2
+        assert await store.stats() == {"sessions": 0, "total_bytes": 0}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"max_sessions": 0}, "max_sessions"),
+        ({"max_total_bytes": True}, "max_total_bytes"),
+        ({"ttl_sweep_interval_seconds": 0}, "ttl_sweep_interval_seconds"),
+        ({"ttl_sweep_interval_seconds": float("nan")}, "ttl_sweep_interval_seconds"),
+    ],
+)
+def test_in_memory_conversation_store_rejects_invalid_capacity(
+    options: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        InMemoryConversationStore(**options)  # type: ignore[arg-type]
 
 
 def test_database_conversation_store_uses_json_repository_rows() -> None:

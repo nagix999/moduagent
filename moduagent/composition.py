@@ -864,6 +864,7 @@ def _plan_generator_spec(generator: PlanGenerator) -> dict[str, Any]:
     spec = _component_spec(
         generator,
         scalar_fields=("max_steps", "history_limit"),
+        mapping_fields=("options", "provider_options"),
     )
     model = getattr(generator, "model", None)
     if model is not None:

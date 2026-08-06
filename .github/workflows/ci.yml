@@ -23,8 +23,8 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[dev]'
-      - run: ruff check moduagent tests benchmarks
-      - run: ruff format --check moduagent tests benchmarks
+      - run: ruff check moduagent tests benchmarks examples
+      - run: ruff format --check moduagent tests benchmarks examples
       - run: pytest -q
 
   package:
@@ -78,8 +78,11 @@ jobs:
               "examples/10_incident_investigation.py",
               "examples/11_customer_case_resolution.py",
               "examples/12_release_readiness.py",
+              "examples/20_production_controls.py",
               "examples/INTERMEDIATE.md",
               "examples/INTERMEDIATE.ko.md",
+              "examples/PRODUCTION.md",
+              "examples/PRODUCTION.ko.md",
               "examples/README.md",
               "examples/SCENARIO_REVIEW.md",
               "tests/integration/test_live_agent_scenarios_v051.py",
@@ -91,6 +94,10 @@ jobs:
               "tests/test_intermediate_incident_example_alpha.py",
               "tests/test_intermediate_release_example_alpha.py",
               "tests/test_model_output_incomplete.py",
+              "tests/test_conversation_store_capacity_v052.py",
+              "tests/test_embedding_contract_v052.py",
+              "tests/test_plan_memory_v052.py",
+              "tests/test_production_controls_example_v052.py",
           }
           missing_files = {
               expected
@@ -134,5 +141,5 @@ jobs:
           /tmp/moduagent-venv/bin/python -m pip install /tmp/moduagent-wheel/moduagent-*.whl
           cd /tmp
           /tmp/moduagent-venv/bin/python -c \
-            "import moduagent; assert moduagent.__version__ == '0.5.1a1'"
+            "import moduagent; assert moduagent.__version__ == '0.5.2'"
           /tmp/moduagent-venv/bin/moduagent --help

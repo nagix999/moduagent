@@ -47,10 +47,23 @@ class Agent:
         output: type[BaseModel] | OutputCodec | None = None,
         limits: RunLimits | None = None,
         retry: RetryConfig | None = None,
+        model_options: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        finalization_mode: Literal[
+            "always", "structured_only", "disabled"
+        ] = "structured_only",
+        stream_visibility: Literal["public_only", "all"] = "public_only",
         memory: ConversationMemoryPolicy | None = None,
         conversation_store: ConversationStore | None = None,
+        checkpoint_store: CheckpointStore | None = None,
         event_sink: EventSink | None = None,
         diagnostic_sink: DiagnosticSink | None = None,
+        diagnostic_timeout_seconds: float = 0.25,
+        diagnostic_max_pending_deliveries: int = 1024,
+        tool_authorizer: ToolAuthorizer | None = None,
+        skill_registry: SkillRegistry | None = None,
+        skill_selector: SkillSelector | None = None,
+        skill_limits: SkillLimits | None = None,
         tool_trace_mode: Literal["off", "summary", "arguments"] = "summary",
     ) -> Agent:
         """Create an Agent from the common high-level configuration.
@@ -58,9 +71,9 @@ class Agent:
         This is an additive convenience API. It resolves to the same
         :class:`AgentConfig`, execution profiles, output codecs, and runtime as
         the full constructor. The most common persistence and observability
-        components are accepted directly; applications that need
-        authorization, checkpoints, Skills, or custom engines should continue
-        to use :class:`Agent` directly.
+        components are accepted directly. Applications that need custom
+        planners or planning models, detailed Tool recovery, decision policies,
+        or execution engines should continue to use :class:`Agent` directly.
         """
 
         resolved_limits = limits if limits is not None else RunLimits()
@@ -77,6 +90,10 @@ class Agent:
                 instructions=instructions,
                 limits=resolved_limits,
                 retry=resolved_retry,
+                model_options=({} if model_options is None else model_options),
+                metadata={} if metadata is None else metadata,
+                finalization_mode=finalization_mode,
+                stream_visibility=stream_visibility,
                 tool_trace_mode=tool_trace_mode,
             ),
             model=model,
@@ -84,9 +101,16 @@ class Agent:
             execution_profile=execution_profile,
             output_codec=output_codec,
             conversation_store=conversation_store,
+            checkpoint_store=checkpoint_store,
             event_sink=event_sink,
             diagnostic_sink=diagnostic_sink,
+            diagnostic_timeout_seconds=diagnostic_timeout_seconds,
+            diagnostic_max_pending_deliveries=(diagnostic_max_pending_deliveries),
+            tool_authorizer=tool_authorizer,
             conversation_memory_policy=memory,
+            skill_registry=skill_registry,
+            skill_selector=skill_selector,
+            skill_limits=skill_limits,
         )
 
     def __init__(

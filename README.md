@@ -10,7 +10,7 @@ Start with a normal model or Tool-calling loop. Add bounded conversation
 memory, validated Pydantic output, strict Plan-and-Execute, checkpoint recovery,
 Skills, and observability only when your application needs them.
 
-> Current version: **0.5.1a1 (Alpha)** · Python **3.10+** · **MIT License**
+> Current version: **0.5.2** · Status: **Alpha** · Python **3.10+** · **MIT License**
 
 New to ModuAgent? Follow the five short steps below. They use the 0.5 Quick
 API; the explicit component API remains available for advanced composition.
@@ -72,10 +72,10 @@ server; ModuAgent does not host a model itself.
 Install the package:
 
 ```bash
-python -m pip install "moduagent==0.5.1a1"
+python -m pip install "moduagent==0.5.2"
 ```
 
-If your package index does not contain `0.5.1a1` yet and you already have a 0.5
+If your package index does not contain `0.5.2` yet and you already have a 0.5
 source checkout, install it from the repository root:
 
 ```bash
@@ -170,6 +170,34 @@ model = OllamaClient(
     model="qwen3:14b",
 )
 ```
+
+The OpenAI-compatible and Ollama clients also expose a validated embedding
+boundary. Configure the client for the embedding endpoint and call `embed()`
+directly; an Agent is not required for deterministic vector generation.
+
+```python
+from moduagent import ModelCapabilities, VLLMClient
+
+async with VLLMClient(
+    base_url="http://localhost:8001/v1",
+    model="BAAI/bge-m3",
+    capabilities=ModelCapabilities(
+        chat=False,
+        streaming=False,
+        tool_calling=False,
+        parallel_tool_calling=False,
+        structured_output=False,
+        embeddings=True,
+        tool_calling_with_structured_output=False,
+    ),
+) as embedding_model:
+    vectors = await embedding_model.embed(["first document", "second document"])
+```
+
+The returned batch must match the input count. Vectors must be non-empty,
+finite, and dimensionally consistent; OpenAI-compatible response indices must
+be the exact unique range `0..N-1`. Malformed responses raise
+`ModelProtocolError` without including document or provider response content.
 
 ## Step 2: add a Tool
 
@@ -574,28 +602,27 @@ domain semantics or Tool safety.
 
 ## Advanced composition: conversation memory
 
-Use the same `session_id` to continue a conversation. When you need to select
-stores, sinks, authorization, checkpoints, Skills, custom engines, or other
-advanced components, use the explicit `Agent(...)` constructor.
+Use the same `session_id` to continue a conversation. `Agent.create()` accepts
+the common stores, memory policy, authorization, checkpoints, Skills, and
+observability components. Use the explicit constructor for lower-level
+composition such as a separate planning model, custom planner or policy,
+detailed Tool recovery, or a custom Engine.
 
 ```python
-from moduagent import (
-    Agent,
-    AgentConfig,
-    InMemoryConversationStore,
-    RecentTurnsConversationMemoryPolicy,
+from moduagent import Agent, InMemoryConversationStore, RecentTurnsConversationMemoryPolicy
+
+conversations = InMemoryConversationStore(
+    ttl_seconds=3600,
+    max_sessions=1_000,
+    max_total_bytes=16_000_000,
 )
 
-conversations = InMemoryConversationStore(ttl_seconds=3600)
-
-memory_agent = Agent(
-    config=AgentConfig(
-        name="memory-assistant",
-        instructions="Use relevant conversation context when answering.",
-    ),
+memory_agent = Agent.create(
+    name="memory-assistant",
+    instructions="Use relevant conversation context when answering.",
     model=model,
     conversation_store=conversations,
-    conversation_memory_policy=RecentTurnsConversationMemoryPolicy(max_turns=6),
+    memory=RecentTurnsConversationMemoryPolicy(max_turns=6),
 )
 
 async def demonstrate_memory() -> None:
@@ -798,11 +825,9 @@ from moduagent import InMemoryCheckpointStore
 
 checkpoints = InMemoryCheckpointStore()
 
-resumable_agent = Agent(
-    config=AgentConfig(
-        name="resumable-agent",
-        instructions="Complete the request safely.",
-    ),
+resumable_agent = Agent.create(
+    name="resumable-agent",
+    instructions="Complete the request safely.",
     model=model,
     tools=[add],
     conversation_store=InMemoryConversationStore(),
@@ -877,11 +902,9 @@ def lookup_invoice(invoice_id: str) -> dict[str, object]:
 
 skills = SkillRegistry.from_paths("./examples/skills")
 
-agent = Agent(
-    config=AgentConfig(
-        name="invoice-agent",
-        instructions="Use verified evidence only.",
-    ),
+agent = Agent.create(
+    name="invoice-agent",
+    instructions="Use verified evidence only.",
     model=model,
     tools=[lookup_invoice],
     skill_registry=skills,
@@ -1006,6 +1029,9 @@ Use Redis or a durable custom store for multi-process or restart-safe systems.
   and PostgreSQL query backends.
 - [Invoice review Skill](https://github.com/nagix999/moduagent/tree/main/examples/skills/invoice-review):
   Skill instructions, references, and assets.
+- [Production controls](https://github.com/nagix999/moduagent/blob/main/examples/PRODUCTION.md):
+  authorized idempotent writes, bounded memory, durable resume, cancellation,
+  and concurrent-session guidance.
 
 ## Documentation
 

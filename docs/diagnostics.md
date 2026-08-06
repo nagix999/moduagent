@@ -1,6 +1,6 @@
 # Diagnostics
 
-ModuAgent 0.5.1a1 separates execution events from failure diagnostics.
+ModuAgent 0.5 separates execution events from failure diagnostics.
 
 - An `EventSink` receives safe lifecycle events such as model attempts, Tool
   calls, Plan steps, retries, and terminal results.

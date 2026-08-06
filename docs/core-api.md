@@ -5,7 +5,7 @@
 ## 설치
 
 ```bash
-python -m pip install moduagent==0.5.1a1
+python -m pip install moduagent==0.5.2
 ```
 
 Python 3.10 이상이 필요합니다. Redis adapter를 사용하면 `redis` 패키지도 설치합니다.
@@ -62,14 +62,19 @@ asyncio.run(main())
 | `output=codec` | 사용자가 만든 `OutputCodec`을 그대로 사용 |
 | `memory=policy` | `ConversationMemoryPolicy`로 전달 |
 | `conversation_store=store` | 대화 저장소로 전달 |
+| `checkpoint_store=store` | 중단 및 재개용 체크포인트 저장소로 전달 |
 | `event_sink=sink`, `diagnostic_sink=sink` | 실행 이벤트와 실패 진단 sink로 전달 |
+| `diagnostic_timeout_seconds`, `diagnostic_max_pending_deliveries` | 진단 sink 전달의 시간과 대기열 상한 설정 |
+| `tool_authorizer=authorizer` | 모든 Tool 실행 전 애플리케이션 인가를 적용 |
+| `skill_registry`, `skill_selector`, `skill_limits` | 선택적 Skill 실행 경계를 구성 |
+| `model_options`, `metadata`, `finalization_mode`, `stream_visibility` | 기존 `AgentConfig` 필드로 전달 |
 | `tool_trace_mode="off"|"summary"|"arguments"` | 결과에 포함할 Tool trace 수준을 선택 |
 
-Plan Quick API는 `max_steps`를 `RunLimits`에 한 번만 지정하면 Planner와 Engine에 같은 값이 적용됩니다. 별도 planning model, custom `PlanGenerator`, checkpoint, 권한, Skill 또는 custom Engine이 필요하면 아래의 명시적 생성자를 사용합니다.
+Plan Quick API는 `max_steps`를 `RunLimits`에 한 번만 지정하면 Planner와 Engine에 같은 값이 적용됩니다. 별도 planning model, custom `PlanGenerator`, custom 정책 또는 custom Engine이 필요하면 아래의 명시적 생성자를 사용합니다.
 
 ### 고급 확장 경로
 
-Quick API는 모든 constructor 인자를 숨겨 전달하는 `**kwargs` 통로를 제공하지 않습니다. 운영 컴포넌트나 custom 실행 의미가 필요하면 기존 `Agent(config=..., model=..., ...)`에서 관련 객체를 명시적으로 조립합니다. 프레임워크는 사용자의 지침, Tool 설명, 데이터 의미와 출력 모델 내용을 대신 생성하지 않습니다.
+Quick API는 모든 constructor 인자를 숨겨 전달하는 `**kwargs` 통로를 제공하지 않습니다. 지원하지 않는 custom 실행 의미가 필요하면 기존 `Agent(config=..., model=..., ...)`에서 관련 객체를 명시적으로 조립합니다. 프레임워크는 사용자의 지침, Tool 설명, 데이터 의미와 출력 모델 내용을 대신 생성하지 않습니다.
 
 ### `ask()`와 `run()`
 

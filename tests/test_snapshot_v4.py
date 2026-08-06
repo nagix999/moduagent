@@ -157,8 +157,24 @@ def test_v4_snapshot_has_dual_version_guard_and_shared_engine_contract() -> None
 
 
 def test_snapshot_runtime_version_tracks_the_source_release() -> None:
-    assert SNAPSHOT_RUNTIME_VERSION == "0.5.1a1"
+    assert SNAPSHOT_RUNTIME_VERSION == "0.5.2"
     assert current_runtime_version() == SNAPSHOT_RUNTIME_VERSION
+
+
+def test_v052_reads_a_v051a1_snapshot_envelope_without_rewriting_its_origin() -> None:
+    checkpoint = RunCheckpoint(
+        run_id="run-v051",
+        session_id="session-v051",
+        messages=(Message.user("resume"),),
+        current_run_start=0,
+    )
+    payload = checkpoint.to_dict()
+    payload["runtime_version"] = "0.5.1a1"
+
+    restored = RunSnapshot.from_json(json.dumps(payload))
+
+    assert restored.runtime_version == "0.5.1a1"
+    assert restored.schema_version == 4
 
 
 def test_event_wire_projection_is_finite_and_never_uses_opaque_repr() -> None:

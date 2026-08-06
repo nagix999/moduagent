@@ -375,7 +375,11 @@ class StandardExecutionEngine(CodecBackedEngine[StandardEngineState]):
                 messages=tuple(context.run.messages),
                 tools=tools,
                 output_schema=(None if staged_finalization else output_schema),
-                options=dict(context.config.model_options),
+                options={
+                    key: value
+                    for key, value in context.config.model_options.items()
+                    if key != "tools"
+                },
             )
             request = await services.prepare_model_request(
                 context,
@@ -788,7 +792,7 @@ class StandardExecutionEngine(CodecBackedEngine[StandardEngineState]):
                 options={
                     key: value
                     for key, value in context.config.model_options.items()
-                    if key not in {"tool_choice", "parallel_tool_calls"}
+                    if key not in {"tools", "tool_choice", "parallel_tool_calls"}
                 },
             )
             request = await services.prepare_model_request(

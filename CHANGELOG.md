@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.5.2
+
+- Extended `Agent.create()` with checkpoint, Tool authorization, Skill,
+  diagnostic-delivery, model-option, metadata, finalization, and stream
+  visibility components while preserving explicitly injected falsey objects.
+- Added bounded `InMemoryConversationStore` capacity with session-level LRU
+  eviction, deterministic serialized-byte accounting, lazy TTL sweeping,
+  explicit cleanup, defensive canonical rows, and content-free usage
+  statistics. Capacity pressure removes expired sessions before live LRU
+  victims.
+- Routed built-in PLAN and replan requests through the same conversation-memory
+  and phase-scoped Skill preparation boundary used by execution requests while
+  keeping current planning protocol messages protected. Agent model options now
+  apply to same-model planner calls; separately configured planning models keep
+  isolated `LLMPlanGenerator` options.
+- Hardened OpenAI-compatible and Ollama embedding responses: batch counts,
+  exact OpenAI indices, non-empty vectors, consistent dimensions, finite
+  numeric values, and empty-input behavior are now validated before data
+  reaches a vector store.
+- Added production-control examples and regression scenarios for conversation
+  compaction, durable checkpoint recovery, tenant-scoped idempotent writes,
+  atomic version/eligibility transitions, application-receipt reconciliation,
+  streaming cancellation, and concurrent sessions without adding a domain
+  Recipe or Workflow layer.
+- Prevented raw model options from injecting a Tool schema outside the
+  framework-owned `ModelRequest.tools` boundary.
+- Kept checkpoint schema v4 and verified that 0.5.1a1 snapshot envelopes remain
+  readable after the runtime version update.
+
 ## 0.5.1a1
 
 - Added a beginner-first example path covering a minimal assistant, typed Tool

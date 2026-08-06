@@ -1,16 +1,16 @@
 # Intermediate examples
 
-These examples target ModuAgent `0.5.1a1`. Complete the beginner path in
+These examples target ModuAgent `0.5.2`. Complete the beginner path in
 [`README.md`](README.md) first, then follow `10` → `11` → `12`. Each example is
 standalone and uses deterministic application-owned data, so you can replace
 the sample Tools with your own integrations without changing the Agent pattern.
 
 ## Install and configure
 
-Install the exact pre-release version:
+Install the exact version:
 
 ```bash
-python -m pip install "moduagent==0.5.1a1"
+python -m pip install "moduagent==0.5.2"
 ```
 
 Or, from this source checkout, use the current working tree:

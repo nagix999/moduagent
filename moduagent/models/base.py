@@ -139,6 +139,21 @@ class ModelGateway(Protocol):
     ) -> ModelResponse: ...
 
 
+@runtime_checkable
+class AuxiliaryModelRequestPreparer(Protocol):
+    """Optional gateway capability for planner-style request preparation."""
+
+    async def prepare_auxiliary_model_request(
+        self,
+        request: ModelRequest,
+        *,
+        model: ModelClient,
+        phase: str,
+        skill_phase: str | None,
+        protected_from: int,
+    ) -> ModelRequest: ...
+
+
 def validate_request_capabilities(
     request: ModelRequest,
     capabilities: ModelCapabilities,

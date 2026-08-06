@@ -1,16 +1,17 @@
 # ModuAgent examples
 
-[한국어 번역: 중급 예제](INTERMEDIATE.ko.md)
+[한국어 번역: 중급 예제](INTERMEDIATE.ko.md) ·
+[한국어 번역: 프로덕션 제어](PRODUCTION.ko.md)
 
 These examples grow one concept at a time. Start with `01` and run them in
 order; each file is standalone.
 
 ## Before you start
 
-These examples target ModuAgent `0.5.1a1`. Install the exact pre-release:
+These examples target ModuAgent `0.5.2`. Install the exact version:
 
 ```bash
-python -m pip install "moduagent==0.5.1a1"
+python -m pip install "moduagent==0.5.2"
 ```
 
 Alternatively, when running from a source checkout, install that working tree
@@ -109,3 +110,16 @@ Once the five small examples feel familiar, continue with:
 
 Those examples intentionally include production concerns that are omitted from
 the beginner path.
+
+## Production controls
+
+After the read-only and advisory examples, use
+[`20_production_controls.py`](20_production_controls.py) to learn how one
+write-capable Tool is constrained by trusted `user_context`, deny-by-default
+RBAC, an application-owned idempotency key/store, checkpoints, bounded
+conversation storage, and protected diagnostics. The code remains a generic
+framework example; it does not add a change-management Recipe to ModuAgent.
+
+See [`PRODUCTION.md`](PRODUCTION.md) for long-conversation compaction, durable
+resume, clean streaming cancellation, concurrent sessions, and the boundary
+between in-memory demonstrations and production infrastructure.
