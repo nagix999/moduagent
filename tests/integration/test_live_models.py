@@ -25,7 +25,8 @@ def _request() -> ModelRequest:
 
 
 async def _smoke_complete(client: VLLMClient | OllamaClient) -> None:
-    response = await client.complete(_request())
+    async with client:
+        response = await client.complete(_request())
 
     assert response.message.content is not None
     assert response.message.content.strip()
@@ -35,11 +36,12 @@ async def _smoke_stream(client: VLLMClient | OllamaClient) -> None:
     deltas: list[str] = []
     final_responses = []
 
-    async for chunk in client.stream(_request()):
-        if chunk.delta:
-            deltas.append(chunk.delta)
-        if chunk.response is not None:
-            final_responses.append(chunk.response)
+    async with client:
+        async for chunk in client.stream(_request()):
+            if chunk.delta:
+                deltas.append(chunk.delta)
+            if chunk.response is not None:
+                final_responses.append(chunk.response)
 
     assert deltas
     assert len(final_responses) == 1
@@ -47,11 +49,12 @@ async def _smoke_stream(client: VLLMClient | OllamaClient) -> None:
 
 
 def _vllm_client() -> VLLMClient:
-    env = _required_environment("VLLM_BASE_URL", "VLLM_MODEL", "VLLM_API_KEY")
+    env = _required_environment("VLLM_BASE_URL", "VLLM_MODEL")
     return VLLMClient(
         base_url=env["VLLM_BASE_URL"],
         model=env["VLLM_MODEL"],
-        api_key=env["VLLM_API_KEY"],
+        api_key=os.getenv("VLLM_API_KEY", "").strip() or None,
+        default_options={"temperature": 0, "max_tokens": 64},
     )
 
 
@@ -60,6 +63,7 @@ def _ollama_client() -> OllamaClient:
     return OllamaClient(
         base_url=env["OLLAMA_BASE_URL"],
         model=env["OLLAMA_MODEL"],
+        default_options={"temperature": 0, "num_predict": 64},
     )
 
 

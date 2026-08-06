@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.5.2
+
+- Extended `Agent.create()` with checkpoint, Tool authorization, Skill,
+  diagnostic-delivery, model-option, metadata, finalization, and stream
+  visibility components while preserving explicitly injected falsey objects.
+- Added bounded `InMemoryConversationStore` capacity with session-level LRU
+  eviction, deterministic serialized-byte accounting, lazy TTL sweeping,
+  explicit cleanup, defensive canonical rows, and content-free usage
+  statistics. Capacity pressure removes expired sessions before live LRU
+  victims.
+- Routed built-in PLAN and replan requests through the same conversation-memory
+  and phase-scoped Skill preparation boundary used by execution requests while
+  keeping current planning protocol messages protected. Agent model options now
+  apply to same-model planner calls; separately configured planning models keep
+  isolated `LLMPlanGenerator` options.
+- Hardened OpenAI-compatible and Ollama embedding responses: batch counts,
+  exact OpenAI indices, non-empty vectors, consistent dimensions, finite
+  numeric values, and empty-input behavior are now validated before data
+  reaches a vector store.
+- Added production-control examples and regression scenarios for conversation
+  compaction, durable checkpoint recovery, tenant-scoped idempotent writes,
+  atomic version/eligibility transitions, application-receipt reconciliation,
+  streaming cancellation, and concurrent sessions without adding a domain
+  Recipe or Workflow layer.
+- Prevented raw model options from injecting a Tool schema outside the
+  framework-owned `ModelRequest.tools` boundary.
+- Kept checkpoint schema v4 and verified that 0.5.1a1 snapshot envelopes remain
+  readable after the runtime version update.
+
+## 0.5.1a1
+
+- Added a beginner-first example path covering a minimal assistant, typed Tool
+  use, Pydantic output, report automation, and safe run debugging, plus
+  deterministic and opt-in live vLLM scenario tests.
+- Added an intermediate path for parallel incident investigation, sequential
+  customer-case resolution, and release-readiness gating. Each scenario uses
+  five typed, application-owned Tools, a structured decision contract, explicit
+  read-only or advisory boundaries, deterministic tests, and opt-in live vLLM
+  assertions.
+- Documented and regression-tested a guided-decoding whitespace-loop failure:
+  explicit required output keys and compact JSON instructions let the incident
+  scenario finish in 357 finalization tokens even with an 8,192-token cap.
+- Added the terminal `model_output_incomplete` classification for provider
+  `timeout`, `length`, and `max_tokens` finish reasons. The allowlisted
+  `provider_finish_reason` is available in `error_summary`, `AgentRunError`,
+  event logs, and protected diagnostics without retaining response content.
+- Extended `Agent.create()` with common conversation and observability
+  components and added immutable, secret-safe `AgentResult.error_summary`,
+  `tool_trace`, and `run_usage` projections.
+- Added per-run model-turn, Tool-call, and wall-clock counters on both
+  successful and failed results.
+- Added content-free model request shape evidence, a paired `MODEL_FAILED`
+  event, retry timing and classification fields, and failed-call metrics.
+- Made output-validation classification and primary failure summaries
+  independent of diagnostic-sink availability.
+- Disabled per-delta built-in logging by default while retaining an explicit
+  content-free opt-in.
+- Hardened secret-key masking across acronym, camel-case, underscore, and
+  hyphen spellings in built-in observability and public Tool traces.
+- Added `aclose()` and async context-manager support to built-in HTTP model
+  clients without taking ownership of caller-injected transports.
+- Preserved explicitly injected falsey components instead of replacing them
+  with defaults.
+- Documented the live scenario findings, bounded example generation, and
+  Standard-versus-Plan latency tradeoff.
+
 ## 0.5.0
 
 - Added the additive `Agent.create()` Quick API for Standard and strict Plan

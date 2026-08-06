@@ -1,6 +1,7 @@
 # ConversationMemoryPolicy 설계
 
-상태: 구현 완료. PLAN 공통 준비 경로와 저장소 용량·pagination은 후속 범위다.
+상태: 구현 완료. 0.5.2에서 PLAN/replan 공통 준비 경로와 in-memory 저장소
+용량 제어까지 반영했으며 durable 저장소의 cursor pagination은 후속 범위다.
 
 ## 목적
 
@@ -361,7 +362,12 @@ ConversationStore.load
 
 체크포인트는 전체 실행 메시지와 `current_run_start`, 누적 usage를 저장한다. 요약 cache의 `policy_fingerprint`와 covered-prefix digest는 `MemoryStateStore`의 `MemorySnapshot`이 관리하며 0.2.0 checkpoint에는 snapshot 식별자를 중복 저장하지 않는다. Resume 후 cache가 현재 Policy나 원문 prefix와 맞지 않으면 MemoryPolicy가 cache를 사용하지 않고 다시 요약한다.
 
-`LLMPlanGenerator`는 현재 과거 대화 전체가 아니라 현재 `request.input`만 모델에 보내므로 긴 history에 의한 context 초과 대상은 아니다. 다만 “아까 말한 내용”처럼 과거 참조를 포함하는 계획의 품질은 떨어질 수 있다. 후속 단계에서 PLAN도 동일한 request-preparation 경로를 사용하도록 Model 호출 책임을 Runtime으로 이동한다.
+0.5.2부터 `LLMPlanGenerator`의 PLAN과 replan 요청도 Runtime의 동일한
+request-preparation 경로를 사용한다. `history_limit`가 먼저 공개 대화 후보 수를
+제한하고, `ConversationMemoryPolicy`가 그 후보를 token 또는 최근 turn 기준으로
+다시 선택한다. 현재 사용자 요청과 Plan protocol 지침은 protected 영역이므로
+제거되지 않으며, compaction이 발생하면 `phase="plan"`인
+`MEMORY_COMPACTED` 이벤트가 기록된다.
 
 ## 오류와 관측성
 
@@ -391,13 +397,16 @@ ConversationStore.load
 
 ConversationMemoryPolicy는 모델 입력 토큰만 제한한다. `InMemoryConversationStore`의 Python 메모리 사용량과 전체 기록 조회 비용은 별도 문제다.
 
-후속 저장소 개선은 다음과 같이 분리한다.
+0.5.2의 저장소 용량 제어와 후속 durable 저장소 개선은 다음과 같이 분리한다.
 
-- `InMemoryConversationStore`: `max_sessions`, `max_total_bytes`, 주기적 TTL sweep, 세션 단위 LRU eviction
-- `RedisConversationStore`/`DatabaseConversationStore`: summary cursor 이후 tail 조회와 pagination
+- `InMemoryConversationStore`: `max_sessions`, `max_total_bytes`, lazy periodic TTL sweep, 세션 단위 LRU eviction을 제공한다. 메시지는 caller가 중첩 mapping을 변경해 byte 회계를 우회하지 못하도록 canonical JSON row로 보관하며, `stats()`는 본문 없이 세션 수와 직렬화된 메시지 byte 수만 반환하고 `sweep_expired()`로 즉시 정리할 수 있다. 이 수치는 Python 객체 overhead나 process RSS의 상한이 아니다.
+- `RedisConversationStore`/`DatabaseConversationStore`: summary cursor 이후 tail 조회와 pagination은 저장소별 원자성·cursor 계약이 필요하므로 후속 버전 범위다.
 - 운영 원문 보존: Redis 또는 DB 사용
 
 메시지 수를 임의로 잘라 모델 문제와 저장 문제를 동시에 처리하지 않는다. 원문 retention과 모델 token budget은 서로 다른 설정이어야 한다.
+단일 세션 자체가 `max_total_bytes`를 초과하는 append는 기존 데이터를
+변경하지 않고 `ConversationStoreCapacityError`로 실패한다. 다른 세션을
+eviction하여 공간을 만들 수 있을 때만 현재 append를 유지한다.
 
 ## 파일 구조
 
@@ -425,8 +434,8 @@ moduagent/memory/
 1. `ConversationMemoryPolicy` 계약과 `FullConversationMemoryPolicy`를 추가하고 Runtime 호출 경로만 분리한다.
 2. `RecentTurnsConversationMemoryPolicy`와 정확한 `TokenCounter` 기반의 요약 없는 토큰 윈도우를 추가한다.
 3. `ConversationSummarizer`와 `MemoryStateStore`를 추가해 오래된 정보 손실을 줄인다.
-4. `InMemoryConversationStore` 용량 제한과 durable store pagination을 별도 작업으로 추가한다.
-5. PLAN 모델 호출을 공통 준비 경로로 이동한다.
+4. `InMemoryConversationStore` 용량 제한을 추가하고 durable store pagination은 별도 작업으로 유지한다.
+5. PLAN과 replan 모델 호출을 공통 준비 경로로 이동한다.
 
 ## 완료 조건
 

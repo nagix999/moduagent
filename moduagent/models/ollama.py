@@ -13,6 +13,7 @@ from .base import (
     ModelResponse,
     validate_request_capabilities,
 )
+from ._embeddings import normalize_embedding_inputs, normalize_embedding_vectors
 from .errors import ModelProtocolError
 from .openai_compatible import (
     _StreamingToolCalls,
@@ -75,7 +76,13 @@ class OllamaClient:
         self.endpoint = normalized_url
         self.model = model
         self.timeout = timeout
-        self.transport = transport or HttpxTransport()
+        if transport is None:
+            owned_transport = HttpxTransport()
+            self.transport: HttpTransport = owned_transport
+            self._owned_transport: HttpxTransport | None = owned_transport
+        else:
+            self.transport = transport
+            self._owned_transport = None
         self._capabilities = capabilities or ModelCapabilities(embeddings=True)
         self.default_options = dict(default_options or {})
         self.default_provider_options = dict(provider_options or {})
@@ -88,6 +95,24 @@ class OllamaClient:
     @property
     def capabilities(self) -> ModelCapabilities:
         return self._capabilities
+
+    async def aclose(self) -> None:
+        """Close the internally created HTTP transport, if any.
+
+        A transport supplied by the caller remains caller-owned.
+        """
+
+        transport = self._owned_transport
+        if transport is None:
+            return
+        self._owned_transport = None
+        await transport.aclose()
+
+    async def __aenter__(self) -> OllamaClient:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.aclose()
 
     def _build_payload(self, request: ModelRequest, *, stream: bool) -> dict[str, Any]:
         validate_request_capabilities(request, self.capabilities, streaming=stream)
@@ -110,6 +135,10 @@ class OllamaClient:
             payload["options"] = options
         if request.tools:
             payload["tools"] = [_tool_schema_to_dict(tool) for tool in request.tools]
+        else:
+            # Provider options cannot create a model-visible Tool surface that
+            # the framework request and Tool registry did not authorize.
+            payload.pop("tools", None)
         if request.output_schema is not None:
             payload["format"] = dict(request.output_schema)
         return payload
@@ -155,10 +184,13 @@ class OllamaClient:
     ) -> tuple[tuple[float, ...], ...]:
         if not self.capabilities.embeddings:
             raise ValueError("the configured model does not support embeddings")
+        normalized_inputs, expected_count = normalize_embedding_inputs(inputs)
+        if expected_count == 0:
+            return ()
         payload: dict[str, Any] = {
             **self.default_provider_options,
             "model": self.model,
-            "input": inputs if isinstance(inputs, str) else list(inputs),
+            "input": normalized_inputs,
         }
         embedding_options = {**self.default_options, **dict(options or {})}
         if embedding_options:
@@ -176,19 +208,7 @@ class OllamaClient:
             (str, bytes, bytearray),
         ):
             raise ModelProtocolError("Ollama embedding response contains no embeddings")
-        embeddings: list[tuple[float, ...]] = []
-        for vector in rows:
-            if not isinstance(vector, Sequence) or isinstance(
-                vector, (str, bytes, bytearray)
-            ):
-                raise ModelProtocolError("Ollama returned an invalid embedding vector")
-            try:
-                embeddings.append(tuple(float(value) for value in vector))
-            except (TypeError, ValueError) as exc:
-                raise ModelProtocolError(
-                    "Ollama returned a non-numeric embedding vector"
-                ) from exc
-        return tuple(embeddings)
+        return normalize_embedding_vectors(rows, expected_count=expected_count)
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelChunk]:
         payload = self._build_payload(request, stream=True)

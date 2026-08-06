@@ -315,6 +315,48 @@ def test_llm_plan_generator_includes_only_bounded_public_history() -> None:
     asyncio.run(scenario())
 
 
+def test_llm_plan_generator_supports_complete_only_legacy_gateway() -> None:
+    class CompleteOnlyGateway:
+        def __init__(self) -> None:
+            self.phases: list[str] = []
+
+        async def complete(
+            self,
+            model: QueueModel,
+            request: ModelRequest,
+            *,
+            phase: str,
+        ) -> ModelResponse:
+            self.phases.append(phase)
+            return await model.complete(request)
+
+    async def scenario() -> None:
+        context = _context()
+        gateway = CompleteOnlyGateway()
+        context.model_gateway = gateway
+        model = QueueModel(
+            [
+                ModelResponse(
+                    Message.assistant(
+                        '{"steps":[{"step_id":"S1","objective":"collect",'
+                        '"completion_criteria":["done"],"expected_output":"facts",'
+                        '"dependencies":[],"allowed_tools":["lookup"]}]}'
+                    )
+                )
+            ]
+        )
+        generator = LLMPlanGenerator(model)
+        generator.configure_available_tools(frozenset({"lookup"}))
+
+        plan = await generator.create(context)
+
+        assert plan.current is not None
+        assert plan.current.step_id == "S1"
+        assert gateway.phases == ["plan"]
+
+    asyncio.run(scenario())
+
+
 def test_plan_commit_preserves_expected_output_and_uses_content_ref() -> None:
     plan = Plan([_step()])
     plan.start_current()

@@ -56,7 +56,7 @@ class SkillRuntime:
     ) -> None:
         self.registry = registry
         self.selector = selector
-        self.limits = limits or SkillLimits()
+        self.limits = limits if limits is not None else SkillLimits()
         self._artifact_cache: dict[SkillRef, SkillArtifact] = {}
 
     async def activate(

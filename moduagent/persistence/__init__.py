@@ -8,6 +8,7 @@ from moduagent.persistence.checkpoint import (
 from moduagent.persistence.conversation import (
     ConversationRepository,
     ConversationStore,
+    ConversationStoreCapacityError,
     DatabaseConversationStore,
     IdempotentConversationStore,
     InMemoryConversationStore,
@@ -37,6 +38,7 @@ __all__ = [
     "CommonRunState",
     "ConversationRepository",
     "ConversationStore",
+    "ConversationStoreCapacityError",
     "DatabaseConversationStore",
     "EngineSnapshot",
     "EngineStateCodec",

@@ -7,12 +7,15 @@ import pytest
 from moduagent import (
     Agent,
     AgentConfig,
+    AuthorizationDecision,
+    LLMPlanGenerator,
     ModelCapabilities,
     Plan,
     PlanExecutionProfile,
     PlanStep,
     RetryConfig,
     RunLimits,
+    StandardDecisionPolicy,
     StandardExecutionProfile,
     function_tool,
 )
@@ -38,6 +41,64 @@ class StaticPlanGenerator:
 
     async def revise(self, context: Any, plan: Plan, feedback: str) -> Plan:
         return plan
+
+
+class _Falsey:
+    def __bool__(self) -> bool:
+        return False
+
+
+class FalseyOutputCodec(_Falsey):
+    def schema(self) -> None:
+        return None
+
+    def decode(self, response: Any) -> str:
+        del response
+        return "decoded"
+
+
+class FalseyConversationStore(_Falsey):
+    supports_idempotent_append = True
+
+    async def load(self, session_id: str) -> list[Any]:
+        del session_id
+        return []
+
+    async def append(self, session_id: str, messages: Any) -> None:
+        del session_id, messages
+
+    async def append_once(
+        self,
+        session_id: str,
+        idempotency_key: str,
+        messages: Any,
+    ) -> bool:
+        del session_id, idempotency_key, messages
+        return True
+
+    async def clear(self, session_id: str) -> None:
+        del session_id
+
+
+class FalseyEventSink(_Falsey):
+    async def publish(self, event: Any) -> None:
+        del event
+
+
+class FalseyDiagnosticSink(_Falsey):
+    async def capture(self, record: Any) -> None:
+        del record
+
+
+class FalseyAuthorizer(_Falsey):
+    async def authorize(self, *args: Any, **kwargs: Any) -> AuthorizationDecision:
+        del args, kwargs
+        return AuthorizationDecision.allow()
+
+
+class FalseyDecisionPolicy(StandardDecisionPolicy):
+    def __bool__(self) -> bool:
+        return False
 
 
 def test_agent_inspect_is_deterministic_and_secret_safe() -> None:
@@ -93,6 +154,69 @@ def test_explicit_execution_profiles_resolve_without_changing_core_api() -> None
     assert standard.inspect().execution_profile.kind == "standard"
     assert plan.inspect().execution_profile.kind == "plan"
     assert plan.inspect().execution_profile.state_version == 1
+
+
+def test_planner_options_are_redacted_and_change_agent_fingerprint() -> None:
+    model = StaticModel()
+    first = Agent(
+        config=AgentConfig("plan-options-1", "Plan safely."),
+        model=model,
+        execution_profile=PlanExecutionProfile(
+            LLMPlanGenerator(
+                model,
+                options={"temperature": 0.1, "api_key": "planner-secret"},
+                provider_options={"seed": 7},
+            )
+        ),
+    )
+    second = Agent(
+        config=AgentConfig("plan-options-1", "Plan safely."),
+        model=model,
+        execution_profile=PlanExecutionProfile(
+            LLMPlanGenerator(
+                model,
+                options={"temperature": 0.9, "api_key": "planner-secret"},
+                provider_options={"seed": 7},
+            )
+        ),
+    )
+
+    details = first.inspect().execution_profile.details["plan_generator"]
+    assert details["options"] == {
+        "temperature": 0.1,
+        "api_key": "[REDACTED]",
+    }
+    assert details["provider_options"] == {"seed": 7}
+    assert "planner-secret" not in repr(first.inspect().to_dict())
+    assert first.inspect().agent_fingerprint != second.inspect().agent_fingerprint
+
+
+def test_falsey_injected_components_are_not_replaced_by_defaults() -> None:
+    output_codec = FalseyOutputCodec()
+    conversation_store = FalseyConversationStore()
+    event_sink = FalseyEventSink()
+    diagnostic_sink = FalseyDiagnosticSink()
+    authorizer = FalseyAuthorizer()
+    policy = FalseyDecisionPolicy()
+
+    agent = Agent(
+        config=AgentConfig("falsey", "Preserve injected components."),
+        model=StaticModel(),
+        output_codec=output_codec,
+        conversation_store=conversation_store,
+        event_sink=event_sink,
+        diagnostic_sink=diagnostic_sink,
+        tool_authorizer=authorizer,
+        decision_policy=policy,
+    )
+
+    assert agent.runtime.output_codec is output_codec
+    assert agent.runtime.conversation_store is conversation_store
+    assert agent.runtime.event_sink is event_sink
+    assert agent.runtime.diagnostic_reporter is not None
+    assert agent.runtime.diagnostic_reporter.sink is diagnostic_sink
+    assert agent.tool_executor.authorizer is authorizer
+    assert agent.runtime.decision_policy is policy
 
 
 def test_execution_profile_and_legacy_policy_are_mutually_exclusive() -> None:

@@ -45,7 +45,11 @@ from moduagent.memory import (
     ConversationMemoryOverflowError,
     MemoryIntegrityError,
 )
-from moduagent.models import ModelCapabilities, classify_model_error
+from moduagent.models import (
+    ModelCapabilities,
+    ModelOutputIncompleteError,
+    classify_model_error,
+)
 from moduagent.observability._background import run_in_daemon_thread
 from moduagent.observability.sinks import (
     _event_sink_is_noop,
@@ -356,9 +360,9 @@ class RunCoordinator(AgentRuntime):
             raise TypeError("request must be a RunRequest")
         self._validate_engine_descriptor()
         run_id = request.resume_run_id or uuid.uuid4().hex
-        deadline = (
-            asyncio.get_running_loop().time() + self.config.limits.timeout_seconds
-        )
+        loop = asyncio.get_running_loop()
+        run_started_at = loop.time()
+        deadline = run_started_at + self.config.limits.timeout_seconds
         context = self._new_context(request, run_id, history=())
         resumed_snapshot: RunSnapshot | None = None
         setup_error: BaseException | None = None
@@ -620,6 +624,11 @@ class RunCoordinator(AgentRuntime):
                 outcome,
                 deadline,
             )
+            result = self._with_run_usage(
+                result,
+                context,
+                started_at=run_started_at,
+            )
             await self._flush_diagnostics_safely(run_id)
             terminal = await self._publish_terminal(
                 AgentEvent(event_type, run_id, {"result": result})
@@ -689,6 +698,11 @@ class RunCoordinator(AgentRuntime):
             }
             summary.update(diagnostic)
             result = self._with_error_summary(result, summary)
+            result = self._with_run_usage(
+                result,
+                context,
+                started_at=run_started_at,
+            )
             for pending in services.drain_events():
                 yield pending
             for pending in services.drain_after_events():
@@ -734,6 +748,11 @@ class RunCoordinator(AgentRuntime):
             summary = dict(self._error_summary(exc, context=context))
             summary.update(diagnostic)
             result = self._with_error_summary(result, summary)
+            result = self._with_run_usage(
+                result,
+                context,
+                started_at=run_started_at,
+            )
             for pending in services.drain_events():
                 yield pending
             for pending in services.drain_after_events():
@@ -1286,6 +1305,12 @@ class RunCoordinator(AgentRuntime):
                     ),
                 }
             )
+        if type(error) is ModelOutputIncompleteError and error.finish_reason in {
+            "timeout",
+            "length",
+            "max_tokens",
+        }:
+            summary["provider_finish_reason"] = error.finish_reason
         return summary
 
     async def _capture_terminal_failure(
@@ -1556,6 +1581,42 @@ class RunCoordinator(AgentRuntime):
             metadata={
                 **dict(result.metadata),
                 "error_summary": dict(summary),
+            },
+        )
+
+    @staticmethod
+    def _with_run_usage(
+        result: AgentResult,
+        context: RunContext,
+        *,
+        started_at: float,
+    ) -> AgentResult:
+        """Attach ephemeral run counters without checkpointing clock values."""
+
+        raw_model_turns = context.metadata.get("_moduagent_model_turns", 0)
+        model_turns = (
+            raw_model_turns
+            if type(raw_model_turns) is int and raw_model_turns >= 0
+            else 0
+        )
+        tool_calls = (
+            context.tool_call_count
+            if type(context.tool_call_count) is int and context.tool_call_count >= 0
+            else 0
+        )
+        duration_seconds = max(
+            0.0,
+            asyncio.get_running_loop().time() - started_at,
+        )
+        return replace(
+            result,
+            metadata={
+                **dict(result.metadata),
+                "run_usage": {
+                    "model_turns": model_turns,
+                    "tool_calls": tool_calls,
+                    "duration_seconds": duration_seconds,
+                },
             },
         )
 

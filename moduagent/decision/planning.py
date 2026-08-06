@@ -4,8 +4,9 @@ import asyncio
 import hashlib
 import json
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
+from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -21,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from moduagent.decision.base import DecisionKind, ExecutionDecision
 from moduagent.messages import Message, ToolCall
 from moduagent.models import (
+    AuxiliaryModelRequestPreparer,
     ModelClient,
     ModelProtocolError,
     ModelRequest,
@@ -860,7 +862,9 @@ class ToolScopedPlanGenerator(Protocol):
 
 
 class LLMPlanGenerator:
-    _IMMUTABLE_CONFIGURATION = frozenset({"model", "max_steps", "history_limit"})
+    _IMMUTABLE_CONFIGURATION = frozenset(
+        {"model", "max_steps", "history_limit", "options", "provider_options"}
+    )
 
     def __setattr__(self, name: str, value: Any) -> None:
         if name in self._IMMUTABLE_CONFIGURATION and name in self.__dict__:
@@ -873,6 +877,8 @@ class LLMPlanGenerator:
         *,
         max_steps: int = 6,
         history_limit: int = 8,
+        options: Mapping[str, Any] | None = None,
+        provider_options: Mapping[str, Any] | None = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
@@ -881,6 +887,8 @@ class LLMPlanGenerator:
         self.model = model
         self.max_steps = max_steps
         self.history_limit = history_limit
+        self.options = MappingProxyType(dict(options or {}))
+        self.provider_options = MappingProxyType(dict(provider_options or {}))
         self._configured_available_tools: frozenset[str] | None = None
 
     def configure_available_tools(
@@ -894,40 +902,35 @@ class LLMPlanGenerator:
         self._configured_available_tools = available_tools
 
     async def create(self, context: RunContext) -> Plan:
-        # Local import keeps the planning domain importable by runtime.context
-        # without executing the skills package/runtime import graph.
-        from moduagent.skills.prompting import compose_skill_prompt
-
         available_tools = self._available_tools()
         request = ModelRequest(
-            messages=compose_skill_prompt(
-                self._base_messages(
-                    context,
-                    Message.system(
-                        "Create the smallest independently verifiable execution plan. "
-                        "Return JSON only. Do not execute the work, write a final "
-                        "answer, or add a final-answer/reporting step. Every step must "
-                        "have a stable step_id, objective, completion_criteria, "
-                        "expected_output, dependencies, and allowed_tools. A step can "
-                        "use only one model-selected tool-call batch; if one tool's "
-                        "result is needed to choose arguments for another tool, split "
-                        "them into separate dependency-linked steps."
-                    ),
-                    Message.user(
-                        json.dumps(
-                            {
-                                "request": context.request.input,
-                                "available_tools": list(available_tools or ()),
-                            },
-                            ensure_ascii=False,
-                        )
-                    ),
+            messages=self._base_messages(
+                context,
+                Message.system(
+                    "Create the smallest independently verifiable execution plan. "
+                    "Return JSON only. Do not execute the work, write a final "
+                    "answer, or add a final-answer/reporting step. Every step must "
+                    "have a stable step_id, objective, completion_criteria, "
+                    "expected_output, dependencies, and allowed_tools. A step can "
+                    "use only one model-selected tool-call batch; if one tool's "
+                    "result is needed to choose arguments for another tool, split "
+                    "them into separate dependency-linked steps."
                 ),
-                context.skill_messages,
-                phase="plan",
+                Message.user(
+                    json.dumps(
+                        {
+                            "request": context.request.input,
+                            "available_tools": list(available_tools or ()),
+                        },
+                        ensure_ascii=False,
+                    )
+                ),
             ),
             output_schema=self._schema(),
+            options=self.options,
+            provider_options=self.provider_options,
         )
+        request = await self._prepare_request(context, request, phase="plan")
         response = (
             await self.model.complete(request)
             if context.model_gateway is None
@@ -947,37 +950,34 @@ class LLMPlanGenerator:
         )
 
     async def revise(self, context: RunContext, plan: Plan, feedback: str) -> Plan:
-        from moduagent.skills.prompting import compose_skill_prompt
-
         available_tools = self._available_tools()
         request = ModelRequest(
-            messages=compose_skill_prompt(
-                self._base_messages(
-                    context,
-                    Message.system(
-                        "Revise only unfinished plan steps. Preserve completed step "
-                        "IDs and result references exactly. Return the plan JSON only; "
-                        "do not execute work or add a final-answer step. A step can "
-                        "use only one model-selected tool-call batch; split sequential "
-                        "tool decisions into dependency-linked steps."
-                    ),
-                    Message.user(
-                        json.dumps(
-                            {
-                                "request": context.request.input,
-                                "plan": plan.to_dict(),
-                                "feedback": feedback,
-                                "available_tools": list(available_tools or ()),
-                            },
-                            ensure_ascii=False,
-                        )
-                    ),
+            messages=self._base_messages(
+                context,
+                Message.system(
+                    "Revise only unfinished plan steps. Preserve completed step "
+                    "IDs and result references exactly. Return the plan JSON only; "
+                    "do not execute work or add a final-answer step. A step can "
+                    "use only one model-selected tool-call batch; split sequential "
+                    "tool decisions into dependency-linked steps."
                 ),
-                context.skill_messages,
-                phase="plan",
+                Message.user(
+                    json.dumps(
+                        {
+                            "request": context.request.input,
+                            "plan": plan.to_dict(),
+                            "feedback": feedback,
+                            "available_tools": list(available_tools or ()),
+                        },
+                        ensure_ascii=False,
+                    )
+                ),
             ),
             output_schema=self._schema(),
+            options=self.options,
+            provider_options=self.provider_options,
         )
+        request = await self._prepare_request(context, request, phase="replan")
         response = (
             await self.model.complete(request)
             if context.model_gateway is None
@@ -994,6 +994,38 @@ class LLMPlanGenerator:
             response.message.content,
             context.request.input,
             available_tools=available_tools,
+        )
+
+    async def _prepare_request(
+        self,
+        context: RunContext,
+        request: ModelRequest,
+        *,
+        phase: str,
+    ) -> ModelRequest:
+        gateway = context.model_gateway
+        if isinstance(gateway, AuxiliaryModelRequestPreparer):
+            return await gateway.prepare_auxiliary_model_request(
+                request,
+                model=self.model,
+                phase=phase,
+                skill_phase="plan",
+                # The final user message contains the current request and must
+                # remain protected; preceding public history may be compacted.
+                protected_from=max(0, len(request.messages) - 1),
+            )
+
+        # Direct generator use has no RuntimeServices boundary. Preserve the
+        # existing Skill behavior while leaving memory preparation to callers.
+        from moduagent.skills.prompting import compose_skill_prompt
+
+        return replace(
+            request,
+            messages=compose_skill_prompt(
+                request.messages,
+                context.skill_messages,
+                phase="plan",
+            ),
         )
 
     def _base_messages(

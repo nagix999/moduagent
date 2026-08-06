@@ -41,13 +41,29 @@ config = AgentConfig(
 | 잘못된 요청 값 | 아니요 | `model_request_invalid` |
 | client type/contract 오류 | 아니요 | `model_client_contract_error` |
 | 응답 protocol·JSON decoding 오류 | 아니요 | `model_protocol_error` |
+| provider가 `timeout`·`length`·`max_tokens`로 출력을 중단 | 아니요 | `model_output_incomplete` |
 | 분류되지 않은 실행 오류 | 아니요 | `model_invocation_failed` |
 
 provider가 HTTP 200을 반환했더라도 body, `choices`, Tool call, Tool arguments JSON, stream chunk 또는 terminal response가 adapter 계약에 맞지 않으면 `ModelProtocolError`다. 같은 응답을 다시 받아도 해결되지 않는 결정적 실패이므로 즉시 종료하고 provider retry를 소비하지 않습니다. Plan JSON이 잘못된 경우도 catch-all 계획으로 바꾸지 않습니다.
 
+provider 응답의 종료 이유가 `timeout`, `length`, `max_tokens`이면 부분 출력을
+공개하거나 Pydantic으로 decode하지 않고 `model_output_incomplete`로 종료합니다.
+이때 `error_summary["provider_finish_reason"]`과 `AgentRunError.provider_finish_reason`
+에는 세 값 중 하나만 보존되며, 응답 본문과 provider metadata는 보존하지
+않습니다. `length`나 `max_tokens`는 재시도보다 출력 예산·스키마·프롬프트를
+검토해야 하므로 자동 재시도하지 않습니다.
+
 strict Plan의 schema-only `StepResult`가 잘못된 JSON이거나 Pydantic schema에 맞지 않으면 현재 단계를 즉시 `failed`로 전이하고 `step_result_schema_invalid`를 반환합니다. 같은 `StepResult` 요청을 반복하거나 `max_step_attempts`만큼 재생성하지 않습니다. 최종 Pydantic output 검증 실패도 provider retry가 아니라 terminal output validation 실패입니다.
 
-stream에서 아직 delta를 공개하지 않은 transient 오류만 재시도할 수 있습니다. 하나 이상의 delta를 이미 내보낸 뒤 연결이 끊기면 중복 출력을 막기 위해 retryable transport 오류라도 같은 stream을 다시 시작하지 않습니다. `RETRY` 이벤트와 `error_summary`에는 정제된 category와 code만 기록되고 원본 provider 메시지는 포함되지 않습니다.
+stream에서 아직 delta를 공개하지 않은 transient 오류만 재시도할 수 있습니다. 하나 이상의 delta를 이미 내보낸 뒤 연결이 끊기면 중복 출력을 막기 위해 retryable transport 오류라도 같은 stream을 다시 시작하지 않습니다. `MODEL_STARTED`, `MODEL_FAILED`, `RETRY` 이벤트로 model turn, attempt, phase, 요청의 message·Tool 개수, structured-output 사용 여부와 지연시간을 확인할 수 있습니다. 이 이벤트에는 prompt·message content·Tool arguments·provider body를 넣지 않습니다. `RETRY`와 `error_summary`에도 정제된 category와 code만 기록됩니다.
+
+`LoggingEventSink`는 기본적으로 `MODEL_DELTA`, `STEP_MODEL_DELTA`,
+`FINAL_DELTA`를 기록하지 않습니다. 개발 중 chunk 단위 이벤트 개수가
+필요한 경우에만 `LoggingEventSink(include_deltas=True)`를 사용하세요.
+이 경우에도 built-in 로그에는 delta 본문이 아니라 문자 수와 byte 수만
+남습니다. `MetricsEventSink`는 실패한 model attempt 수를
+`model.calls.failed`, 실패 지연시간을 `model.failed_duration_seconds`로
+기록합니다.
 
 ### 모델 turn 예산과 무진전 차단
 

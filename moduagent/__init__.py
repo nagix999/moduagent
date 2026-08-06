@@ -67,6 +67,7 @@ from moduagent.models import (
     ModelCapabilities,
     ModelChunk,
     ModelClient,
+    ModelOutputIncompleteError,
     ModelProtocolError,
     ModelRequest,
     ModelResponse,
@@ -101,6 +102,7 @@ from moduagent.persistence import (
     CheckpointStore,
     CommonRunState,
     ConversationStore,
+    ConversationStoreCapacityError,
     DatabaseConversationStore,
     EngineSnapshot,
     FinalizationMarkers,
@@ -186,7 +188,7 @@ from moduagent.tools import (
     tool,
 )
 
-__version__ = "0.5.0"
+__version__ = "0.5.2"
 
 __all__ = [
     "__version__",
@@ -211,6 +213,7 @@ __all__ = [
     "ConversationMemoryOverflowError",
     "ConversationMemoryPolicy",
     "ConversationStore",
+    "ConversationStoreCapacityError",
     "ConversationSummarizer",
     "DatabaseConversationStore",
     "DecisionKind",
@@ -260,6 +263,7 @@ __all__ = [
     "ModelCapabilities",
     "ModelChunk",
     "ModelClient",
+    "ModelOutputIncompleteError",
     "ModelProtocolError",
     "ModelRequest",
     "ModelResponse",

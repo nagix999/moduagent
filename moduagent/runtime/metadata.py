@@ -8,6 +8,7 @@ _RUNTIME_OWNED_METADATA_KEYS = frozenset(
         "failure",
         "plan",
         "plan_usage",
+        "run_usage",
         "skill_usage",
         "skills",
         "tool_trace",

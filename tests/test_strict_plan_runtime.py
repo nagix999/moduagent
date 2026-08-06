@@ -1346,7 +1346,11 @@ def test_incomplete_finalizer_response_is_never_persisted_or_completed() -> None
         result = await agent.run("inspect", session_id="partial-final")
 
         assert result.finish_reason is FinishReason.ERROR
-        assert result.error == "incomplete finalization response (timeout)"
+        assert result.error == "model output incomplete"
+        assert result.error_summary["category"] == "model_protocol"
+        assert result.error_summary["code"] == "model_output_incomplete"
+        assert result.error_summary["retryable"] is False
+        assert result.error_summary["provider_finish_reason"] == "timeout"
         assert [
             message.content for message in await conversations.load("partial-final")
         ] == ["inspect"]

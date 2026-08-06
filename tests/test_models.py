@@ -8,6 +8,8 @@ from typing import Any
 import httpx
 import pytest
 
+import moduagent.models.ollama as ollama_module
+import moduagent.models.openai_compatible as openai_module
 from moduagent.messages import Message, ToolCall
 from moduagent.memory import VLLMTokenCounter
 from moduagent.models import (
@@ -393,7 +395,12 @@ def test_vllm_finalization_drops_tool_only_default_options() -> None:
             default_options={
                 "tool_choice": "auto",
                 "parallel_tool_calls": True,
+                "tools": [{"type": "function", "function": {"name": "unsafe"}}],
                 "temperature": 0,
+            },
+            extra_body={
+                "tools": [{"type": "function", "function": {"name": "unsafe-2"}}],
+                "tool_choice": "required",
             },
         )
 
@@ -401,14 +408,43 @@ def test_vllm_finalization_drops_tool_only_default_options() -> None:
             ModelRequest(
                 (Message.user("finalize"),),
                 output_schema={"type": "object", "properties": {}},
+                provider_options={"parallel_tool_calls": True},
             )
         )
 
         body = transport.requests[0]["json"]
         assert "tool_choice" not in body
         assert "parallel_tool_calls" not in body
+        assert "tools" not in body
         assert body["temperature"] == 0
         assert body["response_format"]["type"] == "json_schema"
+
+    asyncio.run(scenario())
+
+
+def test_ollama_no_tool_request_drops_provider_supplied_tools() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport(
+            response={
+                "done": True,
+                "done_reason": "stop",
+                "message": {"role": "assistant", "content": "ok"},
+            }
+        )
+        client = OllamaClient(
+            base_url="http://ollama",
+            model="qwen",
+            transport=transport,
+            provider_options={
+                "extra_body": {
+                    "tools": [{"type": "function", "function": {"name": "unsafe"}}]
+                }
+            },
+        )
+
+        await client.complete(ModelRequest((Message.user("answer directly"),)))
+
+        assert "tools" not in transport.requests[0]["json"]
 
     asyncio.run(scenario())
 
@@ -677,5 +713,66 @@ def test_httpx_transport_works_with_mock_transport_without_network() -> None:
 
         assert value == {"ok": True}
         assert lines == ['{"part":1}', '{"part":2}']
+
+    asyncio.run(scenario())
+
+
+def test_model_clients_close_only_their_internally_created_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ClosableTransport(FakeTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    async def scenario() -> None:
+        owned_openai = ClosableTransport()
+        monkeypatch.setattr(
+            openai_module,
+            "HttpxTransport",
+            lambda: owned_openai,
+        )
+        async with OpenAICompatibleClient(
+            base_url="http://model",
+            model="model",
+        ) as openai:
+            assert openai.transport is owned_openai
+        await openai.aclose()
+        assert owned_openai.close_calls == 1
+
+        injected_openai = ClosableTransport()
+        openai = OpenAICompatibleClient(
+            base_url="http://model",
+            model="model",
+            transport=injected_openai,
+        )
+        await openai.aclose()
+        assert injected_openai.close_calls == 0
+
+        owned_ollama = ClosableTransport()
+        monkeypatch.setattr(
+            ollama_module,
+            "HttpxTransport",
+            lambda: owned_ollama,
+        )
+        async with OllamaClient(
+            base_url="http://ollama",
+            model="model",
+        ) as ollama:
+            assert ollama.transport is owned_ollama
+        await ollama.aclose()
+        assert owned_ollama.close_calls == 1
+
+        injected_ollama = ClosableTransport()
+        ollama = OllamaClient(
+            base_url="http://ollama",
+            model="model",
+            transport=injected_ollama,
+        )
+        await ollama.aclose()
+        assert injected_ollama.close_calls == 0
 
     asyncio.run(scenario())

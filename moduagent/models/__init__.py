@@ -1,4 +1,5 @@
 from .base import (
+    AuxiliaryModelRequestPreparer,
     ModelCapabilities,
     ModelChunk,
     ModelClient,
@@ -9,6 +10,7 @@ from .base import (
 )
 from .errors import (
     ModelErrorClassification,
+    ModelOutputIncompleteError,
     ModelProtocolError,
     classify_model_error,
     is_retryable_model_error,
@@ -19,6 +21,7 @@ from .transport import HttpTransport, HttpxTransport
 from .vllm import VLLMClient
 
 __all__ = [
+    "AuxiliaryModelRequestPreparer",
     "HttpTransport",
     "HttpxTransport",
     "ModelCapabilities",
@@ -26,6 +29,7 @@ __all__ = [
     "ModelClient",
     "ModelErrorClassification",
     "ModelGateway",
+    "ModelOutputIncompleteError",
     "ModelProtocolError",
     "ModelRequest",
     "ModelResponse",

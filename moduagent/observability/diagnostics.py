@@ -18,6 +18,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from pydantic import ValidationError
 
+from moduagent.models.errors import ModelOutputIncompleteError
 from moduagent.observability._background import run_in_daemon_thread
 
 
@@ -723,6 +724,15 @@ def _extract_safe_details(
     details: dict[str, Any] = {}
     validation_errors: list[Mapping[str, Any]] = []
     for error in chain:
+        if type(error) is ModelOutputIncompleteError and error.finish_reason in {
+            "timeout",
+            "length",
+            "max_tokens",
+        }:
+            details.setdefault(
+                "provider_finish_reason",
+                error.finish_reason,
+            )
         sqlstate = _safe_attribute(error, "sqlstate")
         if sqlstate is None:
             sqlstate = _safe_attribute(error, "pgcode")

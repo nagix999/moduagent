@@ -32,6 +32,7 @@ class AgentRunError(ModuAgentError, RuntimeError):
         self.retryable = self.error_summary.get("retryable")
         self.resumable = self.error_summary.get("resumable")
         self.failure_id = self.error_summary.get("failure_id")
+        self.provider_finish_reason = self.error_summary.get("provider_finish_reason")
 
         details = [f"finish_reason={self.finish_reason}"]
         for key in (
@@ -45,6 +46,7 @@ class AgentRunError(ModuAgentError, RuntimeError):
             "retryable",
             "resumable",
             "failure_id",
+            "provider_finish_reason",
             "model_turns",
             "max_model_turns",
             "no_progress_model_turns",
@@ -145,6 +147,7 @@ _AGENT_ERROR_COUNT_FIELDS = frozenset(
         "no_progress_model_turn_threshold",
     }
 )
+_AGENT_ERROR_PROVIDER_FINISH_REASONS = frozenset({"timeout", "length", "max_tokens"})
 
 
 def _safe_error_text(value: Any, *, limit: int) -> str:
@@ -176,6 +179,9 @@ def _safe_agent_error_summary(
         item = value.get(key)
         if type(item) is int and 0 <= item <= 1_000_000:
             safe[key] = item
+    provider_finish_reason = value.get("provider_finish_reason")
+    if provider_finish_reason in _AGENT_ERROR_PROVIDER_FINISH_REASONS:
+        safe["provider_finish_reason"] = provider_finish_reason
     return safe
 
 

@@ -13,3 +13,5 @@ dist/
 .env.*
 !.env.example
 .pypi-token
+tmp/
+examples/artifacts/

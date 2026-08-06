@@ -10,10 +10,14 @@ Start with a normal model or Tool-calling loop. Add bounded conversation
 memory, validated Pydantic output, strict Plan-and-Execute, checkpoint recovery,
 Skills, and observability only when your application needs them.
 
-> Current version: **0.5.0 (Alpha)** · Python **3.10+** · **MIT License**
+> Current version: **0.5.2** · Status: **Alpha** · Python **3.10+** · **MIT License**
 
 New to ModuAgent? Follow the five short steps below. They use the 0.5 Quick
 API; the explicit component API remains available for advanced composition.
+For runnable files that add only one concept at a time, start with the
+[beginner examples](https://github.com/nagix999/moduagent/blob/main/examples/README.md).
+When you are ready for multi-Tool workflows, continue with the
+[intermediate examples](https://github.com/nagix999/moduagent/blob/main/examples/INTERMEDIATE.md).
 
 ## What ModuAgent provides
 
@@ -68,10 +72,10 @@ server; ModuAgent does not host a model itself.
 Install the package:
 
 ```bash
-python -m pip install "moduagent==0.5.0"
+python -m pip install "moduagent==0.5.2"
 ```
 
-If your package index does not contain `0.5.0` yet and you already have a 0.5
+If your package index does not contain `0.5.2` yet and you already have a 0.5
 source checkout, install it from the repository root:
 
 ```bash
@@ -105,17 +109,19 @@ from moduagent import Agent, VLLMClient
 
 
 async def main() -> None:
-    model = VLLMClient.from_env()
-    agent = Agent.create(
-        model=model,
-        instructions="Answer accurately and concisely.",
-    )
+    async with VLLMClient.from_env(
+        default_options={"temperature": 0, "max_tokens": 256},
+    ) as model:
+        agent = Agent.create(
+            model=model,
+            instructions="Answer accurately and concisely.",
+        )
 
-    answer = await agent.ask(
-        "Explain what an AI agent is in one paragraph.",
-        session_id="getting-started",
-    )
-    print(answer)
+        answer = await agent.ask(
+            "Explain what an AI agent is in one paragraph.",
+            session_id="getting-started",
+        )
+        print(answer)
 
 
 if __name__ == "__main__":
@@ -165,6 +171,34 @@ model = OllamaClient(
 )
 ```
 
+The OpenAI-compatible and Ollama clients also expose a validated embedding
+boundary. Configure the client for the embedding endpoint and call `embed()`
+directly; an Agent is not required for deterministic vector generation.
+
+```python
+from moduagent import ModelCapabilities, VLLMClient
+
+async with VLLMClient(
+    base_url="http://localhost:8001/v1",
+    model="BAAI/bge-m3",
+    capabilities=ModelCapabilities(
+        chat=False,
+        streaming=False,
+        tool_calling=False,
+        parallel_tool_calling=False,
+        structured_output=False,
+        embeddings=True,
+        tool_calling_with_structured_output=False,
+    ),
+) as embedding_model:
+    vectors = await embedding_model.embed(["first document", "second document"])
+```
+
+The returned batch must match the input count. Vectors must be non-empty,
+finite, and dimensionally consistent; OpenAI-compatible response indices must
+be the exact unique range `0..N-1`. Malformed responses raise
+`ModelProtocolError` without including document or provider response content.
+
 ## Step 2: add a Tool
 
 Use `@tool` to expose a typed Python function.
@@ -182,19 +216,22 @@ def add(a: int, b: int) -> int:
 
 
 async def main() -> None:
-    calculator = Agent.create(
-        model=VLLMClient.from_env(),
-        instructions=(
-            "Use the add Tool whenever addition is required. "
-            "Do not invent a calculated result."
-        ),
-        tools=[add],
-    )
-    answer = await calculator.ask(
-        "What is 12 plus 30?",
-        session_id="calculator-demo",
-    )
-    print(answer)
+    async with VLLMClient.from_env(
+        default_options={"temperature": 0, "max_tokens": 256},
+    ) as model:
+        calculator = Agent.create(
+            model=model,
+            instructions=(
+                "Use the add Tool whenever addition is required. "
+                "Do not invent a calculated result."
+            ),
+            tools=[add],
+        )
+        answer = await calculator.ask(
+            "What is 12 plus 30?",
+            session_id="calculator-demo",
+        )
+        print(answer)
 
 
 asyncio.run(main())
@@ -254,23 +291,24 @@ class Answer(BaseModel):
     confidence: float = Field(ge=0, le=1)
 
 
-structured_agent = Agent.create(
-    model=VLLMClient.from_env(),
-    instructions=(
-        "Use the add Tool for every arithmetic operation, then return "
-        "the answer in the requested format."
-    ),
-    tools=[add],
-    output=Answer,
-)
-
-
 async def main() -> None:
-    answer: Answer = await structured_agent.ask(
-        "What is 20 plus 22?",
-        session_id="structured-demo",
-    )
-    print(answer.answer, answer.confidence)
+    async with VLLMClient.from_env(
+        default_options={"temperature": 0, "max_tokens": 256},
+    ) as model:
+        structured_agent = Agent.create(
+            model=model,
+            instructions=(
+                "Use the add Tool for every arithmetic operation, then return "
+                "the answer in the requested format."
+            ),
+            tools=[add],
+            output=Answer,
+        )
+        answer: Answer = await structured_agent.ask(
+            "What is 20 plus 22?",
+            session_id="structured-demo",
+        )
+        print(answer.answer, answer.confidence)
 
 
 if __name__ == "__main__":
@@ -312,34 +350,33 @@ class Answer(BaseModel):
     answer: str
     confidence: float = Field(ge=0, le=1)
 
-model = VLLMClient.from_env()
-
-planning_agent = Agent.create(
-    model=model,
-    instructions=(
-        "Use the add Tool for every arithmetic operation. "
-        "Complete multi-step requests using only validated and committed "
-        "step results."
-    ),
-    tools=[add],
-    output=Answer,
-    execution="plan",
-    limits=RunLimits(
-        max_steps=4,
-        max_step_attempts=2,
-        max_replans=1,
-        max_tool_calls=8,
-        timeout_seconds=120,
-    ),
-)
-
-
 async def main() -> None:
-    answer: Answer = await planning_agent.ask(
-        "Calculate 10 + 20, then add 5 to that verified result.",
-        session_id="plan-demo",
-    )
-    print(answer)
+    async with VLLMClient.from_env(
+        default_options={"temperature": 0, "max_tokens": 512},
+    ) as model:
+        planning_agent = Agent.create(
+            model=model,
+            instructions=(
+                "Use the add Tool for every arithmetic operation. "
+                "Complete multi-step requests using only validated and committed "
+                "step results."
+            ),
+            tools=[add],
+            output=Answer,
+            execution="plan",
+            limits=RunLimits(
+                max_steps=4,
+                max_step_attempts=2,
+                max_replans=1,
+                max_tool_calls=8,
+                timeout_seconds=120,
+            ),
+        )
+        answer: Answer = await planning_agent.ask(
+            "Calculate 10 + 20, then add 5 to that verified result.",
+            session_id="plan-demo",
+        )
+        print(answer)
 
 
 if __name__ == "__main__":
@@ -370,8 +407,9 @@ short workflows.
 ## Step 5: inspect results and bound model calls
 
 `ask()` is equivalent to `run()` followed by `unwrap()`. Use it when the only
-successful value you need is the decoded output. The snippets in this step use
-the `planning_agent` created in Step 4:
+successful value you need is the decoded output. The snippets in this step
+assume an already configured `planning_agent`; keep its model client's async
+context open for the lifetime of these calls:
 
 ```python
 import asyncio
@@ -423,6 +461,9 @@ The main `AgentResult` fields are:
 | `run_id` | Failure-correlation and checkpoint identifier |
 | `messages` | Public conversation messages |
 | `metadata` | Bounded Tool trace, Plan summary, and safe error category |
+| `run_usage` | Immutable model-turn, Tool-call, and elapsed-time summary |
+| `tool_trace` | Immutable bounded projection of executed Tools |
+| `error_summary` | Immutable safe terminal failure classification |
 
 Terminal finish reasons are:
 
@@ -488,6 +529,7 @@ They are not retried for:
 - HTTP `429` or any other HTTP `4xx`;
 - malformed JSON, invalid Tool arguments, or any provider protocol/parsing
   failure;
+- provider output ending with `timeout`, `length`, or `max_tokens`;
 - structured-output validation failures;
 - invalid requests, capability mismatches, `TypeError`, or programming errors.
 
@@ -495,6 +537,11 @@ A streaming model call is not retried after a public delta has been emitted.
 Tool retry and repair are separate contracts: they additionally require the
 Tool's declared safety profile and never become safe merely because model
 retry is enabled.
+
+An incomplete provider response fails with code `model_output_incomplete`.
+Inspect `result.error_summary["provider_finish_reason"]` or
+`AgentRunError.provider_finish_reason` to distinguish `timeout`, `length`, and
+`max_tokens`; partial output and provider metadata are not retained.
 
 ### Whole-run model guards
 
@@ -555,28 +602,27 @@ domain semantics or Tool safety.
 
 ## Advanced composition: conversation memory
 
-Use the same `session_id` to continue a conversation. When you need to select
-stores, sinks, authorization, checkpoints, Skills, custom engines, or other
-advanced components, use the explicit `Agent(...)` constructor.
+Use the same `session_id` to continue a conversation. `Agent.create()` accepts
+the common stores, memory policy, authorization, checkpoints, Skills, and
+observability components. Use the explicit constructor for lower-level
+composition such as a separate planning model, custom planner or policy,
+detailed Tool recovery, or a custom Engine.
 
 ```python
-from moduagent import (
-    Agent,
-    AgentConfig,
-    InMemoryConversationStore,
-    RecentTurnsConversationMemoryPolicy,
+from moduagent import Agent, InMemoryConversationStore, RecentTurnsConversationMemoryPolicy
+
+conversations = InMemoryConversationStore(
+    ttl_seconds=3600,
+    max_sessions=1_000,
+    max_total_bytes=16_000_000,
 )
 
-conversations = InMemoryConversationStore(ttl_seconds=3600)
-
-memory_agent = Agent(
-    config=AgentConfig(
-        name="memory-assistant",
-        instructions="Use relevant conversation context when answering.",
-    ),
+memory_agent = Agent.create(
+    name="memory-assistant",
+    instructions="Use relevant conversation context when answering.",
     model=model,
     conversation_store=conversations,
-    conversation_memory_policy=RecentTurnsConversationMemoryPolicy(max_turns=6),
+    memory=RecentTurnsConversationMemoryPolicy(max_turns=6),
 )
 
 async def demonstrate_memory() -> None:
@@ -689,27 +735,30 @@ Use an `EventSink` or `stream_all()` for the execution timeline. Add a
 
 ```python
 import asyncio
+import logging
 
-from moduagent import InMemoryDiagnosticSink, LoggingEventSink
+from moduagent import Agent, InMemoryDiagnosticSink, LoggingEventSink
 
+logging.basicConfig(level=logging.INFO)
 diagnostics = InMemoryDiagnosticSink(max_records=1_000)
 
-observable_agent = Agent(
-    config=AgentConfig(
-        name="observable-agent",
-        instructions="Complete the request using the available Tools.",
-    ),
+observable_agent = Agent.create(
+    name="observable-agent",
+    instructions="Complete the request using the available Tools.",
     model=model,
     tools=[add],
     event_sink=LoggingEventSink(),
     diagnostic_sink=diagnostics,
-    diagnostic_timeout_seconds=0.25,
-    diagnostic_max_pending_deliveries=1_024,
 )
 
 
 async def main() -> None:
     result = await observable_agent.run("Use add for 20 + 22.")
+    print(dict(result.run_usage))
+    for trace in result.tool_trace:
+        print(dict(trace))
+    if result.error_summary:
+        print(dict(result.error_summary))
 
     if result.failure_id is not None:
         failure = diagnostics.get(result.failure_id)
@@ -723,7 +772,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`result.metadata["tool_trace"]` shows executed Tools and their correlation IDs.
+`result.tool_trace` shows executed Tools and their correlation IDs.
 `result.failure_id` identifies the root failure of a terminal run. Its Tool
 record can have `terminal=False` because that flag means “recoverable when
 captured”; the Plan policy may decide to stop afterward. Recovered Tool
@@ -776,11 +825,9 @@ from moduagent import InMemoryCheckpointStore
 
 checkpoints = InMemoryCheckpointStore()
 
-resumable_agent = Agent(
-    config=AgentConfig(
-        name="resumable-agent",
-        instructions="Complete the request safely.",
-    ),
+resumable_agent = Agent.create(
+    name="resumable-agent",
+    instructions="Complete the request safely.",
     model=model,
     tools=[add],
     conversation_store=InMemoryConversationStore(),
@@ -855,11 +902,9 @@ def lookup_invoice(invoice_id: str) -> dict[str, object]:
 
 skills = SkillRegistry.from_paths("./examples/skills")
 
-agent = Agent(
-    config=AgentConfig(
-        name="invoice-agent",
-        instructions="Use verified evidence only.",
-    ),
+agent = Agent.create(
+    name="invoice-agent",
+    instructions="Use verified evidence only.",
     model=model,
     tools=[lookup_invoice],
     skill_registry=skills,
@@ -984,6 +1029,9 @@ Use Redis or a durable custom store for multi-process or restart-safe systems.
   and PostgreSQL query backends.
 - [Invoice review Skill](https://github.com/nagix999/moduagent/tree/main/examples/skills/invoice-review):
   Skill instructions, references, and assets.
+- [Production controls](https://github.com/nagix999/moduagent/blob/main/examples/PRODUCTION.md):
+  authorized idempotent writes, bounded memory, durable resume, cancellation,
+  and concurrent-session guidance.
 
 ## Documentation
 

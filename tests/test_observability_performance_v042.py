@@ -219,6 +219,15 @@ def test_performance_metrics_capture_phase_and_io_durations() -> None:
                 {"phase": "act", "duration_seconds": 0.25},
             ),
             AgentEvent(
+                EventType.MODEL_FAILED,
+                "timed-run",
+                {
+                    "phase": "act",
+                    "code": "model_timeout",
+                    "duration_seconds": 0.4,
+                },
+            ),
+            AgentEvent(
                 EventType.MEMORY_COMPACTED,
                 "timed-run",
                 {"phase": "act", "duration_seconds": 0.05},
@@ -242,10 +251,25 @@ def test_performance_metrics_capture_phase_and_io_durations() -> None:
             await metrics.publish(event)
 
         assert recorder.counters[("moduagent.model.calls", (("phase", "act"),))] == 1
+        assert (
+            recorder.counters[
+                (
+                    "moduagent.model.calls.failed",
+                    (("code", "model_timeout"), ("phase", "act")),
+                )
+            ]
+            == 1
+        )
         assert recorder.counters[("moduagent.checkpoint.saves", ())] == 1
         assert recorder.observations[
             ("moduagent.model.duration_seconds", (("phase", "act"),))
         ] == [0.25]
+        assert recorder.observations[
+            (
+                "moduagent.model.failed_duration_seconds",
+                (("code", "model_timeout"), ("phase", "act")),
+            )
+        ] == [0.4]
         assert recorder.observations[
             ("moduagent.memory.prepare_seconds", (("phase", "act"),))
         ] == [0.05]

@@ -29,13 +29,13 @@ from moduagent.models import (
     ModelClient,
     ModelCapabilities,
     ModelErrorClassification,
+    ModelOutputIncompleteError,
     ModelProtocolError,
     ModelRequest,
     ModelResponse,
     classify_model_error,
     validate_request_capabilities,
 )
-from moduagent.observability.diagnostics import NoopDiagnosticSink
 from moduagent.runtime.events import AgentEvent
 from moduagent.runtime.events import EventType
 from moduagent.runtime.events import EventVisibility
@@ -196,6 +196,37 @@ class RuntimeServices:
         if context is None:
             raise ExecutionInvariantError("ModelGateway is not bound to a run")
         return await self._complete_model(context, model, request, phase=phase)
+
+    async def prepare_auxiliary_model_request(
+        self,
+        request: ModelRequest,
+        *,
+        model: ModelClient,
+        phase: str,
+        skill_phase: str | None,
+        protected_from: int,
+    ) -> ModelRequest:
+        """Apply the run's Memory and Skill view to planner-style requests."""
+
+        context = self._bound_context
+        if context is None:
+            raise ExecutionInvariantError("ModelGateway is not bound to a run")
+        options = (
+            dict(context.config.model_options) if model is self.runtime.model else {}
+        )
+        options.update(request.options)
+        options.pop("tools", None)
+        if not request.tools:
+            options.pop("tool_choice", None)
+            options.pop("parallel_tool_calls", None)
+        request = replace(request, options=options)
+        return await self.prepare_model_request(
+            context,
+            request,
+            phase=phase,
+            skill_phase=skill_phase,
+            protected_from=protected_from,
+        )
 
     async def _before_model_attempt(
         self,
@@ -431,14 +462,6 @@ class RuntimeServices:
         context: EngineContext,
         response: ModelResponse,
     ) -> Any:
-        reporter = getattr(self.runtime, "diagnostic_reporter", None)
-        if reporter is None or isinstance(
-            getattr(reporter, "sink", None),
-            NoopDiagnosticSink,
-        ):
-            # Preserve the 0.4 codec exception and terminal classification when
-            # diagnostics are disabled, including an explicit no-op sink.
-            return self.runtime.output_codec.decode(response)
         try:
             return self.runtime.output_codec.decode(response)
         except OutputValidationError:
@@ -511,9 +534,11 @@ class RuntimeServices:
             )
             await self._queue_model_started(
                 context,
+                request=request,
                 attempt=attempt,
                 phase=phase,
                 model_turn=guard_snapshot.model_turns,
+                streaming=False,
             )
             attempt_started = asyncio.get_running_loop().time()
             try:
@@ -530,6 +555,7 @@ class RuntimeServices:
                     response=response,
                     attempt=attempt,
                     phase=phase,
+                    model_turn=guard_snapshot.model_turns,
                     duration_seconds=max(
                         0.0,
                         asyncio.get_running_loop().time() - attempt_started,
@@ -549,10 +575,26 @@ class RuntimeServices:
                 if isinstance(exc, ModelGuardTripped):
                     raise
                 classification = classify_model_error(exc)
-                if (
+                duration_seconds = max(
+                    0.0,
+                    asyncio.get_running_loop().time() - attempt_started,
+                )
+                terminal = (
                     not classification.retryable
                     or attempt >= context.config.retry.max_attempts
-                ):
+                )
+                await self._queue_model_failed(
+                    context,
+                    attempt=attempt,
+                    phase=phase,
+                    model_turn=guard_snapshot.model_turns,
+                    duration_seconds=duration_seconds,
+                    error=exc,
+                    classification=classification,
+                    retryable=classification.retryable,
+                    terminal=terminal,
+                )
+                if terminal:
                     await self._capture_exception(
                         context,
                         exc,
@@ -579,6 +621,8 @@ class RuntimeServices:
                     phase=phase,
                     error=exc,
                     classification=classification,
+                    model_turn=guard_snapshot.model_turns,
+                    duration_seconds=duration_seconds,
                 )
                 delay = min(
                     context.config.retry.delay_for(attempt),
@@ -650,9 +694,11 @@ class RuntimeServices:
             )
             await self._queue_model_started(
                 context,
+                request=request,
                 attempt=attempt,
                 phase=phase,
                 model_turn=guard_snapshot.model_turns,
+                streaming=True,
             )
             attempt_started = asyncio.get_running_loop().time()
             try:
@@ -703,6 +749,7 @@ class RuntimeServices:
                     response=response,
                     attempt=attempt,
                     phase=phase,
+                    model_turn=guard_snapshot.model_turns,
                     duration_seconds=max(
                         0.0,
                         asyncio.get_running_loop().time() - attempt_started,
@@ -723,7 +770,23 @@ class RuntimeServices:
                     raise
                 classification = classify_model_error(exc)
                 retryable = classification.retryable and not emitted_output
-                if not retryable or attempt >= context.config.retry.max_attempts:
+                duration_seconds = max(
+                    0.0,
+                    asyncio.get_running_loop().time() - attempt_started,
+                )
+                terminal = not retryable or attempt >= context.config.retry.max_attempts
+                await self._queue_model_failed(
+                    context,
+                    attempt=attempt,
+                    phase=phase,
+                    model_turn=guard_snapshot.model_turns,
+                    duration_seconds=duration_seconds,
+                    error=exc,
+                    classification=classification,
+                    retryable=retryable,
+                    terminal=terminal,
+                )
+                if terminal:
                     await self._capture_exception(
                         context,
                         exc,
@@ -766,6 +829,8 @@ class RuntimeServices:
                     phase=phase,
                     error=exc,
                     classification=classification,
+                    model_turn=guard_snapshot.model_turns,
+                    duration_seconds=duration_seconds,
                 )
                 delay = min(
                     context.config.retry.delay_for(attempt),
@@ -795,6 +860,19 @@ class RuntimeServices:
     ) -> str | None:
         """Capture a sanitized failure without letting observability alter a run."""
 
+        if set_primary:
+            self._record_primary_failure_summary(
+                context,
+                component=component,
+                operation=operation,
+                phase=phase,
+                step_id=step_id,
+                attempt=attempt,
+                category=category,
+                code=code,
+                retryable=retryable,
+                preserve_failure_id=False,
+            )
         reporter = getattr(self.runtime, "diagnostic_reporter", None)
         capture = getattr(reporter, "capture_exception", None)
         if not callable(capture):
@@ -821,15 +899,8 @@ class RuntimeServices:
             if not set_primary:
                 return failure_id
             context.run.primary_failure = {
+                **dict(context.run.primary_failure or {}),
                 "failure_id": failure_id,
-                "component": component,
-                "operation": operation,
-                **({} if phase is None else {"phase": phase}),
-                **({} if step_id is None else {"step_id": step_id}),
-                **({} if attempt is None else {"attempt": attempt}),
-                "category": category,
-                "code": code,
-                "retryable": retryable,
             }
             return failure_id
         return None
@@ -846,10 +917,13 @@ class RuntimeServices:
         category: str,
         code: str,
         retryable: bool,
+        preserve_failure_id: bool = True,
     ) -> None:
         existing = context.run.primary_failure
         failure_id = (
-            existing.get("failure_id") if isinstance(existing, Mapping) else None
+            existing.get("failure_id")
+            if preserve_failure_id and isinstance(existing, Mapping)
+            else None
         )
         context.run.primary_failure = {
             **(
@@ -1128,9 +1202,7 @@ class RuntimeServices:
             raise ModelProtocolError("finalization returned tool calls")
         finish_reason = (response.finish_reason or "").lower()
         if finish_reason in {"timeout", "length", "max_tokens"}:
-            raise ModelProtocolError(
-                f"incomplete finalization response ({finish_reason})"
-            )
+            raise ModelOutputIncompleteError(finish_reason)
         output = self.decode_output(context, response)
         content = response.message.content
         if content is None or not str(content).strip():
@@ -1402,6 +1474,8 @@ class RuntimeServices:
         phase: str,
         error: Exception,
         classification: ModelErrorClassification,
+        model_turn: int,
+        duration_seconds: float,
     ) -> None:
         event = AgentEvent(
             EventType.RETRY,
@@ -1414,6 +1488,8 @@ class RuntimeServices:
                 "error_type": type(error).__name__,
                 "code": classification.code,
                 "retryable": classification.retryable,
+                "model_turn": model_turn,
+                "duration_seconds": duration_seconds,
             },
         )
         await self._enqueue_event(await self.publish_event(context, event))
@@ -1422,9 +1498,11 @@ class RuntimeServices:
         self,
         context: EngineContext,
         *,
+        request: ModelRequest,
         attempt: int,
         phase: str,
         model_turn: int,
+        streaming: bool,
     ) -> None:
         await self.defer_event(
             context,
@@ -1436,6 +1514,43 @@ class RuntimeServices:
                     "attempt": attempt,
                     "model_turn": model_turn,
                     "phase": phase,
+                    "message_count": len(request.messages),
+                    "tool_count": len(request.tools),
+                    "has_output_schema": request.output_schema is not None,
+                    "streaming": streaming,
+                },
+                visibility=EventVisibility.INTERNAL,
+            ),
+        )
+
+    async def _queue_model_failed(
+        self,
+        context: EngineContext,
+        *,
+        attempt: int,
+        phase: str,
+        model_turn: int,
+        duration_seconds: float,
+        error: Exception,
+        classification: ModelErrorClassification,
+        retryable: bool,
+        terminal: bool,
+    ) -> None:
+        await self.defer_event(
+            context,
+            AgentEvent(
+                EventType.MODEL_FAILED,
+                context.run.run_id,
+                {
+                    "step": context.run.step,
+                    "attempt": attempt,
+                    "model_turn": model_turn,
+                    "phase": phase,
+                    "duration_seconds": duration_seconds,
+                    "error_type": type(error).__name__,
+                    "code": classification.code,
+                    "retryable": retryable,
+                    "terminal": terminal,
                 },
                 visibility=EventVisibility.INTERNAL,
             ),
@@ -1448,6 +1563,7 @@ class RuntimeServices:
         response: ModelResponse,
         attempt: int,
         phase: str,
+        model_turn: int,
         duration_seconds: float,
     ) -> None:
         await self.defer_event(
@@ -1458,6 +1574,7 @@ class RuntimeServices:
                 {
                     "step": context.run.step,
                     "attempt": attempt,
+                    "model_turn": model_turn,
                     "phase": phase,
                     "duration_seconds": duration_seconds,
                     "usage": response.usage,
@@ -1868,6 +1985,7 @@ def _memory_phase(value: str) -> MemoryPhase:
     normalized = value.lower()
     aliases = {
         "act_tool": MemoryPhase.ACT,
+        "replan": MemoryPhase.PLAN,
         "tool_recovery": MemoryPhase.ACT,
         "tool_repair": MemoryPhase.ACT,
     }

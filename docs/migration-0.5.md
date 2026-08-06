@@ -7,10 +7,30 @@
 0.5는 기존 `Agent(config=..., model=..., ...)`, 실행 Profile, `function_tool`, `run()`과 저장 계약을 유지하면서 일반적인 구성을 위한 Quick API를 추가합니다. 도메인 Tool, 프롬프트, schema, 안전 정책과 운영 컴포넌트는 계속 애플리케이션이 결정합니다.
 
 ```bash
-python -m pip install --upgrade "moduagent==0.5.0"
+python -m pip install --upgrade "moduagent==0.5.2"
 ```
 
 대부분의 코드는 생성 방식을 즉시 바꿀 필요가 없습니다. 다만 모델 retry가 strict allowlist로 바뀌고 모든 run에 유한한 model turn/no-progress guard가 적용되므로, 먼저 기존 API 그대로 회귀 테스트한 뒤 Quick API를 점진적으로 적용하세요.
+
+### 0.5.2 안정화 항목
+
+- `Agent.create()`가 checkpoint, Tool authorizer, Skill, 진단 전달 한도와
+  `AgentConfig`의 일반 필드를 직접 받는다. 기존 명시적 생성자는 그대로
+  유지된다.
+- built-in PLAN/replan 요청도 설정한 `ConversationMemoryPolicy`를 적용한다.
+  요약 정책을 사용하면 planning 전에 요약 model turn이 추가될 수 있으므로
+  `max_model_turns`와 latency 예산을 다시 측정한다. 같은 모델을 쓰는 Quick
+  API PLAN에는 `AgentConfig.model_options`가 적용된다. 별도 planning 모델은
+  main 모델 옵션을 상속하지 않으며 `LLMPlanGenerator(options=...,
+  provider_options=...)`로 독립 설정한다.
+- `InMemoryConversationStore`의 `max_sessions`, `max_total_bytes`는 opt-in이다.
+  지정하지 않으면 기존의 무제한 용량 동작이 유지되며, 지정하면 세션 단위 LRU
+  eviction을 적용한다. 0.5.2부터 retained row와 byte 회계의 불변성을 위해
+  메시지를 canonical JSON으로 보관하므로 metadata와 Tool arguments는 JSON으로
+  직렬화할 수 있어야 하고 tuple 같은 값은 load 시 JSON 형태로 정규화될 수 있다.
+- OpenAI 호환 및 Ollama `embed()`는 응답 개수, index, 빈 벡터, 차원과 유한
+  숫자를 엄격하게 검증한다. 과거에 잘못된 provider 응답을 허용하던 adapter는
+  첫 응답에서 `ModelProtocolError`로 종료한다.
 
 ## 변경 요약
 
@@ -65,6 +85,12 @@ agent = Agent.create(
 | `output=PydanticModel` | `PydanticOutputCodec(PydanticModel)` |
 | `output=codec` | 전달한 `OutputCodec`을 그대로 사용 |
 | `memory=policy` | 전달한 `ConversationMemoryPolicy` |
+| `conversation_store`, `checkpoint_store` | 전달한 저장소를 그대로 사용 |
+| `event_sink`, `diagnostic_sink` | 전달한 관측성 구성 요소를 그대로 사용 |
+| `diagnostic_timeout_seconds`, `diagnostic_max_pending_deliveries` | 진단 전달 시간과 대기열 상한으로 사용 |
+| `tool_authorizer` | 전달한 Tool 인가 경계를 그대로 사용 |
+| `skill_registry`, `skill_selector`, `skill_limits` | 전달한 Skill 구성 요소를 그대로 사용 |
+| `model_options`, `metadata`, `finalization_mode`, `stream_visibility` | 기존 `AgentConfig` 필드로 전달 |
 
 Quick Plan 구성은 중복되던 Planner와 Engine의 `max_steps`를 한 곳에 둡니다.
 
@@ -84,10 +110,6 @@ agent = Agent.create(
 
 - 별도 planning model 또는 custom `PlanGenerator`
 - custom `DecisionPolicy`나 `ExecutionEngine`
-- `ConversationStore`, `CheckpointStore`
-- event/diagnostic sink
-- `ToolAuthorizer`
-- Skill registry와 selector
 - 상세 Tool failure recovery
 
 Quick API와 명시적 API를 한 Agent에서 중첩 조립하지 말고 필요한 제어 수준에 맞는 진입점 하나를 선택하세요. `Agent.inspect()`로 resolved Profile, Tool/output 계약과 안전 한도를 배포 전에 확인합니다.

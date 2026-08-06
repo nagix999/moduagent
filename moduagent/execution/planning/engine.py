@@ -1344,6 +1344,7 @@ class PlanExecutionEngine(CodecBackedEngine[PlanEngineState]):
         has_tools: bool,
     ) -> dict[str, Any]:
         options = dict(context.config.model_options)
+        options.pop("tools", None)
         if not has_tools:
             options.pop("tool_choice", None)
             options.pop("parallel_tool_calls", None)
