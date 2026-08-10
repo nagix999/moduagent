@@ -7,10 +7,43 @@
 0.5는 기존 `Agent(config=..., model=..., ...)`, 실행 Profile, `function_tool`, `run()`과 저장 계약을 유지하면서 일반적인 구성을 위한 Quick API를 추가합니다. 도메인 Tool, 프롬프트, schema, 안전 정책과 운영 컴포넌트는 계속 애플리케이션이 결정합니다.
 
 ```bash
-python -m pip install --upgrade "moduagent==0.5.2"
+python -m pip install --upgrade "moduagent==0.5.3"
 ```
 
 대부분의 코드는 생성 방식을 즉시 바꿀 필요가 없습니다. 다만 모델 retry가 strict allowlist로 바뀌고 모든 run에 유한한 model turn/no-progress guard가 적용되므로, 먼저 기존 API 그대로 회귀 테스트한 뒤 Quick API를 점진적으로 적용하세요.
+
+### 0.5.3 안전 보완 항목
+
+- Legacy `AgentTool`은 실제 child `AgentResult`를 성공 여부 검사 없이 output만
+  반환하지 않는다. Child timeout, cancellation, model guard, output validation,
+  실행 한도와 기타 terminal 실패는 안정적인 Tool failure가 되며, 실패
+  `output=None`이 Tool success로 보이지 않는다. 정상 child output과 기존
+  생성자 signature는 그대로 유지된다.
+- Canonical child terminal result와 직접 framework 실패는 legacy delegation
+  경계에서 non-retryable이다. 일반 Tool retry 횟수, 변경 인자 repair,
+  timeout retry 또는 `idempotent=True`만으로는 다시 실행하지 않는다.
+  사용자 정의 Agent-like가 명시적으로 발생시킨 pre-classified `ToolFailure`의
+  안전 계약은 보존한다. 이 PATCH는 root 예산, cycle/depth guard, receipt 또는
+  exactly-once 위임을 추가하지 않는다.
+- Parent와 legacy `AgentTool` child가 정확히 같은 `ConversationStore` 객체를
+  사용하면 조립 시 경고한다. Legacy adapter가 같은 `session_id`를 전달해 Context
+  Memory 기록을 섞을 수 있기 때문이다. 0.5.3은 session을 자동 변경하지 않으므로
+  legacy 위임에서는 저장소를 분리한다. 서로 다른 adapter 객체가 같은 원격
+  namespace를 가리키는지는 이 경고가 판별하지 못한다.
+- `ConversationMemoryPolicy`는 현재 session의 요청 범위를 만드는 Context
+  Memory다. Cross-session 사실·선호·episode를 검색하는 Long-Term Memory가
+  아니다. `FullConversationMemoryPolicy`는 호환 기본값이지만 token 상한이 없어
+  운영에 권장하지 않는다. 프로덕션에서는 배포 모델의 exact counter를 사용하는
+  `TokenBudgetConversationMemoryPolicy`를 명시한다.
+- `RecentTurnsConversationMemoryPolicy`는 token을 계산하지 않는다.
+  `MEMORY_COMPACTED`의 `original_tokens=0`, `selected_tokens=0`은 0-token 요청이
+  아니라 미계수를 의미한다.
+
+0.5.2에서 0.5.3으로 올릴 때 저장 데이터 migration은 필요하지 않다. Checkpoint
+outer schema v4, event schema v1, built-in Engine state v1, Context Memory
+`MemorySnapshot`과 ConversationStore 형식은 모두 유지된다. 다만 과거에 실패한
+child를 성공으로 간주하는 로직에 의존했다면 의도적인 안전 수정에 맞게 Tool
+failure 처리를 추가한다.
 
 ### 0.5.2 안정화 항목
 
@@ -220,7 +253,7 @@ elif result.finish_reason is FinishReason.NO_PROGRESS:
 
 ## Checkpoint와 rolling 배포
 
-0.5는 outer checkpoint schema v4와 Engine state version을 유지하고 model guard의 digest·카운터 상태를 additive compatibility state로 저장합니다. 0.5에서 생성한 checkpoint를 resume하면 이미 소비한 model turn과 no-progress streak가 이어집니다.
+0.5는 outer checkpoint schema v4, event schema v1과 built-in Engine state v1을 유지하고 model guard의 digest·카운터 상태를 additive compatibility state로 저장합니다. 0.5에서 생성한 checkpoint를 resume하면 이미 소비한 model turn과 no-progress streak가 이어집니다. 0.5.3은 이 persistent 계약을 변경하지 않으므로 0.5.2 데이터에 대한 migration이 없습니다.
 
 `CheckpointStore`가 있으면 첫 호출과 각 provider retry의 turn 예약을 실제 provider I/O 직전 `before_model` durable boundary에 기록합니다. 저장이 실패하면 provider를 호출하지 않습니다. provider 요청 중 hard crash가 발생해도 resume은 예약된 turn을 다시 사용할 수 없습니다. 이 안전성 때문에 모델 호출마다 checkpoint write가 추가되므로 배포 전 저장소 latency와 처리량을 측정하세요.
 

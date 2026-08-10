@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import math
+import warnings
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, fields
 from enum import Enum
@@ -58,6 +59,7 @@ from moduagent.skills import (
 from moduagent.skills.runtime import SkillRuntime
 from moduagent.skills.tools import SkillReadTool, SkillSearchTool
 from moduagent.tools import (
+    AgentTool,
     AllowAllAuthorizer,
     Tool,
     ToolAuthorizer,
@@ -425,6 +427,10 @@ def compose_agent(
         if conversation_store is None
         else conversation_store
     )
+    _warn_if_agent_tool_shares_conversation_store(
+        registered_tools,
+        resolved_conversation_store,
+    )
     resolved_event_sink = NoopEventSink() if event_sink is None else event_sink
     resolved_diagnostic_sink = (
         NoopDiagnosticSink() if diagnostic_sink is None else diagnostic_sink
@@ -764,6 +770,39 @@ def _model_capabilities(model: ModelClient) -> ModelCapabilities:
     if not isinstance(capabilities, ModelCapabilities):
         raise TypeError("model capabilities must be a ModelCapabilities")
     return capabilities
+
+
+def _warn_if_agent_tool_shares_conversation_store(
+    tools: Iterable[Tool],
+    parent_store: ConversationStore,
+) -> None:
+    """Warn when a legacy AgentTool can mix parent and child transcripts.
+
+    AgentTool forwards the parent's session ID to the child. Object identity is
+    the only reliable store-identity signal in the current public Store SPI, so
+    this intentionally remains a best-effort diagnostic rather than a guard.
+    """
+
+    for tool in tools:
+        if not isinstance(tool, AgentTool):
+            continue
+        try:
+            child_runtime = getattr(tool.agent, "runtime", None)
+            child_store = getattr(child_runtime, "conversation_store", None)
+        except Exception:
+            # Diagnostics must not reject an otherwise valid custom Agent-like
+            # object whose attributes are implemented dynamically.
+            continue
+        if child_store is parent_store:
+            warnings.warn(
+                "AgentTool child shares the parent ConversationStore object; "
+                "delegating the same session_id can mix parent and child "
+                "transcripts. Use distinct stores until delegated session "
+                "namespaces are available.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            return
 
 
 def _supports_idempotent_append(store: ConversationStore) -> bool:

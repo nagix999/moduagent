@@ -157,7 +157,7 @@ def test_v4_snapshot_has_dual_version_guard_and_shared_engine_contract() -> None
 
 
 def test_snapshot_runtime_version_tracks_the_source_release() -> None:
-    assert SNAPSHOT_RUNTIME_VERSION == "0.5.2"
+    assert SNAPSHOT_RUNTIME_VERSION == "0.5.3"
     assert current_runtime_version() == SNAPSHOT_RUNTIME_VERSION
 
 

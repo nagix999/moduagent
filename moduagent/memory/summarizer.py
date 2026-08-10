@@ -14,6 +14,7 @@ from moduagent.messages import Message, Usage
 from moduagent.models import (
     ModelClient,
     ModelGateway,
+    ModelOutputIncompleteError,
     ModelProtocolError,
     ModelRequest,
     ModelResponse,
@@ -195,6 +196,14 @@ class ModelConversationSummarizer:
                 raise ModelProtocolError(
                     "conversation summarizer must return ModelResponse"
                 )
+            finish_reason = response.finish_reason
+            if finish_reason is not None and not isinstance(finish_reason, str):
+                raise ModelProtocolError(
+                    "conversation summarizer returned an invalid finish reason"
+                )
+            normalized_finish_reason = (finish_reason or "").lower()
+            if normalized_finish_reason in {"timeout", "length", "max_tokens"}:
+                raise ModelOutputIncompleteError(normalized_finish_reason)
             calls = response.tool_calls or response.message.tool_calls
             if calls:
                 raise ModelProtocolError("conversation summarizer returned Tool Calls")

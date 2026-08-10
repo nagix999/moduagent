@@ -1,11 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from typing import Any, Protocol, TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from moduagent.tools.base import ToolExecutionContext, ToolSchema
+from moduagent.errors import (
+    AgentRunError,
+    CancellationError,
+    ModelInvocationError,
+    OutputValidationError,
+    RunTimeoutError,
+)
+from moduagent.tools.base import (
+    ToolError,
+    ToolErrorType,
+    ToolExecutionContext,
+    ToolFailure,
+    ToolSchema,
+)
 
 if TYPE_CHECKING:
     from moduagent.runtime.context import AgentResult
@@ -25,6 +39,106 @@ class AgentToolInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     input: str = Field(description="Task or message to delegate to the agent")
+
+
+_TERMINAL_FAILURES: Mapping[str, tuple[ToolErrorType, str, str]] = {
+    "timeout": (
+        ToolErrorType.TIMEOUT,
+        "child_agent_timeout",
+        "delegated agent timed out",
+    ),
+    "cancelled": (
+        ToolErrorType.CANCELLED,
+        "child_agent_cancelled",
+        "delegated agent was cancelled",
+    ),
+    "max_steps": (
+        ToolErrorType.EXECUTION_ERROR,
+        "child_agent_max_steps",
+        "delegated agent exceeded its step limit",
+    ),
+    "max_tool_calls": (
+        ToolErrorType.EXECUTION_ERROR,
+        "child_agent_max_tool_calls",
+        "delegated agent exceeded its tool-call limit",
+    ),
+    "max_model_turns": (
+        ToolErrorType.EXECUTION_ERROR,
+        "child_agent_max_model_turns",
+        "delegated agent exceeded its model-turn limit",
+    ),
+    "no_progress": (
+        ToolErrorType.EXECUTION_ERROR,
+        "child_agent_no_progress",
+        "delegated agent stopped after making no progress",
+    ),
+}
+
+_MODEL_FAILURE_CATEGORIES = frozenset(
+    {
+        "model_client",
+        "model_invocation",
+        "model_protocol",
+        "model_provider",
+        "model_request",
+        "model_transport",
+    }
+)
+
+
+def _tool_failure(
+    error_type: ToolErrorType,
+    reason: str,
+    message: str,
+) -> ToolFailure:
+    """Create the payload-free failure exposed at the parent Tool boundary."""
+
+    return ToolFailure(
+        ToolError(
+            error_type,
+            message,
+            retryable=False,
+            details={},
+            reason=reason,
+            recovery=None,
+        )
+    )
+
+
+def _terminal_tool_failure(error: AgentRunError) -> ToolFailure:
+    mapped = _TERMINAL_FAILURES.get(error.finish_reason)
+    if mapped is not None:
+        return _tool_failure(*mapped)
+
+    if (
+        error.category == "output_validation"
+        or error.code == "output_validation_failed"
+    ):
+        return _tool_failure(
+            ToolErrorType.EXECUTION_ERROR,
+            "child_agent_output_validation_failed",
+            "delegated agent output validation failed",
+        )
+    if error.category in _MODEL_FAILURE_CATEGORIES or error.code == "model_timeout":
+        return _tool_failure(
+            ToolErrorType.EXECUTION_ERROR,
+            "child_agent_model_failed",
+            "delegated agent model invocation failed",
+        )
+    return _tool_failure(
+        ToolErrorType.EXECUTION_ERROR,
+        "child_agent_failed",
+        "delegated agent execution failed",
+    )
+
+
+def _raise_if_canonical_result_failed(result: Any) -> None:
+    # Import lazily: importing moduagent.runtime while the Tool package is
+    # initializing would cycle through decision.planning -> moduagent.tools.
+    from moduagent.runtime.context import AgentResult
+
+    if isinstance(result, AgentResult):
+        result.raise_for_error()
 
 
 class AgentTool:
@@ -84,9 +198,52 @@ class AgentTool:
         context: ToolExecutionContext | None = None,
     ) -> Any:
         context = context if context is not None else ToolExecutionContext()
-        result = await self.agent.run(
-            str(arguments["input"]),
-            session_id=context.session_id,
-            user_context=context.user_context,
-        )
-        return getattr(result, "output", result)
+        try:
+            result = await self.agent.run(
+                str(arguments["input"]),
+                session_id=context.session_id,
+                user_context=context.user_context,
+            )
+            _raise_if_canonical_result_failed(result)
+            return getattr(result, "output", result)
+        except asyncio.CancelledError:
+            # This task also represents the parent invocation. Translating its
+            # cancellation would swallow structured parent cancellation.
+            raise
+        except ToolFailure:
+            # A custom Agent-like implementation may deliberately publish an
+            # already-sanitized Tool contract. Preserve that explicit boundary
+            # instead of weakening or replacing its classification.
+            raise
+        except AgentRunError as exc:
+            raise _terminal_tool_failure(exc) from exc
+        except (asyncio.TimeoutError, RunTimeoutError) as exc:
+            raise _tool_failure(
+                ToolErrorType.TIMEOUT,
+                "child_agent_timeout",
+                "delegated agent timed out",
+            ) from exc
+        except CancellationError as exc:
+            raise _tool_failure(
+                ToolErrorType.CANCELLED,
+                "child_agent_cancelled",
+                "delegated agent was cancelled",
+            ) from exc
+        except OutputValidationError as exc:
+            raise _tool_failure(
+                ToolErrorType.EXECUTION_ERROR,
+                "child_agent_output_validation_failed",
+                "delegated agent output validation failed",
+            ) from exc
+        except ModelInvocationError as exc:
+            raise _tool_failure(
+                ToolErrorType.EXECUTION_ERROR,
+                "child_agent_model_failed",
+                "delegated agent model invocation failed",
+            ) from exc
+        except Exception as exc:
+            raise _tool_failure(
+                ToolErrorType.EXECUTION_ERROR,
+                "child_agent_invocation_failed",
+                "delegated agent invocation failed",
+            ) from exc

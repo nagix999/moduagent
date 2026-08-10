@@ -94,10 +94,13 @@ jobs:
               "tests/test_intermediate_incident_example_alpha.py",
               "tests/test_intermediate_release_example_alpha.py",
               "tests/test_model_output_incomplete.py",
+              "tests/test_agent_tool_v053.py",
               "tests/test_conversation_store_capacity_v052.py",
               "tests/test_embedding_contract_v052.py",
+              "tests/test_memory_diagnostics_v053.py",
               "tests/test_plan_memory_v052.py",
               "tests/test_production_controls_example_v052.py",
+              "tests/test_shared_store_warning_v053.py",
           }
           missing_files = {
               expected
@@ -141,5 +144,5 @@ jobs:
           /tmp/moduagent-venv/bin/python -m pip install /tmp/moduagent-wheel/moduagent-*.whl
           cd /tmp
           /tmp/moduagent-venv/bin/python -c \
-            "import moduagent; assert moduagent.__version__ == '0.5.2'"
+            "import moduagent; assert moduagent.__version__ == '0.5.3'"
           /tmp/moduagent-venv/bin/moduagent --help
