@@ -11,10 +11,10 @@ ModuAgent는 자체 모델 엔드포인트와 Python 함수를 바탕으로 AI �
 계획-실행(Plan-and-Execute), 체크포인트 복구, 스킬, 관측성 기능을 추가할 수
 있습니다.
 
-> 현재 버전: **0.5.3** · 상태: **Alpha** · Python **3.10+** · **MIT License**
+> 현재 버전: **0.6.0** · 상태: **Alpha** · Python **3.10+** · **MIT License**
 
 ModuAgent를 처음 사용한다면 아래의 짧은 다섯 단계를 따라갑니다. 이 단계는
-0.5 Quick API를 사용하며, 고급 조합에는 명시적인 구성 요소 API를 그대로
+안정된 Quick API를 사용하며, 고급 조합에는 명시적인 구성 요소 API를 그대로
 사용할 수 있습니다.
 한 번에 개념 하나씩 추가하는 실행 가능한 파일은
 [초급 예제](https://github.com/nagix999/moduagent/blob/main/examples/README.md)부터
@@ -35,7 +35,9 @@ Agent ──► Execution profile ──► Model
   │              │                │
   │              └──────────────► Tools
   │
-  ├── Conversation store + memory policy
+  ├── AgentDefinition + RuntimeBindings/Profile
+  ├── Conversation store + Context Memory
+  ├── Delegation coordinator + shared budget
   ├── Output codec
   ├── Checkpoint store
   ├── Skills and authorization
@@ -51,6 +53,10 @@ Agent ──► Execution profile ──► Model
 - 출력 코덱은 텍스트 또는 검증된 Pydantic 객체를 반환합니다.
 - 대화 저장소는 기록을 보관하고, 메모리 정책은 모델에 전달할 범위를 선택합니다.
 - 체크포인트 저장소는 중단된 실행을 저장하여 안전하게 복구할 수 있게 합니다.
+- `AgentDefinition`은 배포 의미를 고정하고 `RuntimeBindings`는 교체 가능한
+  엔드포인트, 저장소, 자격 증명, telemetry를 보관합니다.
+- 위임 조정기는 자식 모델 호출 전에 lineage, topology, deadline, 전체 예산,
+  세션 namespace, receipt를 검사합니다.
 
 대부분의 애플리케이션은 모델과 소수의 도구로 시작하는 것이 좋습니다.
 요구 사항이 생길 때 나머지 구성 요소를 추가합니다.
@@ -76,10 +82,10 @@ ModuAgent에는 Python 3.10 이상이 필요합니다. 접근 가능한 모델 �
 패키지를 설치합니다.
 
 ```bash
-python -m pip install "moduagent==0.5.3"
+python -m pip install "moduagent==0.6.0"
 ```
 
-패키지 인덱스에 아직 `0.5.3`이 없고 이미 0.5 소스를 체크아웃했다면 저장소
+패키지 인덱스에 아직 `0.6.0`이 없고 이미 0.6 소스를 체크아웃했다면 저장소
 루트에서 설치합니다.
 
 ```bash
@@ -597,7 +603,7 @@ provider metadata, provider가 만든 call ID는 보호 장치 상태에 저장�
 
 ## 프레임워크의 책임 범위
 
-ModuAgent 0.5에는 도메인 Recipe, Workflow DSL, 데이터베이스 추상화, SQL 생성
+ModuAgent 0.6에는 도메인 Recipe, Workflow DSL, 데이터베이스 추상화, SQL 생성
 또는 보고서 전용 동작이 포함되지 않습니다. 프레임워크는 구성 요소를 조합하고
 실행하며, 애플리케이션은 다음을 직접 담당합니다.
 
@@ -674,6 +680,84 @@ session이 길어지면 운영 endpoint의 context window를 초과할 수 있�
 참고합니다. vLLM의 exact token 계산을 반복한다면 counter를
 `CachingTokenCounter`로 감쌉니다. cache에는 크기가 제한된 keyed digest와
 성공한 token 수만 저장됩니다.
+
+긴 영속 session에는 0.6의 `DurableSummarizingConversationMemoryPolicy`를 사용할
+수 있습니다. 이 정책은 monotonic summary cursor 다음의 paginated tail만 읽고,
+tenant/Agent/session/policy가 결합된 summary v2 snapshot을 compare-and-swap으로
+저장합니다. 전체 blob을 읽은 뒤 page처럼 자르는 호환 fallback은 거부하며,
+conversation store가 native bounded `load_tail()`을 제공해야 합니다. Redis list
+mode, database repository, reset과 legacy summary migration 요구는 Context Memory
+가이드를 참고합니다.
+
+원본 history backend는 `ScopedConversationStore`로 감쌉니다. 안전한 기본값인
+`key_mode="shared"`는 같은 public session ID를 tenant/Agent별로 격리합니다. 0.5
+`MemorySnapshot`을 옮길 때는 전용 legacy state namespace를
+`ScopedLegacyMemoryStateStore`로 묶어 `legacy_state_store=`에 전달합니다. 첫 v2
+miss에서 loader는 canonical prefix를 bounded page로 두 번 읽고 message count,
+digest, store가 부여한 ID와 두 pass가 모두 일치할 때만 v2를 저장합니다.
+`ContextAssembler`는 system/Skill 정책, 현재 task/run, Tool protocol,
+Tool/output schema, optional summary와 최근 complete turn을 하나의 예산으로
+계산합니다. 새 summary는 실제 선택됐을 때만 저장하며, 이미 저장된 summary나 CAS
+winner가 맞지 않으면 이를 생략하고 필수 항목과 recent-only request로 계속합니다.
+
+## 고급 조합: 버전이 고정된 Agent에 위임
+
+Agent가 다른 Agent를 호출해야 하면 `Agent.as_tool()`을 사용합니다. 두 Agent에는
+exact-version `AgentDefinition`이 있고 registry는 그 버전만 해석합니다.
+Coordinator는 자식 model 호출 전에 인가, topology, cycle/depth, deadline, 전체
+model/Tool 예산, 자식 session 격리와 receipt를 검사합니다.
+
+```python
+from moduagent import (
+    Agent,
+    AgentEndpoint,
+    DefinitionStatus,
+    InMemoryAgentRegistry,
+    RuntimeBindings,
+)
+from moduagent.delegation import DelegationCoordinator, DelegationPolicy
+
+registry = InMemoryAgentRegistry()
+registry.register(
+    specialist_definition,
+    AgentEndpoint(handler=specialist, approved=True),
+    status=DefinitionStatus.ACTIVE,
+)
+coordinator = DelegationCoordinator(
+    registry=registry,
+    policy=DelegationPolicy(
+        allowed_edges={"supervisor": {"specialist"}},
+        allowed_tenants={"tenant-a"},
+        allowed_principals={"analyst-1"},
+    ),
+)
+ask_specialist = specialist.as_tool(
+    coordinator=coordinator,
+    caller=supervisor_definition.ref,
+    input_model=ResearchRequest,
+    output_model=ResearchAnswer,
+    name="ask_specialist",
+)
+supervisor = Agent.create(
+    name="supervisor",
+    model=model,
+    instructions="Delegate specialist work, then answer.",
+    tools=(ask_specialist,),
+    definition=supervisor_definition,
+    runtime_bindings=RuntimeBindings(
+        tenant_context_provider=lambda: "tenant-a",
+        principal_context_provider=lambda: "analyst-1",
+    ),
+)
+```
+
+Pydantic 계약과 두 definition까지 포함한
+[오프라인 실행 예제 및 운영 가이드](https://github.com/nagix999/moduagent/blob/main/docs/delegation.md)를
+참고합니다. 인메모리 registry, budget, receipt는 단일 프로세스 개발용입니다.
+운영 위임에는 영속 atomic-CAS 저장소, 모든 worker에서 같은 HMAC secret/namespace,
+격리된 자식 session과 외부 side effect의 애플리케이션 idempotency가 필요합니다.
+Legacy `AgentTool`은 호환을 위해 남지만 execution-group 보장을 제공하지 않으며
+Production profile에서 거부됩니다.
 
 ### 애플리케이션 예제: 리포트 자동화
 
@@ -874,6 +958,14 @@ async def resume_if_safe() -> None:
 `InMemoryCheckpointStore`는 동일한 프로세스 안에서의 복구만 보여 주는
 예제입니다. 프로세스가 종료되면 모든 체크포인트가 사라집니다.
 
+ModuAgent 0.6은 checkpoint envelope v5와 event envelope v2를 기록하며 built-in
+Engine state는 v1을 유지합니다. `migrate_checkpoint_payload()`를 통해 checkpoint
+v1-v4를 읽을 수 있지만 0.5.x는 v5를 읽지 못합니다. Durable Context Memory는
+독립된 summary schema v2를 사용합니다. 서로 다른 버전의 worker가 같은 저장
+namespace를 사용하거나 rollback을 준비하기 전에
+[0.6 마이그레이션 가이드](https://github.com/nagix999/moduagent/blob/main/docs/migration-0.6.md)를
+확인합니다.
+
 - `retryable`은 새 실행을 시도할 수 있다는 의미입니다.
 - `resumable`은 안전하지 않은 부작용을 재실행하지 않고 저장된 실행을
   이어갈 수 있다는 의미입니다.
@@ -972,6 +1064,9 @@ print(spec.to_dict(include_instructions=False))
 
 - 인메모리 대화, 체크포인트, 요약 저장소를 영속 저장소로
   교체합니다.
+- 위임에서는 인메모리 registry, budget ledger와 receipt store를 exact-version 및
+  atomic-CAS 영속 구현으로 교체하고 worker 전체에서 같은 HMAC secret과 namespace를
+  유지합니다.
 - 모델, 도구, 데이터베이스, 전체 실행의 시간 제한을 각각 설정합니다.
 - 동기 Python 도구에 적용한 시간 제한은 실행 중인 스레드를 강제로 멈출 수
   없습니다. 드라이버 또는 서버 측 명령문 시간 제한도 설정합니다.
@@ -979,6 +1074,14 @@ print(spec.to_dict(include_instructions=False))
   도구 호출 수를 제한합니다.
 - 도구의 부작용을 검토한 뒤에만 재시도 또는 변경된 인자를 사용한 복구가
   안전하다고 선언합니다.
+- 모든 Production 도구를 `none`, `read`, `advisory`, `write` 중 하나로
+  분류합니다. 0.6 Production profile은 앞의 세 분류만 허용하고 검증 후 Tool
+  registry를 동결합니다. write 도구는 향후 실제 승인 집행 계층이 제공될 때까지
+  fail closed됩니다.
+- 같은 Python 프로세스에 로드된 model, Tool, adapter, composition 코드는 신뢰된
+  배포 코드로 취급합니다. Registry 동결은 지원되는 검증 후 교체 API를 막지만,
+  객체를 직접 변조하거나 프로세스를 monkey patch하는 코드를 격리하는 sandbox는
+  아닙니다.
 - 쓰기 도구에는 애플리케이션 수준의 멱등성 키와 중복 처리를 적용합니다.
 - `ToolAuthorizer` 또는 RBAC를 사용합니다. 스킬의 `allowed-tools`는 범위를
   좁힐 뿐입니다.
@@ -990,6 +1093,9 @@ print(spec.to_dict(include_instructions=False))
   보존 기간, TTL을 설정합니다.
 - 배포 설정과 함께 `agent.inspect()` 결과를 기록하고, 운영 중인 에이전트를
   업그레이드하기 전에 재개 동작을 테스트합니다.
+- `RuntimeAttestation`은 애플리케이션이 소유하는 Test profile 메타데이터입니다.
+  canonical digest는 선언된 사실의 우발적 교체를 찾지만 서명이나 보안 경계는
+  아닙니다. 신뢰된 배포 코드에서 생성하고 prompt나 요청 payload에서 받지 않습니다.
 - 공개 스트림은 사용자에게 보내고 내부 이벤트는 보호된 `EventSink`로
   보냅니다. 오류 진단은 별도로 접근이 통제된 `DiagnosticSink`에 저장합니다.
 
@@ -1035,6 +1141,7 @@ Redis 또는 영속 사용자 정의 저장소를 사용합니다.
 | 실행 방식 선택 | `StandardExecutionProfile`, `PlanExecutionProfile` |
 | 출력 검증 | `PydanticOutputCodec`, `TextOutputCodec` |
 | 제한된 session 문맥 유지 | `ConversationStore`, `RecentTurnsConversationMemoryPolicy` |
+| 타입이 있는 자식 작업 위임 | `AgentDefinition`, `Agent.as_tool()`, `moduagent.delegation.DelegationCoordinator` |
 | 작업 재개 | `CheckpointStore`, `Agent.resume()` |
 | 도메인 절차 추가 | `SkillRegistry`, `SkillSelector` |
 | 실행 관측 | `Agent.stream_all()`, `EventSink`, `DiagnosticSink`, `failure_id` |
@@ -1063,6 +1170,8 @@ Redis 또는 영속 사용자 정의 저장소를 사용합니다.
   엄격한 상태 머신과 복구 세부 정보를 설명합니다.
 - [Context Memory](https://github.com/nagix999/moduagent/blob/main/docs/conversation-memory-policy.md):
   제한된 session 문맥, token 예산, 요약을 설명합니다.
+- [Agent 위임](https://github.com/nagix999/moduagent/blob/main/docs/delegation.md):
+  버전이 고정된 자식 Agent, 전체 예산, receipt와 운영 경계를 설명합니다.
 - [에이전트 스킬](https://github.com/nagix999/moduagent/blob/main/docs/skills.md):
   재사용 가능한 절차와 리소스 접근을 설명합니다.
 - [Operations](https://github.com/nagix999/moduagent/blob/main/docs/operations.md):
@@ -1074,6 +1183,8 @@ Redis 또는 영속 사용자 정의 저장소를 사용합니다.
   소스 호환성과 체크포인트 마이그레이션을 설명합니다.
 - [0.5 마이그레이션](https://github.com/nagix999/moduagent/blob/main/docs/migration-0.5.md):
   Quick API, 안전성 변경과 migration이 필요 없는 0.5.3 PATCH를 설명합니다.
+- [0.6 마이그레이션](https://github.com/nagix999/moduagent/blob/main/docs/migration-0.6.md):
+  definition, delegation, checkpoint/event/summary schema와 배포 제한을 설명합니다.
 - [Changelog](https://github.com/nagix999/moduagent/blob/main/CHANGELOG.md)
 
 ## 개발

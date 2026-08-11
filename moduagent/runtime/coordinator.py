@@ -10,6 +10,7 @@ import uuid
 from collections.abc import AsyncIterator, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -40,6 +41,7 @@ from moduagent.execution.base import (
     ExecutionEngine,
 )
 from moduagent.execution.standard import StandardExecutionEngine
+from moduagent.delegation.budget import BudgetExceeded
 from moduagent.messages import FinishReason, Message, MessageRole
 from moduagent.memory import (
     ConversationMemoryOverflowError,
@@ -56,6 +58,7 @@ from moduagent.observability.sinks import (
     _event_sink_requires_coordinator_copy,
 )
 from moduagent.persistence import RunCheckpoint, RunSnapshot
+from moduagent.persistence.snapshot import identity_scope_digest
 from moduagent.runtime.context import (
     AgentResult,
     RunContext,
@@ -166,6 +169,69 @@ def _consume_task_result(task: asyncio.Task[Any]) -> None:
         pass
 
 
+def _optional_runtime_identifier(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _required_identity_claim(value: Any) -> str:
+    claim = _optional_runtime_identifier(value)
+    if claim is None or len(claim) > 256 or not claim.isprintable():
+        raise ConfigurationError("trusted identity claim is missing or invalid")
+    return claim
+
+
+def _identity_from_mapping(
+    value: Mapping[str, Any],
+    keys: tuple[str, ...],
+) -> str | None:
+    for key in keys:
+        if key in value and value[key] is not None:
+            return _required_identity_claim(value[key])
+    return None
+
+
+async def _resolve_identity_provider(
+    provider: Any,
+    user_context: Mapping[str, Any],
+    *,
+    keys: tuple[str, ...],
+) -> str | None:
+    if provider is None:
+        return None
+    resolver = getattr(provider, "resolve", None)
+    if not callable(resolver):
+        resolver = provider if callable(provider) else None
+    if resolver is None:
+        raise ConfigurationError("trusted identity provider is invalid")
+    try:
+        signature = inspect.signature(resolver)
+    except (TypeError, ValueError):
+        value = resolver(dict(user_context))
+    else:
+        positional = tuple(
+            parameter
+            for parameter in signature.parameters.values()
+            if parameter.kind
+            in {
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            }
+        )
+        value = resolver(dict(user_context)) if positional else resolver()
+    if inspect.isawaitable(value):
+        value = await value
+    if isinstance(value, Mapping):
+        claim = _identity_from_mapping(value, keys)
+    else:
+        claim = _required_identity_claim(value)
+    if claim is None:
+        raise ConfigurationError("trusted identity provider returned no claim")
+    return claim
+
+
 def _project_primary_failure(value: Any) -> dict[str, Any]:
     """Return only bounded, structured fields from an internal failure summary."""
 
@@ -208,6 +274,14 @@ class _PublishedEventStamp:
     session_id: str | None
     engine_id: str | None
     sequence: int
+    execution_group_id: str | None
+    root_run_id: str | None
+    parent_run_id: str | None
+    child_run_id: str | None
+    delegation_id: str | None
+    agent_id: str | None
+    agent_version: str | None
+    depth: int
 
     @classmethod
     def from_event(cls, event: AgentEvent) -> "_PublishedEventStamp":
@@ -217,6 +291,14 @@ class _PublishedEventStamp:
             session_id=event.session_id,
             engine_id=event.engine_id,
             sequence=event.sequence,
+            execution_group_id=event.execution_group_id,
+            root_run_id=event.root_run_id,
+            parent_run_id=event.parent_run_id,
+            child_run_id=event.child_run_id,
+            delegation_id=event.delegation_id,
+            agent_id=event.agent_id,
+            agent_version=event.agent_version,
+            depth=event.depth,
         )
 
     def apply(self, event: AgentEvent) -> AgentEvent:
@@ -226,6 +308,14 @@ class _PublishedEventStamp:
             and event.session_id == self.session_id
             and event.engine_id == self.engine_id
             and event.sequence == self.sequence
+            and event.execution_group_id == self.execution_group_id
+            and event.root_run_id == self.root_run_id
+            and event.parent_run_id == self.parent_run_id
+            and event.child_run_id == self.child_run_id
+            and event.delegation_id == self.delegation_id
+            and event.agent_id == self.agent_id
+            and event.agent_version == self.agent_version
+            and event.depth == self.depth
         ):
             return event
         return replace(
@@ -235,6 +325,14 @@ class _PublishedEventStamp:
             session_id=self.session_id,
             engine_id=self.engine_id,
             sequence=self.sequence,
+            execution_group_id=self.execution_group_id,
+            root_run_id=self.root_run_id,
+            parent_run_id=self.parent_run_id,
+            child_run_id=self.child_run_id,
+            delegation_id=self.delegation_id,
+            agent_id=self.agent_id,
+            agent_version=self.agent_version,
+            depth=self.depth,
         )
 
 
@@ -350,6 +448,239 @@ class RunCoordinator(AgentRuntime):
         self._sink_queues: dict[str, asyncio.Queue[AgentEvent]] = {}
         self._sink_workers: dict[str, asyncio.Task[None]] = {}
 
+    async def _resolve_trusted_identity(
+        self,
+        request: RunRequest,
+    ) -> dict[str, str]:
+        """Resolve run-owned tenant/principal claims outside model content.
+
+        A delegated child inherits immutable claims from its parent. Root runs
+        use configured providers when present and otherwise accept the
+        application-owned ``user_context`` boundary in Development. Production
+        composition requires providers, so prompt text can never supply these
+        values.
+        """
+
+        incoming = request.delegation_context
+        if incoming is not None:
+            tenant = _required_identity_claim(getattr(incoming, "tenant", None))
+            principal = _required_identity_claim(getattr(incoming, "principal", None))
+            return {
+                "_moduagent_tenant": tenant,
+                "_moduagent_principal": principal,
+                "_moduagent_tenant_scope_digest": identity_scope_digest(
+                    "tenant",
+                    tenant,
+                ),
+                "_moduagent_principal_scope_digest": identity_scope_digest(
+                    "principal",
+                    principal,
+                ),
+            }
+
+        bindings = getattr(self, "runtime_bindings", None)
+        tenant_provider = getattr(bindings, "tenant_context_provider", None)
+        principal_provider = getattr(bindings, "principal_context_provider", None)
+        tenant = await _resolve_identity_provider(
+            tenant_provider,
+            request.user_context,
+            keys=("tenant_id", "tenant", "id"),
+        )
+        principal = await _resolve_identity_provider(
+            principal_provider,
+            request.user_context,
+            keys=("principal_id", "principal", "id"),
+        )
+        if tenant is None:
+            tenant = _identity_from_mapping(
+                request.user_context,
+                ("tenant_id", "tenant"),
+            )
+        if principal is None:
+            principal = _identity_from_mapping(
+                request.user_context,
+                ("principal_id", "principal"),
+            )
+        result: dict[str, str] = {}
+        if tenant is not None:
+            result["_moduagent_tenant"] = tenant
+            result["_moduagent_tenant_scope_digest"] = identity_scope_digest(
+                "tenant",
+                tenant,
+            )
+        if principal is not None:
+            result["_moduagent_principal"] = principal
+            result["_moduagent_principal_scope_digest"] = identity_scope_digest(
+                "principal",
+                principal,
+            )
+        return result
+
+    def _validate_conversation_store_scope(
+        self,
+        trusted_identity: Mapping[str, str],
+    ) -> None:
+        """Bind conversation reads and writes to the trusted run scope.
+
+        Tenant providers are resolved only at run time, and resume skips the
+        normal history-loader bootstrap.  This common pre-read check prevents
+        both paths from using a store bound to another tenant or Agent.
+        """
+
+        store = self.conversation_store
+        history_loader = getattr(
+            self.conversation_memory_policy,
+            "history_loader",
+            None,
+        )
+        scoped = getattr(store, "supports_tenant_agent_scope", False) is True
+        if history_loader is not None and not scoped:
+            raise ConfigurationError(
+                "durable Context Memory requires a tenant/Agent-scoped "
+                "ConversationStore"
+            )
+        if not scoped:
+            return
+
+        stable_agent_id = str(getattr(self.agent_spec, "name", self.config.name))
+        if getattr(store, "agent_id", None) != stable_agent_id:
+            raise ConfigurationError(
+                "ConversationStore Agent scope does not match the Agent identity"
+            )
+        trusted_tenant = trusted_identity.get("_moduagent_tenant")
+        if (
+            trusted_tenant is not None
+            and getattr(store, "tenant_id", None) != trusted_tenant
+        ):
+            raise ConfigurationError(
+                "ConversationStore tenant scope does not match trusted run identity"
+            )
+
+        if history_loader is not None and (
+            getattr(history_loader, "agent_id", None) != stable_agent_id
+            or getattr(history_loader, "tenant_id", None)
+            != getattr(store, "tenant_id", None)
+        ):
+            raise ConfigurationError(
+                "Context Memory scope does not match ConversationStore scope"
+            )
+
+    async def _bind_delegation_runtime(
+        self,
+        context: RunContext,
+        *,
+        absolute_deadline: datetime,
+    ) -> None:
+        """Bind the shared ledger and typed parent Tool context for this run."""
+
+        tools = tuple(getattr(self, "delegation_tools", ()))
+        incoming = context.request.delegation_context
+        if incoming is not None:
+            projection = incoming.to_dict()
+            lineage = projection.get("lineage", {})
+            if not isinstance(lineage, Mapping):
+                raise ConfigurationError("delegation lineage projection is invalid")
+            context.metadata["_moduagent_run_lineage"] = dict(lineage)
+            context.metadata["_moduagent_execution_group_id"] = str(
+                getattr(incoming, "execution_group_id")
+            )
+        if not tools:
+            return
+
+        from moduagent.delegation import (
+            PARENT_DELEGATION_CONTEXT_KEY,
+            ParentDelegationContext,
+            RunLineage,
+        )
+
+        coordinators = tuple(tool.coordinator for tool in tools)
+        coordinator = coordinators[0]
+        if any(item is not coordinator for item in coordinators[1:]):
+            raise ConfigurationError(
+                "all DelegatedAgentTools on one Agent must share a coordinator"
+            )
+        ledger = coordinator.budget_ledger
+        if context.budget_ledger is not None and context.budget_ledger is not ledger:
+            raise ConfigurationError(
+                "delegated child budget ledger does not match its Tool coordinator"
+            )
+        context.budget_ledger = ledger
+        callers = {tool.caller for tool in tools}
+        if len(callers) != 1:
+            raise ConfigurationError(
+                "all DelegatedAgentTools on one Agent must share a caller AgentRef"
+            )
+        caller = next(iter(callers))
+        tenant = context.metadata.get("_moduagent_tenant")
+        principal = context.metadata.get("_moduagent_principal")
+        if not isinstance(tenant, str) or not isinstance(principal, str):
+            raise ConfigurationError(
+                "delegation requires trusted tenant and principal context"
+            )
+        existing_group_id = context.metadata.get("_moduagent_execution_group_id")
+        existing_state = None
+        if context.request.resume_run_id and isinstance(
+            existing_group_id,
+            str,
+        ):
+            load_group = getattr(ledger, "load_group", None)
+            if not callable(load_group):
+                raise ConfigurationError(
+                    "resumed delegation requires a loadable budget ledger"
+                )
+            existing_state = await load_group(existing_group_id)
+            if existing_state is None:
+                raise ConfigurationError(
+                    "resumed execution-group budget state is unavailable"
+                )
+        if existing_state is not None:
+            if existing_state.limits != coordinator.limits:
+                raise ConfigurationError("resumed execution-group limits do not match")
+            raw_lineage = context.metadata.get("_moduagent_run_lineage", {})
+            try:
+                lineage = RunLineage.from_dict(raw_lineage)
+            except (TypeError, ValueError) as exc:
+                raise ConfigurationError(
+                    "resumed execution-group lineage is invalid"
+                ) from exc
+            parent = ParentDelegationContext(
+                lineage=lineage,
+                execution_group_id=existing_state.execution_group_id,
+                principal=principal,
+                tenant=tenant,
+                parent_session_id=context.request.session_id,
+                absolute_deadline=existing_state.absolute_deadline,
+                limits=existing_state.limits,
+                current_run_id=context.run_id,
+            )
+        else:
+            parent = coordinator.parent_context(
+                caller=caller,
+                run_id=context.run_id,
+                session_id=context.request.session_id,
+                principal=principal,
+                tenant=tenant,
+                incoming=incoming,
+                execution_group_id=(
+                    existing_group_id
+                    if context.request.resume_run_id
+                    and isinstance(existing_group_id, str)
+                    else None
+                ),
+                absolute_deadline=(None if incoming is not None else absolute_deadline),
+            )
+        await ledger.ensure_group(
+            parent.execution_group_id,
+            parent.limits,
+            absolute_deadline=parent.absolute_deadline,
+        )
+        context.metadata[PARENT_DELEGATION_CONTEXT_KEY] = parent
+        context.metadata["_moduagent_run_lineage"] = parent.lineage.to_dict()
+        context.metadata["_moduagent_execution_group_id"] = parent.execution_group_id
+        context.metadata["_moduagent_execution_group_deadline"] = (
+            parent.absolute_deadline.isoformat()
+        )
+
     async def _run(
         self,
         request: RunRequest,
@@ -359,10 +690,28 @@ class RunCoordinator(AgentRuntime):
         if not isinstance(request, RunRequest):
             raise TypeError("request must be a RunRequest")
         self._validate_engine_descriptor()
-        run_id = request.resume_run_id or uuid.uuid4().hex
+        run_id = request.resume_run_id or request.assigned_run_id or uuid.uuid4().hex
         loop = asyncio.get_running_loop()
         run_started_at = loop.time()
         deadline = run_started_at + self.config.limits.timeout_seconds
+        absolute_deadline = datetime.now(timezone.utc) + timedelta(
+            seconds=self.config.limits.timeout_seconds
+        )
+        incoming_deadline = getattr(
+            request.delegation_context,
+            "absolute_deadline",
+            None,
+        )
+        if isinstance(incoming_deadline, datetime):
+            if incoming_deadline.tzinfo is None:
+                raise ValueError("delegation absolute_deadline must be timezone-aware")
+            incoming_deadline = incoming_deadline.astimezone(timezone.utc)
+            absolute_deadline = min(absolute_deadline, incoming_deadline)
+            remaining = max(
+                0.0,
+                (absolute_deadline - datetime.now(timezone.utc)).total_seconds(),
+            )
+            deadline = min(deadline, loop.time() + remaining)
         context = self._new_context(request, run_id, history=())
         resumed_snapshot: RunSnapshot | None = None
         setup_error: BaseException | None = None
@@ -370,24 +719,100 @@ class RunCoordinator(AgentRuntime):
         # Resume is loaded before the EventPublisher is created so the first
         # new event continues the durable monotonic sequence.
         try:
+            trusted_identity = await self._resolve_trusted_identity(request)
+            self._validate_conversation_store_scope(trusted_identity)
             if request.resume_run_id:
                 resumed_snapshot, checkpoint = await self._load_resume(
                     request,
                     deadline,
+                    trusted_identity,
                 )
                 context = checkpoint.to_context()
+                context.request = replace(
+                    context.request,
+                    user_context=copy.deepcopy(dict(request.user_context)),
+                    delegation_context=request.delegation_context,
+                    budget_ledger=request.budget_ledger,
+                    budget_lease=request.budget_lease,
+                )
+                context.budget_ledger = request.budget_ledger
+                context.budget_lease = request.budget_lease
                 self._normalize_context_tool_trace(context)
             else:
-                history = await self._persistence_within(
-                    deadline,
-                    lambda: self.conversation_store.load(request.session_id),
-                    operation="conversation",
+                history_loader = getattr(
+                    self.conversation_memory_policy,
+                    "history_loader",
+                    None,
                 )
+                if history_loader is None:
+                    history = await self._persistence_within(
+                        deadline,
+                        lambda: self.conversation_store.load(request.session_id),
+                        operation="conversation",
+                    )
+                else:
+                    load_history = getattr(history_loader, "load_history", None)
+                    if not callable(load_history):
+                        raise ConfigurationError(
+                            "Context Memory history_loader must provide load_history()"
+                        )
+                    configured_tenant = getattr(history_loader, "tenant_id", None)
+                    trusted_tenant = trusted_identity.get("_moduagent_tenant")
+                    if (
+                        trusted_tenant is not None
+                        and configured_tenant is not None
+                        and configured_tenant != trusted_tenant
+                    ):
+                        raise ConfigurationError(
+                            "Context Memory tenant does not match trusted run identity"
+                        )
+                    configured_agent = getattr(history_loader, "agent_id", None)
+                    stable_agent_id = str(
+                        getattr(self.agent_spec, "name", self.config.name)
+                    )
+                    if (
+                        configured_agent is not None
+                        and configured_agent != stable_agent_id
+                    ):
+                        raise ConfigurationError(
+                            "Context Memory agent_id does not match the Agent identity"
+                        )
+                    history_view = await self._persistence_within(
+                        deadline,
+                        lambda: load_history(
+                            self.conversation_store,
+                            request.session_id,
+                        ),
+                        operation="conversation",
+                    )
+                    history = getattr(history_view, "messages", None)
+                    if not isinstance(history, tuple) or not all(
+                        isinstance(message, Message) for message in history
+                    ):
+                        raise ConfigurationError(
+                            "Context Memory history loader returned an invalid view"
+                        )
                 context = self._new_context(
                     request,
                     run_id,
                     history=tuple(history),
                 )
+            context.metadata.update(trusted_identity)
+            await self._bind_delegation_runtime(
+                context,
+                absolute_deadline=absolute_deadline,
+            )
+            group_deadline = context.metadata.get("_moduagent_execution_group_deadline")
+            if isinstance(group_deadline, str):
+                parsed_group_deadline = datetime.fromisoformat(group_deadline)
+                remaining = max(
+                    0.0,
+                    (
+                        parsed_group_deadline.astimezone(timezone.utc)
+                        - datetime.now(timezone.utc)
+                    ).total_seconds(),
+                )
+                deadline = min(deadline, loop.time() + remaining)
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
@@ -404,11 +829,14 @@ class RunCoordinator(AgentRuntime):
             if resumed_snapshot is not None
             else int(context.metadata.get("_moduagent_event_sequence", 0) or 0)
         )
+        self._attach_agent_fingerprint(context)
+        self._attach_run_identity(context)
         publisher = EventPublisher(
             run_id=run_id,
             session_id=request.session_id,
             engine_id=self.engine.engine_id,
             initial_sequence=initial_sequence,
+            **self._event_identity(context),
         )
         self._event_publishers[run_id] = publisher
         self._coordinator_contexts[run_id] = context
@@ -416,7 +844,6 @@ class RunCoordinator(AgentRuntime):
         context.metadata["_moduagent_engine_id"] = self.engine.engine_id
         context.metadata["_moduagent_engine_state_version"] = self.engine.state_version
         context.metadata["_moduagent_event_sequence"] = initial_sequence
-        self._attach_agent_fingerprint(context)
 
         services = RuntimeServices(self, deadline)
         engine_context: EngineContext | None = None
@@ -633,7 +1060,9 @@ class RunCoordinator(AgentRuntime):
             terminal = await self._publish_terminal(
                 AgentEvent(event_type, run_id, {"result": result})
             )
-            if event_type is EventType.RUN_FAILED or self._retain_terminal_checkpoint():
+            if event_type is EventType.RUN_FAILED or self._retain_terminal_checkpoint(
+                context
+            ):
                 await self._checkpoint_state_safely(
                     engine_context,
                     services,
@@ -719,13 +1148,7 @@ class RunCoordinator(AgentRuntime):
                 )
             yield terminal
         except Exception as exc:
-            finish_reason = (
-                FinishReason.MAX_MODEL_TURNS
-                if isinstance(exc, ModelTurnBudgetExceeded)
-                else FinishReason.NO_PROGRESS
-                if isinstance(exc, ModelNoProgressError)
-                else FinishReason.ERROR
-            )
+            finish_reason = self._finish_reason_for_exception(exc)
             context.status = RunStatus.FAILED
             context.metadata["_moduagent_terminal_reason"] = finish_reason.value
             if finish_reason in _NON_RESUMABLE_GUARD_REASONS:
@@ -811,6 +1234,7 @@ class RunCoordinator(AgentRuntime):
         self,
         request: RunRequest,
         deadline: float,
+        trusted_identity: Mapping[str, str],
     ) -> tuple[RunSnapshot, RunCheckpoint]:
         store = self.checkpoint_store
         if store is None:
@@ -843,10 +1267,15 @@ class RunCoordinator(AgentRuntime):
                 raise TypeError("checkpoint load() must return RunCheckpoint or None")
             snapshot = checkpoint.to_snapshot()
 
+        if snapshot.run_id != run_id or checkpoint.run_id != run_id:
+            raise StateMigrationError(
+                "checkpoint run_id does not match the requested resume run"
+            )
         if checkpoint.session_id != request.session_id:
             raise StateMigrationError(
                 "checkpoint session_id does not match the request"
             )
+        self._validate_resume_identity(snapshot, trusted_identity)
         if snapshot.engine.engine_id != self.engine.engine_id:
             raise StateMigrationError(
                 "checkpoint engine does not match the configured engine"
@@ -868,7 +1297,128 @@ class RunCoordinator(AgentRuntime):
             raise StateMigrationError(
                 "checkpoint Agent fingerprint does not match configuration"
             )
+        current_definition_fingerprint = self._agent_definition_fingerprint()
+        current_ref = self._agent_ref()
+        if current_definition_fingerprint is not None and snapshot.agent_ref:
+            if snapshot.agent_definition_fingerprint != current_definition_fingerprint:
+                raise StateMigrationError(
+                    "checkpoint AgentDefinition fingerprint does not match"
+                )
+            if dict(snapshot.agent_ref) != current_ref:
+                raise StateMigrationError(
+                    "checkpoint AgentRef does not match configuration"
+                )
+        elif current_definition_fingerprint is not None:
+            # A v4 migration has no AgentRef and carries its legacy AgentSpec
+            # fingerprint in both fields. A native v5 checkpoint that loses
+            # only agent_ref must fail closed instead of bypassing exact
+            # definition pinning. The next successful migrated checkpoint is
+            # re-written with the exact v5 AgentRef/fingerprint pair.
+            if snapshot.migrated_from_schema_version not in {1, 2, 3, 4}:
+                raise StateMigrationError(
+                    "checkpoint AgentRef is missing for a pinned definition"
+                )
+            profile_kind = getattr(
+                getattr(getattr(self, "runtime_profile", None), "kind", None),
+                "value",
+                None,
+            )
+            if profile_kind == "production":
+                raise StateMigrationError(
+                    "Production cannot adopt a legacy checkpoint without an exact AgentRef"
+                )
+        elif current_definition_fingerprint is None and snapshot.agent_ref:
+            raise StateMigrationError("checkpoint requires an AgentDefinition binding")
+        await self._validate_delegated_resume(request, snapshot)
         return snapshot, checkpoint
+
+    @staticmethod
+    def _validate_resume_identity(
+        snapshot: RunSnapshot,
+        trusted_identity: Mapping[str, str],
+    ) -> None:
+        """Bind a checkpoint to the currently authenticated tenant/subject."""
+
+        for kind in ("tenant", "principal"):
+            stored = getattr(snapshot, f"{kind}_scope_digest")
+            expected = trusted_identity.get(f"_moduagent_{kind}_scope_digest")
+            if stored is None and expected is None:
+                continue
+            if stored is None:
+                raise StateMigrationError(f"checkpoint {kind} scope binding is missing")
+            if expected is None:
+                raise StateMigrationError(
+                    f"checkpoint requires a trusted {kind} identity"
+                )
+            if stored != expected:
+                raise StateMigrationError(
+                    f"checkpoint {kind} scope does not match the request"
+                )
+
+    async def _validate_delegated_resume(
+        self,
+        request: RunRequest,
+        snapshot: RunSnapshot,
+    ) -> None:
+        """Keep child checkpoints behind the receipt-owned private boundary."""
+
+        lineage = snapshot.run_lineage
+        depth = lineage.get("depth", 0)
+        delegated = (
+            type(depth) is int
+            and depth > 0
+            or snapshot.delegation_id is not None
+            or snapshot.parent_tool_call_id is not None
+            or snapshot.budget_lease_id is not None
+        )
+        incoming = request.delegation_context
+        if delegated and incoming is None:
+            raise StateMigrationError(
+                "delegated checkpoint requires coordinator-owned resume context"
+            )
+        if not delegated:
+            if incoming is not None:
+                raise StateMigrationError(
+                    "root checkpoint cannot resume as a delegated child"
+                )
+            return
+        projection = incoming.to_dict()
+        incoming_lineage = projection.get("lineage")
+        if not isinstance(incoming_lineage, Mapping) or dict(incoming_lineage) != dict(
+            lineage
+        ):
+            raise StateMigrationError("delegated checkpoint lineage does not match")
+        if projection.get("execution_group_id") != snapshot.execution_group_id:
+            raise StateMigrationError(
+                "delegated checkpoint execution group does not match"
+            )
+        if lineage.get("delegation_id") != snapshot.delegation_id or (
+            lineage.get("parent_tool_call_id") != snapshot.parent_tool_call_id
+        ):
+            raise StateMigrationError(
+                "delegated checkpoint receipt identity is inconsistent"
+            )
+        lease = request.budget_lease
+        ledger = request.budget_ledger
+        if lease is None or ledger is None:
+            raise StateMigrationError("delegated checkpoint requires a budget lease")
+        if getattr(lease, "execution_group_id", None) != snapshot.execution_group_id:
+            raise StateMigrationError("delegated budget lease group does not match")
+        if (
+            snapshot.common_state.status
+            not in {RunStatus.FAILED.value, RunStatus.CANCELLED.value}
+            and getattr(lease, "lease_id", None) != snapshot.budget_lease_id
+        ):
+            raise StateMigrationError("delegated budget lease identity does not match")
+        load_group = getattr(ledger, "load_group", None)
+        if not callable(load_group):
+            raise StateMigrationError("delegated budget ledger is not loadable")
+        state = await load_group(str(snapshot.execution_group_id))
+        if state is None:
+            raise StateMigrationError("delegated execution-group state is unavailable")
+        record = getattr(state, "leases", {}).get(getattr(lease, "lease_id", None))
+        if record is None or getattr(record, "status", None) != "active":
+            raise StateMigrationError("delegated budget lease is not active")
 
     def _resume_engine_state(self, snapshot: RunSnapshot) -> Any:
         resolved_spec = dict(self._engine_spec())
@@ -935,7 +1485,7 @@ class RunCoordinator(AgentRuntime):
 
         self._normalize_skill_resource_messages(context.run)
         await self._persist_pending_messages(context.run, deadline)
-        if failed or self._retain_terminal_checkpoint():
+        if failed or self._retain_terminal_checkpoint(context.run):
             await self._checkpoint_state_safely(
                 context,
                 services,
@@ -1109,7 +1659,7 @@ class RunCoordinator(AgentRuntime):
                     _RUN_ID_METADATA_KEY: run_id,
                     "moduagent.public_input": True,
                 }
-                if self._retain_terminal_checkpoint()
+                if self._retain_terminal_checkpoint(request)
                 else None
             ),
         )
@@ -1135,6 +1685,8 @@ class RunCoordinator(AgentRuntime):
             new_messages=[user_message],
             metadata=metadata,
             current_run_start=1 + len(history),
+            budget_ledger=request.budget_ledger,
+            budget_lease=request.budget_lease,
         )
         return context
 
@@ -1197,8 +1749,16 @@ class RunCoordinator(AgentRuntime):
                 "execution Engine capability requirements changed after composition"
             )
 
-    def _retain_terminal_checkpoint(self) -> bool:
-        return bool(self.resolved_spec.get("retain_terminal_checkpoint", False))
+    def _retain_terminal_checkpoint(
+        self,
+        run: RunContext | RunRequest | None = None,
+    ) -> bool:
+        if bool(self.resolved_spec.get("retain_terminal_checkpoint", False)):
+            return True
+        request = run.request if isinstance(run, RunContext) else run
+        return bool(
+            isinstance(request, RunRequest) and request.delegation_context is not None
+        )
 
     @staticmethod
     def _public_error(error: Exception) -> str:
@@ -1250,6 +1810,8 @@ class RunCoordinator(AgentRuntime):
             category, code = "limit", error.code
         elif isinstance(error, ModelNoProgressError):
             category, code = "model_progress", error.code
+        elif isinstance(error, BudgetExceeded):
+            category, code = "execution_group_budget", error.code
         elif isinstance(error, ModelInvocationError):
             classification = classify_model_error(error)
             category, code = classification.category, classification.code
@@ -1283,6 +1845,7 @@ class RunCoordinator(AgentRuntime):
                     CheckpointNotFoundError,
                     StateMigrationError,
                     ModelGuardTripped,
+                    BudgetExceeded,
                 ),
             )
             else self._is_safely_resumable(context)
@@ -1312,6 +1875,21 @@ class RunCoordinator(AgentRuntime):
         }:
             summary["provider_finish_reason"] = error.finish_reason
         return summary
+
+    @staticmethod
+    def _finish_reason_for_exception(error: Exception) -> FinishReason:
+        if isinstance(error, ModelTurnBudgetExceeded):
+            return FinishReason.MAX_MODEL_TURNS
+        if isinstance(error, ModelNoProgressError):
+            return FinishReason.NO_PROGRESS
+        if isinstance(error, BudgetExceeded):
+            if error.code == "execution_group_model_turns_exceeded":
+                return FinishReason.MAX_MODEL_TURNS
+            if error.code == "execution_group_tool_calls_exceeded":
+                return FinishReason.MAX_TOOL_CALLS
+            if error.code == "execution_group_timeout":
+                return FinishReason.TIMEOUT
+        return FinishReason.ERROR
 
     async def _capture_terminal_failure(
         self,
@@ -1436,6 +2014,8 @@ class RunCoordinator(AgentRuntime):
 
     @staticmethod
     def _diagnostic_operation(error: BaseException) -> tuple[str, str]:
+        if isinstance(error, BudgetExceeded):
+            return "runtime", "execution_group_budget"
         if isinstance(error, ModelGuardTripped):
             return "model", "guard"
         if isinstance(error, ModelInvocationError):
@@ -1632,6 +2212,128 @@ class RunCoordinator(AgentRuntime):
         fingerprint = self._agent_fingerprint()
         if fingerprint is not None:
             context.metadata["_moduagent_agent_fingerprint"] = fingerprint
+        definition_fingerprint = self._agent_definition_fingerprint()
+        if definition_fingerprint is not None:
+            context.metadata["_moduagent_agent_definition_fingerprint"] = (
+                definition_fingerprint
+            )
+            context.metadata["_moduagent_agent_ref"] = self._agent_ref()
+
+    def _agent_definition_fingerprint(self) -> str | None:
+        value = getattr(
+            getattr(self, "agent_definition", None),
+            "fingerprint",
+            None,
+        )
+        return value if isinstance(value, str) and value else None
+
+    def _agent_ref(self) -> dict[str, str]:
+        definition = getattr(self, "agent_definition", None)
+        agent_id = getattr(definition, "agent_id", None)
+        version = getattr(definition, "version", None)
+        if not isinstance(agent_id, str) or not isinstance(version, str):
+            return {}
+        return {"agent_id": agent_id, "version": version}
+
+    def _attach_run_identity(self, context: RunContext) -> None:
+        """Initialize v5 lineage metadata before events or checkpoints exist."""
+
+        projection: Mapping[str, Any] = {}
+        delegation_context = context.request.delegation_context
+        if delegation_context is not None:
+            candidate = delegation_context.to_dict()
+            if isinstance(candidate, Mapping):
+                projection = candidate
+        raw_lineage = projection.get("lineage", projection.get("run_lineage", {}))
+        if not isinstance(raw_lineage, Mapping):
+            raw_lineage = {}
+        existing = context.metadata.get("_moduagent_run_lineage")
+        if not raw_lineage and isinstance(existing, Mapping):
+            raw_lineage = existing
+        lineage = dict(raw_lineage)
+        if not lineage:
+            agent_ref = self._agent_ref()
+            agent_id = agent_ref.get("agent_id")
+            agent_version = agent_ref.get("version")
+            lineage = {
+                "root_run_id": context.run_id,
+                "parent_run_id": None,
+                "depth": 0,
+                "agent_path": (
+                    [f"{agent_id}@{agent_version}"]
+                    if agent_id is not None and agent_version is not None
+                    else []
+                ),
+            }
+            if agent_id is not None and agent_version is not None:
+                lineage.update(
+                    {
+                        "delegation_id": None,
+                        "parent_tool_call_id": None,
+                        "caller_agent_id": None,
+                        "agent_id": agent_id,
+                        "agent_version": agent_version,
+                    }
+                )
+        context.metadata["_moduagent_run_lineage"] = lineage
+        context.metadata.setdefault(
+            "_moduagent_execution_group_id",
+            projection.get("execution_group_id")
+            or lineage.get("root_run_id")
+            or context.run_id,
+        )
+        for source_key, metadata_key in (
+            ("delegation_id", "_moduagent_delegation_id"),
+            ("parent_tool_call_id", "_moduagent_parent_tool_call_id"),
+        ):
+            value = projection.get(source_key) or lineage.get(source_key)
+            if value is not None:
+                context.metadata[metadata_key] = value
+
+    def _event_identity(self, context: RunContext) -> dict[str, Any]:
+        """Return the content-free event v2 identity for one run."""
+
+        projection: Mapping[str, Any] = {}
+        delegation_context = context.request.delegation_context
+        if delegation_context is not None:
+            to_dict = getattr(delegation_context, "to_dict", None)
+            if callable(to_dict):
+                candidate = to_dict()
+                if isinstance(candidate, Mapping):
+                    projection = candidate
+        raw_lineage = projection.get("lineage", projection.get("run_lineage", {}))
+        if not isinstance(raw_lineage, Mapping):
+            raw_lineage = {}
+        if not raw_lineage:
+            candidate = context.metadata.get("_moduagent_run_lineage", {})
+            if isinstance(candidate, Mapping):
+                raw_lineage = candidate
+        root_run_id = str(raw_lineage.get("root_run_id") or context.run_id)
+        parent_run_id = raw_lineage.get("parent_run_id")
+        depth = raw_lineage.get("depth", 0)
+        if type(depth) is not int or depth < 0:
+            depth = 0
+        raw_agent_ref = context.metadata.get("_moduagent_agent_ref", {})
+        agent_ref = raw_agent_ref if isinstance(raw_agent_ref, Mapping) else {}
+        agent_id = agent_ref.get("agent_id", agent_ref.get("id", self.config.name))
+        agent_version = agent_ref.get("version")
+        return {
+            "execution_group_id": str(
+                projection.get("execution_group_id")
+                or context.metadata.get("_moduagent_execution_group_id")
+                or root_run_id
+            ),
+            "root_run_id": root_run_id,
+            "parent_run_id": (None if parent_run_id is None else str(parent_run_id)),
+            "delegation_id": _optional_runtime_identifier(
+                projection.get("delegation_id")
+                or raw_lineage.get("delegation_id")
+                or context.metadata.get("_moduagent_delegation_id")
+            ),
+            "agent_id": _optional_runtime_identifier(agent_id),
+            "agent_version": _optional_runtime_identifier(agent_version),
+            "depth": depth,
+        }
 
     @staticmethod
     def _normalize_skill_resource_messages(context: RunContext) -> None:
@@ -1687,13 +2389,43 @@ class RunCoordinator(AgentRuntime):
             raise ValueError("_publish_terminal requires a terminal event")
         return await self._publish_event(event)
 
-    async def _publish_event(self, event: AgentEvent) -> AgentEvent:
+    async def _publish_related_delegation_event(
+        self,
+        event: AgentEvent,
+    ) -> AgentEvent:
+        """Publish coordinator-validated child correlation on a parent run."""
+
+        if not isinstance(event, AgentEvent) or not event.type.value.startswith(
+            "delegation_"
+        ):
+            raise ValueError(
+                "related delegation publication requires a lifecycle event"
+            )
+        return await self._publish_event(
+            event,
+            allow_related_delegation=True,
+        )
+
+    async def _publish_event(
+        self,
+        event: AgentEvent,
+        *,
+        allow_related_delegation: bool = False,
+    ) -> AgentEvent:
         """Stamp once, isolate sink failures, and return the published object."""
 
-        published = self._reserve_event(event)
+        published = self._reserve_event(
+            event,
+            allow_related_delegation=allow_related_delegation,
+        )
         return await self._dispatch_reserved_event(published)
 
-    def _reserve_event(self, event: AgentEvent) -> AgentEvent:
+    def _reserve_event(
+        self,
+        event: AgentEvent,
+        *,
+        allow_related_delegation: bool = False,
+    ) -> AgentEvent:
         """Allocate an event sequence before a related durable write."""
 
         if not isinstance(event, AgentEvent):
@@ -1705,7 +2437,10 @@ class RunCoordinator(AgentRuntime):
             raise ExecutionInvariantError(
                 "event does not belong to an active Coordinator run"
             )
-        published = publisher.stamp(event)
+        published = publisher.stamp(
+            event,
+            allow_related_delegation=allow_related_delegation,
+        )
         context = self._coordinator_contexts.get(event.run_id)
         if context is not None:
             context.metadata["_moduagent_event_sequence"] = published.sequence

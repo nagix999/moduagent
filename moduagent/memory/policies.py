@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from moduagent.memory.base import (
     ConversationMemoryOverflowError,
     MemoryIntegrityError,
+    MemoryContextBound,
     MemoryRequest,
     MemoryResult,
 )
@@ -83,6 +84,10 @@ class RecentTurnsConversationMemoryPolicy(_ImmutableSemanticConfiguration):
         if max_turns < 0:
             raise ValueError("max_turns cannot be negative")
         self.max_turns = max_turns
+
+    @property
+    def context_bound(self) -> MemoryContextBound:
+        return MemoryContextBound("turns", self.max_turns)
 
     async def prepare(self, request: MemoryRequest) -> MemoryResult:
         parts = _conversation_parts(request)
@@ -166,6 +171,10 @@ class TokenBudgetConversationMemoryPolicy(_ImmutableSemanticConfiguration):
         self.policy_fingerprint = hashlib.sha256(
             json.dumps(fingerprint_value, sort_keys=True).encode()
         ).hexdigest()
+
+    @property
+    def context_bound(self) -> MemoryContextBound:
+        return MemoryContextBound("tokens", self.budget.input_tokens)
 
     async def prepare(self, request: MemoryRequest) -> MemoryResult:
         token_counter = _RequestTokenMemo(self.token_counter)
@@ -272,6 +281,8 @@ class TokenBudgetConversationMemoryPolicy(_ImmutableSemanticConfiguration):
 
                 if isinstance(exc, ModelGuardTripped):
                     raise
+                if self._is_terminal_summary_error(exc):
+                    raise
                 summary_message = None
                 summary_error = type(exc).__name__
 
@@ -313,6 +324,18 @@ class TokenBudgetConversationMemoryPolicy(_ImmutableSemanticConfiguration):
             dropped_messages=dropped_messages,
             metadata=metadata,
         )
+
+    def _is_terminal_summary_error(self, error: Exception) -> bool:
+        """Return whether an extension-owned summary failure must propagate.
+
+        Legacy policies keep their established optional fallback. Durable
+        Context Memory overrides this hook for typed state-integrity failures,
+        preserving the original exception instead of reconstructing it from a
+        diagnostic class-name string.
+        """
+
+        del error
+        return False
 
     async def _count(
         self,

@@ -290,7 +290,7 @@ def test_checkpoint_json_context_and_stores_round_trip() -> None:
         store = RedisCheckpointStore(redis, ttl_seconds=5)
         await store.save("run-1", checkpoint)
         assert await store.load("run-1") == checkpoint
-        assert redis.expirations["moduagent:checkpoint:v4:run-1"] == 5
+        assert redis.expirations["moduagent:checkpoint:v5:run-1"] == 5
         assert redis.expirations.get("moduagent:conversation:session-1") is None
 
     asyncio.run(scenario())

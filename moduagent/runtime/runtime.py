@@ -3004,20 +3004,29 @@ class AgentRuntime:
         )
         usage_before_memory = context.usage
         memory_started = asyncio.get_running_loop().time()
+        memory_request = MemoryRequest(
+            run_id=context.run_id,
+            session_id=context.request.session_id,
+            phase=phase,
+            model_request=request,
+            protected_from=protected_boundary,
+            user_context=context.request.user_context,
+            model_gateway=context.model_gateway,
+        )
         memory = await self._within(
             deadline,
-            lambda: self.conversation_memory_policy.prepare(
-                MemoryRequest(
-                    run_id=context.run_id,
-                    session_id=context.request.session_id,
-                    phase=phase,
-                    model_request=request,
-                    protected_from=protected_boundary,
-                    user_context=context.request.user_context,
-                    model_gateway=context.model_gateway,
-                )
-            ),
+            lambda: self.conversation_memory_policy.prepare(memory_request),
         )
+        assemble_runtime_context = getattr(
+            self.conversation_memory_policy,
+            "assemble_runtime_context",
+            None,
+        )
+        if callable(assemble_runtime_context):
+            memory = await self._within(
+                deadline,
+                lambda: assemble_runtime_context(memory_request, memory),
+            )
         memory_duration_seconds = max(
             0.0,
             asyncio.get_running_loop().time() - memory_started,

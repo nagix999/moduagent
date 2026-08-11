@@ -34,7 +34,7 @@ def _skill_state() -> SkillRunState:
     )
 
 
-def test_checkpoint_v4_round_trips_skill_and_strict_execution_state() -> None:
+def test_checkpoint_v5_round_trips_skill_and_strict_execution_state() -> None:
     execution_state = ExecutionState(
         phase=RunPhase.STEP_PREPARE,
         plan=Plan(
@@ -67,8 +67,8 @@ def test_checkpoint_v4_round_trips_skill_and_strict_execution_state() -> None:
     decoded = RunCheckpoint.from_dict(encoded)
     restored = decoded.to_context()
 
-    assert encoded["schema_version"] == 4
-    assert encoded["version"] == 4
+    assert encoded["schema_version"] == 5
+    assert encoded["version"] == 5
     assert restored.request.requested_skills == ("invoice-review",)
     assert restored.request.skill_mode == "explicit"
     assert restored.skill_state == _skill_state()
@@ -101,7 +101,7 @@ def test_version_1_checkpoint_resumes_with_skills_disabled() -> None:
     assert context.request.skill_mode == "disabled"
     assert context.skill_state == SkillRunState()
     assert context.execution_state is None
-    assert checkpoint.to_dict()["version"] == 4
+    assert checkpoint.to_dict()["version"] == 5
 
 
 def test_version_2_checkpoint_restores_skills_but_not_strict_execution_state() -> None:

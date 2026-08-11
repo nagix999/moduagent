@@ -70,14 +70,18 @@ jobs:
               source_names = archive.getnames()
           required_files = {
               "benchmarks/performance_v042.py",
+              "docs/delegation.md",
+              "docs/migration-0.6.md",
               "examples/01_hello_agent.py",
               "examples/02_use_a_tool.py",
               "examples/03_structured_output.py",
               "examples/04_report_automation.py",
               "examples/05_debug_a_run.py",
+              "examples/06_waf_log_analysis.py",
               "examples/10_incident_investigation.py",
               "examples/11_customer_case_resolution.py",
               "examples/12_release_readiness.py",
+              "examples/13_document_qa_and_report.py",
               "examples/20_production_controls.py",
               "examples/INTERMEDIATE.md",
               "examples/INTERMEDIATE.ko.md",
@@ -89,6 +93,9 @@ jobs:
               "tests/integration/test_live_intermediate_scenarios_v051a.py",
               "tests/integration/test_live_models.py",
               "tests/integration/test_live_persistence.py",
+              "tests/conformance/__init__.py",
+              "tests/conformance/contracts.py",
+              "tests/conformance/test_adapters_v060.py",
               "tests/test_beginner_examples_v051.py",
               "tests/test_intermediate_customer_example_alpha.py",
               "tests/test_intermediate_incident_example_alpha.py",
@@ -96,11 +103,22 @@ jobs:
               "tests/test_model_output_incomplete.py",
               "tests/test_agent_tool_v053.py",
               "tests/test_conversation_store_capacity_v052.py",
+              "tests/test_context_history_runtime_v060.py",
+              "tests/test_context_assembler_runtime_v060.py",
+              "tests/test_context_memory_v060.py",
+              "tests/test_conversation_pagination_v060.py",
+              "tests/test_definitions_v060.py",
+              "tests/test_delegation_foundation_v060.py",
+              "tests/test_delegation_runtime_v060.py",
+              "tests/test_document_qa_report_example_v060.py",
               "tests/test_embedding_contract_v052.py",
+              "tests/test_kernel_contracts_v060.py",
               "tests/test_memory_diagnostics_v053.py",
               "tests/test_plan_memory_v052.py",
               "tests/test_production_controls_example_v052.py",
+              "tests/test_profiles_v060.py",
               "tests/test_shared_store_warning_v053.py",
+              "tests/test_waf_log_analysis_example_v01.py",
           }
           missing_files = {
               expected
@@ -144,5 +162,5 @@ jobs:
           /tmp/moduagent-venv/bin/python -m pip install /tmp/moduagent-wheel/moduagent-*.whl
           cd /tmp
           /tmp/moduagent-venv/bin/python -c \
-            "import moduagent; assert moduagent.__version__ == '0.5.3'"
+            "import moduagent; assert moduagent.__version__ == '0.6.0'"
           /tmp/moduagent-venv/bin/moduagent --help

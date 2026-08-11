@@ -36,12 +36,14 @@ from moduagent.runtime.context import RunContext
 def test_run_context_appends_diagnostic_fields_after_040_positional_fields() -> None:
     field_names = tuple(item.name for item in fields(RunContext))
 
-    assert field_names[-4:] == (
+    diagnostic_start = field_names.index("created_at")
+    assert field_names[diagnostic_start : diagnostic_start + 4] == (
         "created_at",
         "diagnostic_reporter",
         "primary_failure",
         "tool_failure_ids",
     )
+    assert field_names[-2:] == ("budget_ledger", "budget_lease")
 
 
 class ScriptedModel:

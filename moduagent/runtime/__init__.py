@@ -8,6 +8,7 @@ from moduagent.runtime.context import (
 )
 from moduagent.runtime.events import (
     AgentEvent,
+    EVENT_SCHEMA_VERSION,
     EventPublisher,
     EventType,
     EventVisibility,
@@ -17,6 +18,7 @@ from moduagent.runtime.coordinator import RunCoordinator
 
 __all__ = [
     "AgentEvent",
+    "EVENT_SCHEMA_VERSION",
     "AgentRuntime",
     "AgentResult",
     "EventPublisher",

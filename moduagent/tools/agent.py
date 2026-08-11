@@ -167,6 +167,10 @@ class AgentTool:
             raise ValueError("tool name cannot be empty")
         self.description = description or f"Delegate a task to the {self.name} agent"
         self.idempotent = idempotent
+        # Legacy AgentTool cannot prove the delegated Agent's side effects.
+        # Production already rejects this adapter; Development remains source
+        # compatible and treats the classification as unknown.
+        self.side_effect_level = None
         self.timeout_seconds = timeout_seconds
         self.max_result_bytes = max_result_bytes
         self.input_model = AgentToolInput
