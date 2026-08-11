@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from moduagent import Agent, RunLimits, function_tool
+from moduagent import (
+    Agent,
+    RunContext,
+    RunLimits,
+    StandardDecisionPolicy,
+    StandardExecutionProfile,
+    ToolResult,
+    function_tool,
+)
 
 from .pipeline import IndexStatus, RAGIndexManager, SyncReport
 
@@ -88,6 +96,29 @@ Tool 결과의 숫자, 상태, generation ID, warning을 그대로 ManagementRes
 summary만 짧은 한국어로 작성한다. 문서 본문이나 자격 증명을 요청하거나 출력하지
 않는다. Tool 실패를 성공으로 표현하지 않는다.
 """
+
+
+class _FinalizeAfterSuccessfulOperationPolicy(StandardDecisionPolicy):
+    """Move directly from one successful management Tool to finalization."""
+
+    _STATE_KEY = "rag_management_operation_succeeded"
+
+    async def begin(self, context: RunContext) -> None:
+        await super().begin(context)
+        context.policy_state.setdefault(self._STATE_KEY, False)
+
+    async def observe(
+        self,
+        context: RunContext,
+        results: Sequence[ToolResult],
+    ) -> None:
+        await super().observe(context, results)
+        if len(results) != 1:
+            raise RuntimeError("management execution must observe exactly one Tool")
+        context.policy_state[self._STATE_KEY] = results[0].success is True
+
+    def should_stop(self, context: RunContext) -> bool:
+        return context.policy_state.get(self._STATE_KEY) is True
 
 
 def make_management_tools(
@@ -210,7 +241,9 @@ def build_management_agent(
             allow_writes=allow_writes,
             audit=audit,
         ),
-        execution="standard",
+        execution=StandardExecutionProfile(
+            decision_policy=_FinalizeAfterSuccessfulOperationPolicy(),
+        ),
         output=ManagementResponse,
         limits=RunLimits(
             max_steps=4,
