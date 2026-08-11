@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Added an incremental RAG index-manager example using Docling, Gemma 4 visual
+  layout refinement, BGE-M3 embeddings, and Milvus blue/green indexing. It
+  detects content and pipeline changes, preserves canonical provenance, and
+  supports resumable synchronization, validation, and rollback.
+
 ## 0.6.0
 
 - Added immutable, exact-version `AgentDefinition` identities, a lifecycle-aware
