@@ -1844,9 +1844,186 @@ def test_management_agent_structured_finalization_matches_authoritative_tool_res
         assert response.chunk_count == 0
         assert len(model.requests) == 2
         assert model.requests[0].tools
+        assert model.requests[0].options["tool_choice"] == "required"
         assert model.requests[1].tools == ()
         assert model.requests[1].output_schema is not None
+        assert "tool_choice" not in model.requests[1].options
+        assert "parallel_tool_calls" not in model.requests[1].options
         assert model.responses == []
+
+    try:
+        _run(scenario())
+    finally:
+        fixture.catalog.close()
+
+
+def test_management_agent_rejects_a_model_that_skips_the_required_tool(
+    tmp_path: Path,
+) -> None:
+    agent_module = _module("agent")
+    moduagent = importlib.import_module("moduagent")
+    messages = importlib.import_module("moduagent.messages")
+    root = tmp_path / "documents"
+    _write(root, "policy.txt", b"policy")
+    fixture = _manager_fixture(tmp_path, root)
+    model = ScriptedManagementModel(
+        [moduagent.ModelResponse(messages.Message.assistant("도구 없이 답변"))]
+    )
+
+    async def scenario() -> None:
+        with pytest.raises(moduagent.AgentRunError) as caught:
+            await agent_module.run_management_request(
+                model,
+                fixture.manager,
+                "현재 상태를 알려줘",
+            )
+        assert caught.value.category == "model_protocol"
+        assert caught.value.code == "model_protocol_error"
+        assert len(model.requests) == 1
+        assert model.requests[0].options["tool_choice"] == "required"
+
+    try:
+        _run(scenario())
+    finally:
+        fixture.catalog.close()
+
+
+def test_management_agent_rejects_multiple_tools_before_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_module = _module("agent")
+    moduagent = importlib.import_module("moduagent")
+    messages = importlib.import_module("moduagent.messages")
+    root = tmp_path / "documents"
+    _write(root, "policy.txt", b"policy")
+    fixture = _manager_fixture(tmp_path, root)
+    first = moduagent.ToolCall("status-1", "inspect_index_status", {})
+    second = moduagent.ToolCall("status-2", "inspect_index_status", {})
+    model = ScriptedManagementModel(
+        [
+            moduagent.ModelResponse(
+                messages.Message.assistant(None, (first, second)),
+                (first, second),
+                finish_reason="tool_calls",
+            )
+        ]
+    )
+    status_calls = 0
+
+    async def count_status(_self: Any) -> Any:
+        nonlocal status_calls
+        status_calls += 1
+        raise AssertionError("management tools must not execute")
+
+    monkeypatch.setattr(type(fixture.manager), "status", count_status)
+
+    async def scenario() -> None:
+        with pytest.raises(moduagent.AgentRunError) as caught:
+            await agent_module.run_management_request(
+                model,
+                fixture.manager,
+                "현재 상태를 두 번 확인해줘",
+            )
+        assert caught.value.category == "model_protocol"
+        assert caught.value.code == "model_protocol_error"
+        assert status_calls == 0
+        assert len(model.requests) == 1
+
+    try:
+        _run(scenario())
+    finally:
+        fixture.catalog.close()
+
+
+def test_management_agent_surfaces_a_failed_tool_without_another_model_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_module = _module("agent")
+    moduagent = importlib.import_module("moduagent")
+    messages = importlib.import_module("moduagent.messages")
+    pipeline_module = _module("pipeline")
+    root = tmp_path / "documents"
+    _write(root, "policy.txt", b"policy")
+    fixture = _manager_fixture(tmp_path, root)
+    tool_call = moduagent.ToolCall("status-failure", "inspect_index_status", {})
+    model = ScriptedManagementModel(
+        [
+            moduagent.ModelResponse(
+                messages.Message.assistant(None, (tool_call,)),
+                (tool_call,),
+                finish_reason="tool_calls",
+            )
+        ]
+    )
+
+    async def fail_status(_self: Any) -> Any:
+        raise pipeline_module.PipelineError("scripted status failure")
+
+    monkeypatch.setattr(type(fixture.manager), "status", fail_status)
+
+    async def scenario() -> None:
+        with pytest.raises(moduagent.AgentRunError) as caught:
+            await agent_module.run_management_request(
+                model,
+                fixture.manager,
+                "현재 상태를 알려줘",
+            )
+        assert caught.value.category == "tool_failure"
+        assert caught.value.code == "execution_error"
+        assert caught.value.error_summary["component"] == "tool"
+        assert caught.value.error_summary["operation"] == "inspect_index_status"
+        assert caught.value.retryable is True
+        assert len(model.requests) == 1
+
+    try:
+        _run(scenario())
+    finally:
+        fixture.catalog.close()
+
+
+def test_management_agent_never_marks_a_failed_write_operation_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_module = _module("agent")
+    moduagent = importlib.import_module("moduagent")
+    messages = importlib.import_module("moduagent.messages")
+    pipeline_module = _module("pipeline")
+    root = tmp_path / "documents"
+    _write(root, "policy.txt", b"policy")
+    fixture = _manager_fixture(tmp_path, root)
+    tool_call = moduagent.ToolCall("sync-failure", "apply_incremental_sync", {})
+    model = ScriptedManagementModel(
+        [
+            moduagent.ModelResponse(
+                messages.Message.assistant(None, (tool_call,)),
+                (tool_call,),
+                finish_reason="tool_calls",
+            )
+        ]
+    )
+
+    async def fail_sync(_self: Any, *, force_rebuild: bool = False) -> Any:
+        del force_rebuild
+        raise pipeline_module.PipelineError("scripted sync failure")
+
+    monkeypatch.setattr(type(fixture.manager), "sync", fail_sync)
+
+    async def scenario() -> None:
+        with pytest.raises(moduagent.AgentRunError) as caught:
+            await agent_module.run_management_request(
+                model,
+                fixture.manager,
+                "변경 사항을 동기화해줘",
+                allow_writes=True,
+            )
+        assert caught.value.category == "tool_failure"
+        assert caught.value.code == "execution_error"
+        assert caught.value.error_summary["operation"] == "apply_incremental_sync"
+        assert caught.value.retryable is False
+        assert len(model.requests) == 1
 
     try:
         _run(scenario())
