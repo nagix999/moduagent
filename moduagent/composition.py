@@ -168,6 +168,9 @@ class ToolSpec:
     description: str
     schema_fingerprint: str
     safety_profile: ToolSafetyProfile
+    # Appended in 0.6.0. ``None`` means the custom/legacy Tool did not provide
+    # an auditable side-effect classification.
+    side_effect_level: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -181,6 +184,7 @@ class ToolSpec:
                 ),
                 "timeout_retry_safe": self.safety_profile.timeout_retry_safe,
             },
+            "side_effect_level": self.side_effect_level,
         }
 
 
@@ -369,6 +373,7 @@ def compose_agent(
     config: AgentConfig,
     model: ModelClient,
     tools: Iterable[Tool] = (),
+    tool_registry: ToolRegistry | None = None,
     conversation_store: ConversationStore | None = None,
     decision_policy: DecisionPolicy | None = None,
     execution_profile: ExecutionProfile | None = None,
@@ -409,13 +414,29 @@ def compose_agent(
         else None
     )
     registered_tools = tuple(tools)
+    if tool_registry is not None:
+        if not isinstance(tool_registry, ToolRegistry):
+            raise TypeError("tool_registry must be a ToolRegistry or None")
+        if tuple(tool_registry) != registered_tools:
+            raise ConfigurationError(
+                "tool_registry contents do not match the configured tools"
+            )
     if skill_runtime is not None:
-        registered_tools = (
-            *registered_tools,
-            SkillReadTool(skill_runtime),
-            SkillSearchTool(skill_runtime),
-        )
-    tool_registry = ToolRegistry(registered_tools)
+        skill_tools = (SkillReadTool(skill_runtime), SkillSearchTool(skill_runtime))
+        if tool_registry is None:
+            registered_tools = (*registered_tools, *skill_tools)
+        else:
+            for skill_tool in skill_tools:
+                existing = tool_registry.get(skill_tool.name)
+                if existing is None:
+                    tool_registry.register(skill_tool)
+                elif type(existing) is not type(skill_tool):
+                    raise ConfigurationError(
+                        f"tool_registry reserves Skill Tool name: {skill_tool.name}"
+                    )
+            registered_tools = tuple(tool_registry)
+    if tool_registry is None:
+        tool_registry = ToolRegistry(registered_tools)
     memory_policy = (
         conversation_memory_policy
         if conversation_memory_policy is not None
@@ -1052,6 +1073,7 @@ def _tool_spec(tool: Tool) -> ToolSpec:
         description=schema.description,
         schema_fingerprint=_mapping_fingerprint(schema.to_dict()),
         safety_profile=resolve_tool_safety_profile(tool),
+        side_effect_level=getattr(tool, "side_effect_level", None),
     )
 
 

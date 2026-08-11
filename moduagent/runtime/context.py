@@ -81,6 +81,15 @@ class RunRequest:
     resume_run_id: str | None = None
     requested_skills: tuple[str, ...] = ()
     skill_mode: str = "disabled"
+    # DelegationContext is intentionally typed structurally here. Importing
+    # the delegation package from the kernel context would create a package
+    # cycle, while the runtime only needs its immutable projection.
+    delegation_context: Any | None = field(default=None, repr=False, compare=False)
+    budget_ledger: Any | None = field(default=None, repr=False, compare=False)
+    budget_lease: Any | None = field(default=None, repr=False, compare=False)
+    # Private local-delegation hook. Public Agent.run() never accepts this;
+    # the DelegationCoordinator owns the deterministic child run identity.
+    assigned_run_id: str | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         requested_skills = tuple(self.requested_skills)
@@ -94,6 +103,46 @@ class RunRequest:
             expected = ", ".join(sorted(_SKILL_MODES))
             raise ValueError(f"skill_mode must be one of: {expected}")
         object.__setattr__(self, "requested_skills", requested_skills)
+        delegation_context = self.delegation_context
+        if delegation_context is not None and not callable(
+            getattr(delegation_context, "to_dict", None)
+        ):
+            raise TypeError("delegation_context must provide to_dict()")
+        if self.budget_ledger is not None:
+            for method in ("reserve_model_turn", "reserve_tool_call"):
+                if not callable(getattr(self.budget_ledger, method, None)):
+                    raise TypeError(f"budget_ledger must provide {method}()")
+        if self.budget_lease is not None and not isinstance(
+            getattr(self.budget_lease, "lease_id", None),
+            str,
+        ):
+            raise TypeError("budget_lease must provide a lease_id")
+        if self.assigned_run_id is not None and (
+            not isinstance(self.assigned_run_id, str)
+            or not self.assigned_run_id.strip()
+        ):
+            raise ValueError("assigned_run_id must be a non-empty string or None")
+        if self.assigned_run_id is not None and self.resume_run_id is not None:
+            raise ValueError("assigned_run_id cannot be combined with resume_run_id")
+        if self.budget_lease is not None and self.budget_ledger is None:
+            raise ValueError("budget_lease requires budget_ledger")
+        if delegation_context is not None and (
+            self.budget_ledger is None or self.budget_lease is None
+        ):
+            raise ValueError(
+                "delegation_context requires budget_ledger and budget_lease"
+            )
+        if delegation_context is not None and not callable(
+            getattr(self.budget_ledger, "load_group", None)
+        ):
+            raise TypeError("delegated budget_ledger must provide load_group()")
+        if self.budget_lease is not None:
+            lease_group = getattr(self.budget_lease, "execution_group_id", None)
+            context_group = getattr(delegation_context, "execution_group_id", None)
+            if context_group is not None and lease_group != context_group:
+                raise ValueError(
+                    "delegation context and budget lease execution groups differ"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,6 +339,10 @@ class RunContext:
     diagnostic_reporter: Any | None = field(default=None, repr=False)
     primary_failure: Mapping[str, Any] | None = field(default=None, repr=False)
     tool_failure_ids: dict[str, str] = field(default_factory=dict, repr=False)
+    # Execution-group accounting is rebound from RuntimeBindings and never
+    # serialized as a live object. Checkpoints persist only stable ledger IDs.
+    budget_ledger: Any | None = field(default=None, repr=False, compare=False)
+    budget_lease: Any | None = field(default=None, repr=False, compare=False)
 
     def add_message(self, message: Message, *, persist: bool = True) -> None:
         self.messages.append(message)

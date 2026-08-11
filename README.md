@@ -10,9 +10,9 @@ Start with a normal model or Tool-calling loop. Add bounded Context Memory,
 validated Pydantic output, strict Plan-and-Execute, checkpoint recovery,
 Skills, and observability only when your application needs them.
 
-> Current version: **0.5.3** · Status: **Alpha** · Python **3.10+** · **MIT License**
+> Current version: **0.6.0** · Status: **Alpha** · Python **3.10+** · **MIT License**
 
-New to ModuAgent? Follow the five short steps below. They use the 0.5 Quick
+New to ModuAgent? Follow the five short steps below. They use the stable Quick
 API; the explicit component API remains available for advanced composition.
 For runnable files that add only one concept at a time, start with the
 [beginner examples](https://github.com/nagix999/moduagent/blob/main/examples/README.md).
@@ -31,7 +31,9 @@ Agent ──► Execution profile ──► Model
   │              │                │
   │              └──────────────► Tools
   │
-  ├── Conversation store + memory policy
+  ├── AgentDefinition + RuntimeBindings/Profile
+  ├── Conversation store + Context Memory
+  ├── Delegation coordinator + shared budget
   ├── Output codec
   ├── Checkpoint store
   ├── Skills and authorization
@@ -47,6 +49,10 @@ Agent ──► Execution profile ──► Model
 - An output codec returns text or a validated Pydantic object.
 - A conversation store saves history; a memory policy selects the model view.
 - A checkpoint store saves interrupted runs for safe recovery.
+- An `AgentDefinition` pins deployable semantics while `RuntimeBindings` holds
+  replaceable endpoints, stores, credentials, and telemetry.
+- A delegation coordinator applies lineage, topology, deadline, aggregate
+  budget, session namespace, and receipt guards before a child model runs.
 
 Most applications should start with a model and a small set of Tools. Add the
 other components as requirements appear.
@@ -72,10 +78,10 @@ server; ModuAgent does not host a model itself.
 Install the package:
 
 ```bash
-python -m pip install "moduagent==0.5.3"
+python -m pip install "moduagent==0.6.0"
 ```
 
-If your package index does not contain `0.5.3` yet and you already have a 0.5
+If your package index does not contain `0.6.0` yet and you already have a 0.6
 source checkout, install it from the repository root:
 
 ```bash
@@ -598,7 +604,7 @@ are not stored by the guard.
 
 ## Framework boundary
 
-ModuAgent 0.5 does not include domain Recipes, a Workflow DSL, database
+ModuAgent 0.6 does not include domain Recipes, a Workflow DSL, database
 abstractions, SQL generation, or report-specific behavior. The framework
 composes and runs the components; the application remains responsible for:
 
@@ -678,6 +684,87 @@ older context must be retained. See the
 If exact vLLM tokenization is used repeatedly, wrap the counter with
 `CachingTokenCounter`; it stores only a bounded keyed digest and successful
 token count.
+
+For long durable sessions, 0.6 also provides
+`DurableSummarizingConversationMemoryPolicy`. It reads only the paginated tail
+after a monotonic summary cursor and writes a tenant/Agent/session/policy-bound
+summary v2 snapshot through compare-and-swap. It requires a conversation store
+with a native bounded `load_tail()` implementation; a full-blob compatibility
+fallback is rejected. See the Context Memory guide for Redis list mode,
+database repository, reset, and legacy-summary migration requirements.
+
+Wrap the raw history backend in `ScopedConversationStore`; its default
+`key_mode="shared"` isolates equal public session IDs across tenant/Agent
+namespaces. For a 0.5 `MemorySnapshot`, bind the dedicated legacy state
+namespace with `ScopedLegacyMemoryStateStore` and pass it as
+`legacy_state_store=`. On the first v2 miss, the loader scans the canonical
+prefix twice with bounded pagination and writes v2 only when the count, digest,
+store-issued IDs, and both scans agree. `ContextAssembler` then budgets system
+and Skill policy, current task/run, Tool protocol, Tool/output schemas, optional
+summary, and recent complete turns together. A newly generated summary is
+committed only if selected; a persisted summary or CAS winner that does not fit
+is omitted while the required/recent-only request continues.
+
+## Advanced composition: delegate to a versioned Agent
+
+Use `Agent.as_tool()` when one Agent should call another. Both Agents have an
+exact-version `AgentDefinition`; the registry resolves only that version, and
+the coordinator checks authorization, topology, cycles, depth, deadline,
+aggregate model/Tool budgets, child session isolation, and receipts before the
+child model is called.
+
+```python
+from moduagent import (
+    Agent,
+    AgentEndpoint,
+    DefinitionStatus,
+    InMemoryAgentRegistry,
+    RuntimeBindings,
+)
+from moduagent.delegation import DelegationCoordinator, DelegationPolicy
+
+registry = InMemoryAgentRegistry()
+registry.register(
+    specialist_definition,
+    AgentEndpoint(handler=specialist, approved=True),
+    status=DefinitionStatus.ACTIVE,
+)
+coordinator = DelegationCoordinator(
+    registry=registry,
+    policy=DelegationPolicy(
+        allowed_edges={"supervisor": {"specialist"}},
+        allowed_tenants={"tenant-a"},
+        allowed_principals={"analyst-1"},
+    ),
+)
+ask_specialist = specialist.as_tool(
+    coordinator=coordinator,
+    caller=supervisor_definition.ref,
+    input_model=ResearchRequest,
+    output_model=ResearchAnswer,
+    name="ask_specialist",
+)
+supervisor = Agent.create(
+    name="supervisor",
+    model=model,
+    instructions="Delegate specialist work, then answer.",
+    tools=(ask_specialist,),
+    definition=supervisor_definition,
+    runtime_bindings=RuntimeBindings(
+        tenant_context_provider=lambda: "tenant-a",
+        principal_context_provider=lambda: "analyst-1",
+    ),
+)
+```
+
+The complete [offline runnable example and operations guide](https://github.com/nagix999/moduagent/blob/main/docs/delegation.md)
+defines the Pydantic contracts and both definitions. In-memory registry,
+budget, and receipt implementations are for one-process development. Production
+delegation requires durable atomic-CAS store implementations, the same stable
+HMAC secret/namespace on every worker, isolated child sessions, and
+application-level idempotency for external side effects. Legacy `AgentTool`
+remains available for compatibility but does not provide these execution-group
+guarantees and is rejected by the Production profile.
 
 ### Application example: report automation
 
@@ -878,6 +965,14 @@ Agent configuration. Resume only when `error_summary["resumable"]` is true.
 `InMemoryCheckpointStore` demonstrates same-process recovery only; it loses
 all checkpoints when the process exits.
 
+ModuAgent 0.6 writes checkpoint envelope v5 and event envelope v2; built-in
+Engine state remains v1. Checkpoint v1-v4 can be read through
+`migrate_checkpoint_payload()`, but 0.5.x cannot read v5. Durable Context Memory
+uses its independent summary schema v2. Read the
+[0.6 migration guide](https://github.com/nagix999/moduagent/blob/main/docs/migration-0.6.md)
+before sharing a storage namespace between mixed-version workers or planning a
+rollback.
+
 - `retryable` means a new run may be attempted.
 - `resumable` means the saved run can continue without replaying an unsafe
   side effect.
@@ -977,6 +1072,9 @@ the specification.
 
 - Replace in-memory conversation, checkpoint, and summary stores with durable
   stores.
+- For delegation, replace the in-memory registry, budget ledger, and receipt
+  store with exact-version and atomic-CAS durable implementations; keep one
+  stable HMAC secret and namespace across workers.
 - Set model, Tool, database, and overall run timeouts independently.
 - A timeout around a synchronous Python Tool cannot forcibly stop the
   underlying thread. Configure a driver or server-side statement timeout too.
@@ -984,6 +1082,14 @@ the specification.
   steps, and Tool calls.
 - Declare retry or changed-argument repair safety only after reviewing Tool
   side effects.
+- Classify every Production Tool as `none`, `read`, `advisory`, or `write`.
+  The 0.6 Production profile accepts only the first three and freezes the Tool
+  registry after validation; write Tools require a future enforced approval
+  plane and remain fail-closed.
+- Treat model, Tool, adapter, and composition code loaded in the Python process
+  as trusted deployment code. Registry freezing blocks supported post-validation
+  replacement APIs; it is not a sandbox against code that mutates objects or
+  monkey-patches the process.
 - Give write Tools application-level idempotency keys and duplicate handling.
 - Use `ToolAuthorizer` or RBAC; Skill `allowed-tools` only narrows scope.
 - Keep the default summary Tool trace unless argument logging has a clear,
@@ -994,6 +1100,10 @@ the specification.
   for conversations, checkpoints, events, and generated artifacts.
 - Record `agent.inspect()` with the deployment and test resume behavior before
   upgrading a live Agent.
+- Treat `RuntimeAttestation` as application-owned Test-profile metadata. Its
+  canonical digest detects accidental fact substitution, but it is not a
+  signature or a security boundary; derive the facts in trusted deployment
+  code and do not accept them from prompts or request payloads.
 - Send public streams to users and internal events to protected `EventSink`
   implementations. Store failure diagnostics in a separately access-controlled
   `DiagnosticSink`.
@@ -1040,6 +1150,7 @@ Use Redis or a durable custom store for multi-process or restart-safe systems.
 | Choose execution | `StandardExecutionProfile`, `PlanExecutionProfile` |
 | Validate output | `PydanticOutputCodec`, `TextOutputCodec` |
 | Keep bounded session context | `ConversationStore`, `RecentTurnsConversationMemoryPolicy` |
+| Delegate typed child work | `AgentDefinition`, `Agent.as_tool()`, `moduagent.delegation.DelegationCoordinator` |
 | Resume work | `CheckpointStore`, `Agent.resume()` |
 | Add domain procedures | `SkillRegistry`, `SkillSelector` |
 | Observe runs | `Agent.stream_all()`, `EventSink`, `DiagnosticSink`, `failure_id` |
@@ -1068,6 +1179,8 @@ The detailed guides are currently written in Korean.
   strict state machine and recovery details.
 - [Context Memory](https://github.com/nagix999/moduagent/blob/main/docs/conversation-memory-policy.md):
   bounded session context, token budgets, and summarization.
+- [Agent delegation](https://github.com/nagix999/moduagent/blob/main/docs/delegation.md):
+  versioned child Agents, aggregate budgets, receipts, and operations.
 - [Agent Skills](https://github.com/nagix999/moduagent/blob/main/docs/skills.md):
   reusable procedures and resource access.
 - [Operations](https://github.com/nagix999/moduagent/blob/main/docs/operations.md):
@@ -1078,6 +1191,8 @@ The detailed guides are currently written in Korean.
   source compatibility and checkpoint migration.
 - [0.5 migration](https://github.com/nagix999/moduagent/blob/main/docs/migration-0.5.md):
   Quick API, safety changes, and the migration-free 0.5.3 PATCH.
+- [0.6 migration](https://github.com/nagix999/moduagent/blob/main/docs/migration-0.6.md):
+  definitions, delegation, checkpoint/event/summary schemas, and rollout limits.
 - [Changelog](https://github.com/nagix999/moduagent/blob/main/CHANGELOG.md)
 
 ## Development

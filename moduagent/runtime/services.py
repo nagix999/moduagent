@@ -53,6 +53,7 @@ from moduagent.tools import (
     ToolError,
     ToolErrorType,
     ToolExecutionContext,
+    ToolExecutionIdentity,
     ToolFailureClassification,
     ToolRepairConstraint,
     ToolResult,
@@ -234,6 +235,11 @@ class RuntimeServices:
         *,
         phase: str,
     ) -> ModelGuardSnapshot:
+        await self._reserve_execution_group_budget(
+            context,
+            operation="model",
+            count=1,
+        )
         guard = self._require_model_guard()
         try:
             guard_snapshot = guard.before_model_attempt(
@@ -268,6 +274,48 @@ class RuntimeServices:
                 boundary=DurableBoundary.BEFORE_MODEL,
             )
         return guard_snapshot
+
+    @staticmethod
+    async def _reserve_execution_group_budget(
+        context: EngineContext,
+        *,
+        operation: str,
+        count: int,
+    ) -> None:
+        """Durably reserve aggregate root/child usage before external work."""
+
+        if count < 1:
+            return
+        ledger = context.run.budget_ledger
+        if ledger is None:
+            return
+        lease = context.run.budget_lease
+        execution_group_id = getattr(lease, "execution_group_id", None)
+        if not isinstance(execution_group_id, str) or not execution_group_id:
+            delegation_context = context.run.request.delegation_context
+            execution_group_id = getattr(
+                delegation_context,
+                "execution_group_id",
+                None,
+            )
+        if not isinstance(execution_group_id, str) or not execution_group_id:
+            candidate = context.run.metadata.get("_moduagent_execution_group_id")
+            execution_group_id = candidate if isinstance(candidate, str) else None
+        if not execution_group_id:
+            raise ExecutionInvariantError(
+                "execution-group budget is missing an execution_group_id"
+            )
+        if operation == "model":
+            reserve = getattr(ledger, "reserve_model_turn", None)
+        elif operation == "tool":
+            reserve = getattr(ledger, "reserve_tool_call", None)
+        else:  # pragma: no cover - internal programming error
+            raise ExecutionInvariantError("unknown execution-group budget operation")
+        if not callable(reserve):
+            raise ExecutionInvariantError(
+                "execution-group budget ledger is missing a reservation method"
+            )
+        await reserve(execution_group_id, count=count)
 
     def _observe_model_response(
         self,
@@ -1004,6 +1052,86 @@ class RuntimeServices:
         execute_many = getattr(executor, "execute_many", None)
         if not callable(execute_batch) and not callable(execute_many):
             raise ToolInvocationError("Tool executor must provide a batch operation")
+        from moduagent.delegation import (
+            DELEGATION_EVENT_CALLBACK_KEY,
+            DelegationEvent,
+        )
+
+        async def publish_delegation_event(event: DelegationEvent) -> None:
+            if not isinstance(event, DelegationEvent):
+                raise TypeError("delegation event callback requires DelegationEvent")
+            expected_group = context.run.metadata.get("_moduagent_execution_group_id")
+            if event.execution_group_id != expected_group:
+                raise ExecutionInvariantError(
+                    "delegation event execution group does not match the run"
+                )
+            parent_context = context.run.metadata.get(
+                "_moduagent_parent_delegation_context"
+            )
+            parent_lineage = getattr(parent_context, "lineage", None)
+            current_call_ids = {
+                call.id for call in calls if isinstance(getattr(call, "id", None), str)
+            }
+            if (
+                parent_lineage is None
+                or event.caller != parent_lineage.agent_ref
+                or event.lineage != parent_lineage
+                or event.parent_tool_call_id not in current_call_ids
+                or not isinstance(event.child_run_id, str)
+                or not event.child_run_id
+            ):
+                raise ExecutionInvariantError(
+                    "delegation event lineage does not match the parent run"
+                )
+            projection = event.to_dict()
+            identity = self.runtime._event_identity(context.run)
+            published = await self.runtime._publish_related_delegation_event(
+                AgentEvent(
+                    EventType(event.type.value),
+                    context.run.run_id,
+                    {
+                        key: projection[key]
+                        for key in (
+                            "parent_tool_call_id",
+                            "caller_agent_id",
+                            "callee_agent_id",
+                            "status",
+                            "code",
+                        )
+                    },
+                    visibility=EventVisibility.INTERNAL,
+                    execution_group_id=event.execution_group_id,
+                    root_run_id=identity["root_run_id"],
+                    parent_run_id=identity["parent_run_id"],
+                    child_run_id=event.child_run_id,
+                    delegation_id=event.delegation_id,
+                    agent_id=identity["agent_id"],
+                    agent_version=identity["agent_version"],
+                    depth=identity["depth"],
+                ),
+            )
+            await self._enqueue_event(published)
+
+        delegation_metadata = {
+            key: context.run.metadata[key]
+            for key in (
+                "_moduagent_parent_delegation_context",
+                "_moduagent_execution_group_id",
+            )
+            if key in context.run.metadata
+        }
+        delegation_metadata[DELEGATION_EVENT_CALLBACK_KEY] = publish_delegation_event
+        tenant_id = context.run.metadata.get("_moduagent_tenant")
+        principal_id = context.run.metadata.get("_moduagent_principal")
+        trusted_identity = (
+            ToolExecutionIdentity(
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                delegated=context.run.request.delegation_context is not None,
+            )
+            if isinstance(tenant_id, str) and isinstance(principal_id, str)
+            else None
+        )
         tool_context = ToolExecutionContext(
             run_id=context.run.run_id,
             session_id=context.run.request.session_id,
@@ -1014,7 +1142,9 @@ class RuntimeServices:
                     activation.to_dict()
                     for activation in context.run.skill_state.active_skills
                 ],
+                **delegation_metadata,
             },
+            trusted_identity=trusted_identity,
         )
         capabilities = getattr(self.runtime.model, "capabilities", None)
         parallel = bool(
@@ -1022,6 +1152,11 @@ class RuntimeServices:
             and getattr(capabilities, "parallel_tool_calling", True)
         )
         self._validate_skill_resource_batch(context, calls)
+        await self._reserve_execution_group_budget(
+            context,
+            operation="tool",
+            count=len(calls),
+        )
         if self.runtime.checkpoint_store is not None:
             # Until a post-outcome Engine checkpoint proves otherwise, an
             # interrupted invocation may have completed outside this process.

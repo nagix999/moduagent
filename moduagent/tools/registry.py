@@ -10,10 +10,13 @@ class ToolRegistry:
 
     def __init__(self, tools: Iterable[Tool] = ()) -> None:
         self._tools: dict[str, Tool] = {}
+        self._frozen = False
         for tool in tools:
             self.register(tool)
 
     def register(self, tool: Tool, *, replace: bool = False) -> Tool:
+        if self._frozen:
+            raise RuntimeError("tool registry is frozen")
         name = str(tool.name)
         if not name.strip():
             raise ValueError("tool name cannot be empty")
@@ -23,6 +26,8 @@ class ToolRegistry:
         return tool
 
     def unregister(self, name: str) -> Tool:
+        if self._frozen:
+            raise RuntimeError("tool registry is frozen")
         try:
             return self._tools.pop(name)
         except KeyError as exc:
@@ -54,6 +59,16 @@ class ToolRegistry:
     @property
     def schema_list(self) -> tuple[ToolSchema, ...]:
         return self.schemas()
+
+    @property
+    def is_frozen(self) -> bool:
+        return self._frozen
+
+    def freeze(self) -> ToolRegistry:
+        """Seal the composition against post-validation Tool replacement."""
+
+        self._frozen = True
+        return self
 
     def __contains__(self, name: object) -> bool:
         return name in self._tools

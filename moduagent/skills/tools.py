@@ -37,6 +37,7 @@ class SkillReadTool:
         "Read one bounded UTF-8 page from references/ or assets/ of an active Skill."
     )
     idempotent = True
+    side_effect_level = "read"
     timeout_seconds = 10.0
     max_result_bytes = 256 * 1024
     is_skill_resource_tool = True
@@ -149,6 +150,7 @@ class SkillSearchTool:
         "Search bounded UTF-8 content in references/ or assets/ of an active Skill."
     )
     idempotent = True
+    side_effect_level = "read"
     timeout_seconds = 10.0
     max_result_bytes = 256 * 1024
     is_skill_resource_tool = True

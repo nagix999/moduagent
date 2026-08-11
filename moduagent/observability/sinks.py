@@ -148,6 +148,62 @@ _OBSERVABILITY_EVENT_FIELDS: Mapping[EventType, tuple[str, ...]] = {
         "dropped_messages",
         "duration_seconds",
     ),
+    EventType.DELEGATION_REQUESTED: (
+        "parent_tool_call_id",
+        "caller_agent_id",
+        "callee_agent_id",
+        "status",
+        "code",
+    ),
+    EventType.DELEGATION_AUTHORIZED: (
+        "parent_tool_call_id",
+        "caller_agent_id",
+        "callee_agent_id",
+        "status",
+        "code",
+    ),
+    EventType.DELEGATION_REJECTED: (
+        "parent_tool_call_id",
+        "caller_agent_id",
+        "callee_agent_id",
+        "status",
+        "code",
+    ),
+    EventType.DELEGATION_STARTED: (
+        "parent_tool_call_id",
+        "caller_agent_id",
+        "callee_agent_id",
+        "status",
+        "code",
+    ),
+    EventType.DELEGATION_RESUMED: (
+        "parent_tool_call_id",
+        "caller_agent_id",
+        "callee_agent_id",
+        "status",
+        "code",
+    ),
+    EventType.DELEGATION_COMPLETED: (
+        "parent_tool_call_id",
+        "caller_agent_id",
+        "callee_agent_id",
+        "status",
+        "code",
+    ),
+    EventType.DELEGATION_FAILED: (
+        "parent_tool_call_id",
+        "caller_agent_id",
+        "callee_agent_id",
+        "status",
+        "code",
+    ),
+    EventType.DELEGATION_RECONCILIATION_REQUIRED: (
+        "parent_tool_call_id",
+        "caller_agent_id",
+        "callee_agent_id",
+        "status",
+        "code",
+    ),
     EventType.TOOL_STARTED: (),
     EventType.TOOL_COMPLETED: (),
     EventType.TOOL_REPAIR_SCHEDULED: (
@@ -232,6 +288,10 @@ class CompositeEventSink:
     # type, avoiding the former Coordinator copy plus one copy per child.
     handles_event_isolation = True
 
+    @property
+    def content_safe(self) -> bool:
+        return all(getattr(sink, "content_safe", False) is True for sink in self.sinks)
+
     def __init__(
         self,
         sinks: Iterable[EventSink] | EventSink = (),
@@ -282,6 +342,8 @@ class CompositeEventSink:
 
 
 class LoggingEventSink:
+    content_safe = True
+
     def __init__(
         self,
         logger: logging.Logger | None = None,
@@ -377,6 +439,8 @@ class InMemoryMetricRecorder:
 
 
 class MetricsEventSink:
+    content_safe = True
+
     """Record run, latency, tool, failure and token metrics from AgentEvents."""
 
     def __init__(
@@ -585,6 +649,8 @@ class MetricsEventSink:
 
 class AuditEventSink:
     """Write security-relevant, recursively redacted event records."""
+
+    content_safe = True
 
     DEFAULT_EVENT_TYPES = frozenset(
         {

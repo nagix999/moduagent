@@ -23,6 +23,7 @@ from moduagent.persistence.snapshot import (
     FinalizationMarkers,
     RunSnapshot,
     current_runtime_version,
+    identity_scope_digest,
 )
 from moduagent.runtime.context import (
     RunContext,
@@ -45,16 +46,28 @@ _RUNTIME_SNAPSHOT_METADATA_KEYS = frozenset(
         "_moduagent_resume_safety",
         "_moduagent_runtime_version",
         "_moduagent_terminal_reason",
+        "_moduagent_run_lineage",
+        "_moduagent_execution_group_id",
+        "_moduagent_agent_ref",
+        "_moduagent_agent_definition_fingerprint",
+        "_moduagent_delegation_id",
+        "_moduagent_parent_tool_call_id",
+        "_moduagent_budget_lease_id",
+        "_moduagent_parent_delegation_context",
+        "_moduagent_execution_group_deadline",
+        "_moduagent_migrated_from_schema_version",
+        "_moduagent_tenant_scope_digest",
+        "_moduagent_principal_scope_digest",
     }
 )
 
 
 @dataclass(frozen=True, slots=True)
 class RunCheckpoint:
-    """Backward-compatible facade over a v4 :class:`RunSnapshot`.
+    """Backward-compatible facade over a v5 :class:`RunSnapshot`.
 
     Construction and context conversion retain the 0.3 API. Serialization is
-    always the v4 envelope; legacy v1-v3 payloads are copy-migrated on read.
+    always the v5 envelope; legacy v1-v4 payloads are copy-migrated on read.
     """
 
     run_id: str
@@ -92,6 +105,18 @@ class RunCheckpoint:
         repr=False,
         compare=False,
     )
+    # Additive v5 delegation identity. Live coordinators/ledgers are never
+    # serialized; only immutable references are retained.
+    run_lineage: Mapping[str, Any] = field(default_factory=dict)
+    execution_group_id: str | None = None
+    agent_ref: Mapping[str, Any] = field(default_factory=dict)
+    agent_definition_fingerprint: str | None = None
+    delegation_id: str | None = None
+    parent_tool_call_id: str | None = None
+    budget_lease_id: str | None = None
+    migrated_from_schema_version: int | None = None
+    tenant_scope_digest: str | None = None
+    principal_scope_digest: str | None = None
 
     def __post_init__(self) -> None:
         _validate_identifier(self.run_id, "run_id")
@@ -127,6 +152,58 @@ class RunCheckpoint:
         object.__setattr__(self, "user_context", copy.deepcopy(dict(self.user_context)))
         object.__setattr__(self, "policy_state", copy.deepcopy(dict(self.policy_state)))
         object.__setattr__(self, "metadata", copy.deepcopy(dict(self.metadata)))
+        lineage = copy.deepcopy(dict(self.run_lineage))
+        if not lineage:
+            lineage = {
+                "root_run_id": self.run_id,
+                "parent_run_id": None,
+                "depth": 0,
+                "agent_path": [],
+            }
+        object.__setattr__(self, "run_lineage", lineage)
+        object.__setattr__(
+            self,
+            "execution_group_id",
+            (
+                str(lineage.get("root_run_id", self.run_id))
+                if self.execution_group_id is None
+                else self.execution_group_id
+            ),
+        )
+        object.__setattr__(self, "agent_ref", copy.deepcopy(dict(self.agent_ref)))
+        object.__setattr__(
+            self,
+            "agent_definition_fingerprint",
+            (
+                self.agent_fingerprint
+                if self.agent_definition_fingerprint is None
+                else self.agent_definition_fingerprint
+            ),
+        )
+        for value, field_name in (
+            (self.execution_group_id, "execution_group_id"),
+            (self.agent_definition_fingerprint, "agent_definition_fingerprint"),
+            (self.delegation_id, "delegation_id"),
+            (self.parent_tool_call_id, "parent_tool_call_id"),
+            (self.budget_lease_id, "budget_lease_id"),
+        ):
+            if value is not None:
+                _validate_identifier(value, field_name)
+        if self.migrated_from_schema_version is not None and (
+            type(self.migrated_from_schema_version) is not int
+            or self.migrated_from_schema_version not in {1, 2, 3, 4}
+        ):
+            raise ValueError("migrated_from_schema_version must be 1-4 or None")
+        for value, field_name in (
+            (self.tenant_scope_digest, "tenant_scope_digest"),
+            (self.principal_scope_digest, "principal_scope_digest"),
+        ):
+            if value is not None and (
+                not isinstance(value, str)
+                or not value.startswith("sha256:")
+                or len(value) != 71
+            ):
+                raise ValueError(f"{field_name} must use sha256")
         execution_state = _execution_state_to_dict(self.execution_state)
         object.__setattr__(self, "execution_state", execution_state)
         if self.engine_state is not None:
@@ -261,6 +338,7 @@ class RunCheckpoint:
             ),
             event_sequence=int(context.metadata.get("_moduagent_event_sequence", 0)),
             engine_state=engine_state,
+            **_checkpoint_delegation_fields(context),
         )
 
     @classmethod
@@ -363,6 +441,16 @@ class RunCheckpoint:
             resume_safety=common.resume_safety,
             event_sequence=common.event_sequence,
             engine_state=snapshot.engine.state,
+            run_lineage=snapshot.run_lineage,
+            execution_group_id=snapshot.execution_group_id,
+            agent_ref=snapshot.agent_ref,
+            agent_definition_fingerprint=(snapshot.agent_definition_fingerprint),
+            delegation_id=snapshot.delegation_id,
+            parent_tool_call_id=snapshot.parent_tool_call_id,
+            budget_lease_id=snapshot.budget_lease_id,
+            migrated_from_schema_version=snapshot.migrated_from_schema_version,
+            tenant_scope_digest=snapshot.tenant_scope_digest,
+            principal_scope_digest=snapshot.principal_scope_digest,
         )
 
     def to_snapshot(self) -> RunSnapshot:
@@ -419,6 +507,16 @@ class RunCheckpoint:
             finalization_markers=markers,
             created_at=self.created_at,
             updated_at=self.updated_at,
+            run_lineage=self.run_lineage,
+            execution_group_id=self.execution_group_id,
+            agent_ref=self.agent_ref,
+            agent_definition_fingerprint=self.agent_definition_fingerprint,
+            delegation_id=self.delegation_id,
+            parent_tool_call_id=self.parent_tool_call_id,
+            budget_lease_id=self.budget_lease_id,
+            migrated_from_schema_version=self.migrated_from_schema_version,
+            tenant_scope_digest=self.tenant_scope_digest,
+            principal_scope_digest=self.principal_scope_digest,
         )
 
     def to_context(self) -> RunContext:
@@ -442,6 +540,20 @@ class RunCheckpoint:
         metadata.pop("_moduagent_engine", None)
         metadata["_moduagent_resume_safety"] = self.resume_safety
         metadata["_moduagent_event_sequence"] = self.event_sequence
+        metadata["_moduagent_run_lineage"] = copy.deepcopy(dict(self.run_lineage))
+        metadata["_moduagent_execution_group_id"] = self.execution_group_id
+        metadata["_moduagent_agent_ref"] = copy.deepcopy(dict(self.agent_ref))
+        metadata["_moduagent_agent_definition_fingerprint"] = (
+            self.agent_definition_fingerprint
+        )
+        metadata["_moduagent_delegation_id"] = self.delegation_id
+        metadata["_moduagent_parent_tool_call_id"] = self.parent_tool_call_id
+        metadata["_moduagent_budget_lease_id"] = self.budget_lease_id
+        metadata["_moduagent_migrated_from_schema_version"] = (
+            self.migrated_from_schema_version
+        )
+        metadata["_moduagent_tenant_scope_digest"] = self.tenant_scope_digest
+        metadata["_moduagent_principal_scope_digest"] = self.principal_scope_digest
         if self.terminal_reason is not None:
             metadata["_moduagent_terminal_reason"] = self.terminal_reason
         return RunContext(
@@ -556,7 +668,7 @@ def _build_run_snapshot(
     agent_fingerprint: str | None = None,
     updated_at: datetime | None = None,
 ) -> RunSnapshot:
-    """Build a current v4 snapshot without round-tripping through legacy v3.
+    """Build a current v5 snapshot without round-tripping through legacy v3.
 
     The legacy :class:`RunCheckpoint` facade remains authoritative for old
     ``CheckpointStore.save()`` adapters and v1-v3 reads. SnapshotStore writes
@@ -639,6 +751,7 @@ def _build_run_snapshot(
             )
         )
     )
+    delegation_fields = _checkpoint_delegation_fields(context)
     return RunSnapshot(
         runtime_version=str(
             context.metadata.get(
@@ -656,7 +769,93 @@ def _build_run_snapshot(
         sanitized_runtime_metadata=_sanitize_runtime_metadata(raw_metadata),
         created_at=context.created_at,
         updated_at=updated_at or datetime.now(timezone.utc),
+        **delegation_fields,
     )
+
+
+def _checkpoint_delegation_fields(context: RunContext) -> dict[str, Any]:
+    """Project run-scoped delegation state into the v5 durable envelope."""
+
+    raw_context = context.request.delegation_context
+    projected: Mapping[str, Any] = {}
+    if raw_context is not None:
+        to_dict = getattr(raw_context, "to_dict", None)
+        if callable(to_dict):
+            candidate = to_dict()
+            if isinstance(candidate, Mapping):
+                projected = candidate
+    raw_lineage = projected.get("lineage", projected.get("run_lineage", {}))
+    if not isinstance(raw_lineage, Mapping):
+        raw_lineage = {}
+    metadata_lineage = context.metadata.get("_moduagent_run_lineage", {})
+    if not raw_lineage and isinstance(metadata_lineage, Mapping):
+        raw_lineage = metadata_lineage
+    lineage = copy.deepcopy(dict(raw_lineage))
+    if not lineage:
+        lineage = {
+            "root_run_id": context.run_id,
+            "parent_run_id": None,
+            "depth": 0,
+            "agent_path": [],
+        }
+    execution_group_id = (
+        projected.get("execution_group_id")
+        or context.metadata.get("_moduagent_execution_group_id")
+        or lineage.get("root_run_id")
+        or context.run_id
+    )
+    raw_agent_ref = context.metadata.get("_moduagent_agent_ref", {})
+    agent_ref = dict(raw_agent_ref) if isinstance(raw_agent_ref, Mapping) else {}
+    fingerprint = str(
+        context.metadata.get(
+            "_moduagent_agent_definition_fingerprint",
+            context.metadata.get(
+                "_moduagent_agent_fingerprint",
+                "legacy-unbound",
+            ),
+        )
+    )
+    lease = context.budget_lease
+    lease_id = getattr(lease, "lease_id", None) if lease is not None else None
+    return {
+        "run_lineage": lineage,
+        "execution_group_id": str(execution_group_id),
+        "agent_ref": agent_ref,
+        "agent_definition_fingerprint": fingerprint,
+        "delegation_id": _optional_identifier(
+            projected.get("delegation_id")
+            or lineage.get("delegation_id")
+            or context.metadata.get("_moduagent_delegation_id")
+        ),
+        "parent_tool_call_id": _optional_identifier(
+            projected.get("parent_tool_call_id")
+            or lineage.get("parent_tool_call_id")
+            or context.metadata.get("_moduagent_parent_tool_call_id")
+        ),
+        "budget_lease_id": _optional_identifier(
+            lease_id or context.metadata.get("_moduagent_budget_lease_id")
+        ),
+        "tenant_scope_digest": _scope_digest_from_context(context, "tenant"),
+        "principal_scope_digest": _scope_digest_from_context(context, "principal"),
+    }
+
+
+def _scope_digest_from_context(context: RunContext, kind: str) -> str | None:
+    metadata_key = f"_moduagent_{kind}_scope_digest"
+    value = context.metadata.get(metadata_key)
+    if isinstance(value, str) and value:
+        return value
+    identity = context.metadata.get(f"_moduagent_{kind}")
+    if not isinstance(identity, str) or not identity:
+        return None
+    return identity_scope_digest(kind, identity)
+
+
+def _optional_identifier(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
 
 
 @runtime_checkable
@@ -684,6 +883,8 @@ class SnapshotStore(Protocol):
 
 
 class InMemoryCheckpointStore:
+    durable = False
+
     def __init__(
         self,
         *,
@@ -715,7 +916,7 @@ class InMemoryCheckpointStore:
             if legacy_payload is None:
                 return None
             snapshot = _snapshot_from_json(legacy_payload)
-            # Copy-on-migrate: write and verify the v4 candidate while retaining
+            # Copy-on-migrate: write and verify the v5 candidate while retaining
             # the exact legacy payload under its original slot.
             encoded = snapshot.to_json()
             verified = RunSnapshot.from_json(encoded)
@@ -784,6 +985,7 @@ class InMemoryCheckpointStore:
 
 
 class RedisCheckpointStore:
+    durable = True
     """Versioned checkpoint storage over a sync or async Redis-style client."""
 
     def __init__(
@@ -807,27 +1009,37 @@ class RedisCheckpointStore:
 
     async def load_snapshot(self, run_id: str) -> RunSnapshot | None:
         _validate_identifier(run_id, "run_id")
+        v5_payload = await _call(self._client.get, self._v5_key(run_id))
+        if v5_payload is not None:
+            return RunSnapshot.from_json(v5_payload)
         v4_payload = await _call(self._client.get, self._v4_key(run_id))
         if v4_payload is not None:
-            return RunSnapshot.from_json(v4_payload)
+            snapshot = RunSnapshot.from_json(v4_payload)
+            return await self._write_and_verify_v5(snapshot)
         legacy_payload = await _call(self._client.get, self._legacy_key(run_id))
         if legacy_payload is None:
             return None
         snapshot = _snapshot_from_json(legacy_payload)
+        return await self._write_and_verify_v5(snapshot)
+
+    async def _write_and_verify_v5(self, snapshot: RunSnapshot) -> RunSnapshot:
         encoded = snapshot.to_json()
         await _redis_set(
             self._client,
-            self._v4_key(run_id),
+            self._v5_key(snapshot.run_id),
             encoded,
             self._ttl_seconds,
         )
-        verified_payload = await _call(self._client.get, self._v4_key(run_id))
+        verified_payload = await _call(
+            self._client.get,
+            self._v5_key(snapshot.run_id),
+        )
         if verified_payload is None:
-            raise RuntimeError("v4 checkpoint migration read-back failed")
+            raise RuntimeError("v5 checkpoint migration read-back failed")
         verified = RunSnapshot.from_json(verified_payload)
         if verified.to_json() != encoded:
-            raise RuntimeError("v4 checkpoint migration verification failed")
-        # The legacy key is deliberately retained.
+            raise RuntimeError("v5 checkpoint migration verification failed")
+        # Previous-version keys are deliberately retained for rollback.
         return verified
 
     async def save(
@@ -842,7 +1054,7 @@ class RedisCheckpointStore:
             raise TypeError("snapshot must be a RunSnapshot")
         await _redis_set(
             self._client,
-            self._v4_key(snapshot.run_id),
+            self._v5_key(snapshot.run_id),
             snapshot.to_json(),
             self._ttl_seconds,
         )
@@ -876,6 +1088,7 @@ class RedisCheckpointStore:
 
     async def delete(self, run_id: str) -> None:
         _validate_identifier(run_id, "run_id")
+        await _call(self._client.delete, self._v5_key(run_id))
         await _call(self._client.delete, self._v4_key(run_id))
         await _call(self._client.delete, self._legacy_key(run_id))
 
@@ -886,6 +1099,10 @@ class RedisCheckpointStore:
     def _v4_key(self, run_id: str) -> str:
         _validate_identifier(run_id, "run_id")
         return f"{self._key_prefix}v4:{run_id}"
+
+    def _v5_key(self, run_id: str) -> str:
+        _validate_identifier(run_id, "run_id")
+        return f"{self._key_prefix}v5:{run_id}"
 
 
 async def _redis_set(

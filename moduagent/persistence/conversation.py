@@ -6,6 +6,7 @@ import json
 import math
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from moduagent.errors import PersistenceError
@@ -18,6 +19,16 @@ _SERIALIZATION_VERSION = 1
 
 class ConversationStoreCapacityError(PersistenceError):
     """An in-memory conversation cannot fit within its configured capacity."""
+
+
+class ConversationCursorError(PersistenceError):
+    """A pagination cursor is outside the current conversation contents.
+
+    The v1 pagination SPI uses an absolute append offset; it does not expose a
+    durable per-session generation token. Consumers that coordinate clear and
+    reuse across processes must therefore add their own epoch or use the
+    Context Memory loader's bounded optimistic revalidation.
+    """
 
 
 def serialize_messages(messages: Sequence[Message]) -> str:
@@ -55,6 +66,67 @@ class ConversationStore(Protocol):
     async def clear(self, session_id: str) -> None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class SequencedMessage:
+    """One message with its store-assigned, one-based append sequence."""
+
+    sequence: int
+    message_id: str
+    message: Message
+
+    def __post_init__(self) -> None:
+        if type(self.sequence) is not int or self.sequence < 1:
+            raise ValueError("message sequence must be a positive integer")
+        _validate_identifier(self.message_id, "message_id")
+        if not isinstance(self.message, Message):
+            raise TypeError("message must be a Message")
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationPage:
+    """Forward page returned by ``load_tail`` after an exclusive cursor."""
+
+    items: tuple[SequencedMessage, ...]
+    after_sequence: int
+    next_sequence: int
+    has_more: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "items", tuple(self.items))
+        _validate_after_sequence(self.after_sequence)
+        if type(self.next_sequence) is not int or self.next_sequence < 0:
+            raise ValueError("next_sequence cannot be negative")
+        if type(self.has_more) is not bool:
+            raise TypeError("has_more must be a bool")
+        expected = tuple(
+            range(self.after_sequence + 1, self.after_sequence + len(self.items) + 1)
+        )
+        actual = tuple(item.sequence for item in self.items)
+        if actual != expected:
+            raise ValueError("ConversationPage sequences must be contiguous")
+        expected_next = actual[-1] if actual else self.after_sequence
+        if self.next_sequence != expected_next:
+            raise ValueError("next_sequence must equal the last returned sequence")
+
+    @property
+    def messages(self) -> tuple[Message, ...]:
+        return tuple(item.message for item in self.items)
+
+
+@runtime_checkable
+class PaginatedConversationStore(Protocol):
+    """Additive cursor capability for stores that avoid full-history reads."""
+
+    supports_bounded_load_tail: bool
+
+    async def load_tail(
+        self,
+        session_id: str,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> ConversationPage: ...
+
+
 @runtime_checkable
 class IdempotentConversationStore(Protocol):
     """Optional durable capability used for crash-safe run persistence."""
@@ -72,7 +144,142 @@ class IdempotentConversationStore(Protocol):
         ...
 
 
+class ScopedConversationStore:
+    """Bind a ConversationStore to one tenant/Agent namespace explicitly.
+
+    Durable Context Memory requires this capability because the historical
+    ConversationStore SPI accepts only ``session_id``. ``key_mode='shared'``
+    (the default) hashes tenant, Agent and public session into an isolated raw
+    key, so multiple scopes may safely share one backend. ``isolated_legacy``
+    preserves the old raw session key solely for a backend namespace already
+    dedicated to exactly this tenant/Agent pair; it enables in-place migration
+    without silently changing existing keys.
+    """
+
+    supports_tenant_agent_scope = True
+    __slots__ = (
+        "_agent_id",
+        "_durable",
+        "_key_mode",
+        "_store",
+        "_supports_bounded_load_tail",
+        "_supports_idempotent_append",
+        "_tenant_id",
+    )
+
+    def __init__(
+        self,
+        store: ConversationStore,
+        *,
+        tenant_id: str,
+        agent_id: str,
+        key_mode: str = "shared",
+    ) -> None:
+        if not isinstance(store, ConversationStore):
+            raise TypeError("store must implement ConversationStore")
+        _validate_identifier(tenant_id, "tenant_id")
+        _validate_identifier(agent_id, "agent_id")
+        if key_mode not in {"shared", "isolated_legacy"}:
+            raise ValueError("key_mode must be 'shared' or 'isolated_legacy'")
+        if getattr(store, "supports_tenant_agent_scope", False) is True:
+            raise ValueError("a scoped conversation store cannot be wrapped again")
+        self._store = store
+        self._tenant_id = tenant_id
+        self._agent_id = agent_id
+        self._key_mode = key_mode
+        self._durable = bool(getattr(store, "durable", False))
+        self._supports_bounded_load_tail = getattr(
+            store, "supports_bounded_load_tail", False
+        ) is True and callable(getattr(store, "load_tail", None))
+        self._supports_idempotent_append = getattr(
+            store, "supports_idempotent_append", False
+        ) is True and callable(getattr(store, "append_once", None))
+
+    @property
+    def store(self) -> ConversationStore:
+        return self._store
+
+    @property
+    def tenant_id(self) -> str:
+        return self._tenant_id
+
+    @property
+    def agent_id(self) -> str:
+        return self._agent_id
+
+    @property
+    def key_mode(self) -> str:
+        return self._key_mode
+
+    @property
+    def durable(self) -> bool:
+        return self._durable
+
+    @property
+    def supports_bounded_load_tail(self) -> bool:
+        return self._supports_bounded_load_tail
+
+    @property
+    def supports_idempotent_append(self) -> bool:
+        return self._supports_idempotent_append
+
+    async def load(self, session_id: str) -> list[Message]:
+        return await self.store.load(self.scoped_session_id(session_id))
+
+    async def load_tail(
+        self,
+        session_id: str,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> ConversationPage:
+        load_tail = getattr(self.store, "load_tail", None)
+        if not self.supports_bounded_load_tail or not callable(load_tail):
+            raise RuntimeError("wrapped store does not support bounded load_tail()")
+        return await load_tail(
+            self.scoped_session_id(session_id),
+            after_sequence,
+            limit,
+        )
+
+    async def append(
+        self,
+        session_id: str,
+        messages: Sequence[Message],
+    ) -> None:
+        await self.store.append(self.scoped_session_id(session_id), messages)
+
+    async def append_once(
+        self,
+        session_id: str,
+        idempotency_key: str,
+        messages: Sequence[Message],
+    ) -> bool:
+        append_once = getattr(self.store, "append_once", None)
+        if not self.supports_idempotent_append or not callable(append_once):
+            raise RuntimeError("wrapped store does not support append_once()")
+        return await append_once(
+            self.scoped_session_id(session_id),
+            idempotency_key,
+            messages,
+        )
+
+    async def clear(self, session_id: str) -> None:
+        await self.store.clear(self.scoped_session_id(session_id))
+
+    def scoped_session_id(self, session_id: str) -> str:
+        _validate_identifier(session_id, "session_id")
+        if self.key_mode == "isolated_legacy":
+            return session_id
+        payload = json.dumps(
+            [self.tenant_id, self.agent_id, session_id],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return f"context-session-v1:{hashlib.sha256(payload).hexdigest()}"
+
+
 class InMemoryConversationStore:
+    durable = False
     """Bounded conversation storage for tests and single-process development.
 
     ``max_total_bytes`` measures the UTF-8 JSON rows retained for messages. It
@@ -123,6 +330,7 @@ class InMemoryConversationStore:
         self._next_sweep_at = self._clock()
         self._lock = asyncio.Lock()
         self.supports_idempotent_append = True
+        self.supports_bounded_load_tail = True
 
     async def load(self, session_id: str) -> list[Message]:
         _validate_identifier(session_id, "session_id")
@@ -136,6 +344,44 @@ class InMemoryConversationStore:
             self._touch(session_id)
             snapshot = tuple(rows)
         return [_decode_message_row(row) for row in snapshot]
+
+    async def load_tail(
+        self,
+        session_id: str,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> ConversationPage:
+        _validate_identifier(session_id, "session_id")
+        _validate_page_request(after_sequence, limit)
+        async with self._lock:
+            now = self._clock()
+            self._sweep_expired_if_due(now)
+            self._evict_if_expired(session_id, now=now)
+            rows = self._messages.get(session_id)
+            if rows is None:
+                if after_sequence:
+                    raise ConversationCursorError(
+                        "conversation cursor is beyond the current session"
+                    )
+                return _conversation_page(
+                    (),
+                    session_id,
+                    after_sequence,
+                    has_more=False,
+                )
+            if after_sequence > len(rows):
+                raise ConversationCursorError(
+                    "conversation cursor is beyond the current session"
+                )
+            self._touch(session_id)
+            selected = tuple(rows[after_sequence : after_sequence + limit])
+            has_more = after_sequence + len(selected) < len(rows)
+        return _conversation_page(
+            selected,
+            session_id,
+            after_sequence,
+            has_more=has_more,
+        )
 
     async def append(self, session_id: str, messages: Sequence[Message]) -> None:
         _validate_identifier(session_id, "session_id")
@@ -307,6 +553,7 @@ class InMemoryConversationStore:
 
 
 class RedisConversationStore:
+    durable = True
     """Redis-backed store using only an injected, Redis-like client.
 
     Redis list commands are preferred because each append is atomic. A client that
@@ -343,6 +590,11 @@ class RedisConversationStore:
         self.supports_idempotent_append = bool(
             self._use_lists and callable(getattr(client, "eval", None))
         )
+        # Blob-mode load_tail() is retained as a compatibility convenience, but
+        # it necessarily decodes the complete conversation. Durable Context
+        # Memory must require this explicit capability rather than merely
+        # checking that a method named load_tail exists.
+        self.supports_bounded_load_tail = self._use_lists
 
     async def load(self, session_id: str) -> list[Message]:
         key = self._key(session_id)
@@ -350,6 +602,53 @@ class RedisConversationStore:
             rows = await _call(self._client.lrange, key, 0, -1)
             return [_decode_message_row(row) for row in (rows or ())]
         return deserialize_messages(await _call(self._client.get, key))
+
+    async def load_tail(
+        self,
+        session_id: str,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> ConversationPage:
+        key = self._key(session_id)
+        _validate_page_request(after_sequence, limit)
+        if self._use_lists:
+            # Redis LRANGE is inclusive, so fetch one extra row for has_more.
+            rows = list(
+                await _call(
+                    self._client.lrange,
+                    key,
+                    after_sequence,
+                    after_sequence + limit,
+                )
+                or ()
+            )
+            if not rows and after_sequence:
+                llen = getattr(self._client, "llen", None)
+                if callable(llen):
+                    length = int(await _call(llen, key))
+                    if after_sequence > length:
+                        raise ConversationCursorError(
+                            "conversation cursor is beyond the current session"
+                        )
+            return _conversation_page(
+                rows[:limit],
+                session_id,
+                after_sequence,
+                has_more=len(rows) > limit,
+            )
+
+        messages = deserialize_messages(await _call(self._client.get, key))
+        if after_sequence > len(messages):
+            raise ConversationCursorError(
+                "conversation cursor is beyond the current session"
+            )
+        selected = messages[after_sequence : after_sequence + limit]
+        return _conversation_page(
+            selected,
+            session_id,
+            after_sequence,
+            has_more=after_sequence + len(selected) < len(messages),
+        )
 
     async def append(self, session_id: str, messages: Sequence[Message]) -> None:
         key = self._key(session_id)
@@ -456,7 +755,20 @@ class ConversationRepository(Protocol):
     async def clear_messages(self, session_id: str) -> None: ...
 
 
+@runtime_checkable
+class PaginatedConversationRepository(Protocol):
+    """Optional DB capability for cursor reads without loading the full session."""
+
+    async def load_messages_page(
+        self,
+        session_id: str,
+        after_sequence: int,
+        limit: int,
+    ) -> Sequence[str | Mapping[str, Any]]: ...
+
+
 class DatabaseConversationStore:
+    durable = True
     """Long-term conversation store backed by an injected repository.
 
     The repository receives one JSON document per message, keeping this package
@@ -471,11 +783,53 @@ class DatabaseConversationStore:
         self.supports_idempotent_append = callable(
             getattr(repository, "append_messages_once", None)
         )
+        self.supports_bounded_load_tail = callable(
+            getattr(repository, "load_messages_page", None)
+        )
 
     async def load(self, session_id: str) -> list[Message]:
         _validate_identifier(session_id, "session_id")
         rows = await _call(self._repository.load_messages, session_id)
         return [_decode_message_row(row) for row in (rows or ())]
+
+    async def load_tail(
+        self,
+        session_id: str,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> ConversationPage:
+        _validate_identifier(session_id, "session_id")
+        _validate_page_request(after_sequence, limit)
+        paginated_load = getattr(self._repository, "load_messages_page", None)
+        if callable(paginated_load):
+            rows = list(
+                await _call(
+                    paginated_load,
+                    session_id,
+                    after_sequence,
+                    limit + 1,
+                )
+                or ()
+            )
+            return _conversation_page(
+                rows[:limit],
+                session_id,
+                after_sequence,
+                has_more=len(rows) > limit,
+            )
+
+        rows = list(await _call(self._repository.load_messages, session_id) or ())
+        if after_sequence > len(rows):
+            raise ConversationCursorError(
+                "conversation cursor is beyond the current session"
+            )
+        selected = rows[after_sequence : after_sequence + limit]
+        return _conversation_page(
+            selected,
+            session_id,
+            after_sequence,
+            has_more=after_sequence + len(selected) < len(rows),
+        )
 
     async def append(self, session_id: str, messages: Sequence[Message]) -> None:
         _validate_identifier(session_id, "session_id")
@@ -515,6 +869,61 @@ class DatabaseConversationStore:
     async def clear(self, session_id: str) -> None:
         _validate_identifier(session_id, "session_id")
         await _call(self._repository.clear_messages, session_id)
+
+
+def _conversation_page(
+    rows: Sequence[Message | str | bytes | bytearray | Mapping[str, Any]],
+    session_id: str,
+    after_sequence: int,
+    *,
+    has_more: bool,
+) -> ConversationPage:
+    decoded = tuple(
+        row if isinstance(row, Message) else _decode_message_row(row) for row in rows
+    )
+    items = tuple(
+        SequencedMessage(
+            sequence=after_sequence + offset,
+            message_id=_source_message_id(
+                session_id,
+                after_sequence + offset,
+                message,
+            ),
+            message=message,
+        )
+        for offset, message in enumerate(decoded, start=1)
+    )
+    return ConversationPage(
+        items=items,
+        after_sequence=after_sequence,
+        next_sequence=(items[-1].sequence if items else after_sequence),
+        has_more=has_more,
+    )
+
+
+def _source_message_id(session_id: str, sequence: int, message: Message) -> str:
+    # Storage adapters may return semantically identical JSON objects with a
+    # different mapping insertion order (notably JSONB-backed repositories).
+    # Cursor identity must depend on message content, not that representation.
+    canonical_message = json.dumps(
+        message.to_dict(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    payload = f"{session_id}\0{sequence}\0{canonical_message}".encode("utf-8")
+    return f"msg-v1:{hashlib.sha256(payload).hexdigest()}"
+
+
+def _validate_page_request(after_sequence: int, limit: int) -> None:
+    _validate_after_sequence(after_sequence)
+    if type(limit) is not int or not 1 <= limit <= 10_000:
+        raise ValueError("limit must be between 1 and 10000")
+
+
+def _validate_after_sequence(after_sequence: int) -> None:
+    if type(after_sequence) is not int or after_sequence < 0:
+        raise ValueError("after_sequence must be a non-negative integer")
 
 
 def _encode_message_row(message: Message) -> str:
@@ -603,13 +1012,19 @@ def _validate_optional_positive_int(value: int | None, name: str) -> None:
 
 
 __all__ = [
+    "ConversationCursorError",
+    "ConversationPage",
     "ConversationStoreCapacityError",
     "ConversationRepository",
     "ConversationStore",
     "DatabaseConversationStore",
     "InMemoryConversationStore",
     "IdempotentConversationStore",
+    "PaginatedConversationRepository",
+    "PaginatedConversationStore",
     "RedisConversationStore",
+    "ScopedConversationStore",
+    "SequencedMessage",
     "deserialize_messages",
     "serialize_messages",
 ]

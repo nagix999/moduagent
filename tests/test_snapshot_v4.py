@@ -148,8 +148,8 @@ def test_v4_snapshot_has_dual_version_guard_and_shared_engine_contract() -> None
     payload = checkpoint.to_dict()
     restored = RunSnapshot.from_json(checkpoint.to_json())
 
-    assert payload["schema_version"] == 4
-    assert payload["version"] == 4
+    assert payload["schema_version"] == 5
+    assert payload["version"] == 5
     assert "execution_state" not in payload
     assert restored.engine.engine_id == "standard"
     assert EngineSnapshot is ExecutionEngineSnapshot
@@ -157,7 +157,7 @@ def test_v4_snapshot_has_dual_version_guard_and_shared_engine_contract() -> None
 
 
 def test_snapshot_runtime_version_tracks_the_source_release() -> None:
-    assert SNAPSHOT_RUNTIME_VERSION == "0.5.3"
+    assert SNAPSHOT_RUNTIME_VERSION == "0.6.0"
     assert current_runtime_version() == SNAPSHOT_RUNTIME_VERSION
 
 
@@ -174,7 +174,7 @@ def test_v052_reads_a_v051a1_snapshot_envelope_without_rewriting_its_origin() ->
     restored = RunSnapshot.from_json(json.dumps(payload))
 
     assert restored.runtime_version == "0.5.1a1"
-    assert restored.schema_version == 4
+    assert restored.schema_version == 5
 
 
 def test_event_wire_projection_is_finite_and_never_uses_opaque_repr() -> None:
@@ -222,7 +222,7 @@ def test_run_creation_timestamp_survives_repeated_checkpoints_and_resume() -> No
     "updates,match",
     [
         ({"version": 3}, "must match"),
-        ({"schema_version": 5, "version": 5}, "unsupported snapshot"),
+        ({"schema_version": 6, "version": 6}, "unsupported snapshot"),
     ],
 )
 def test_v4_snapshot_rejects_version_mismatch_and_future_schema(
@@ -559,7 +559,7 @@ def test_in_memory_copy_on_migrate_preserves_exact_legacy_payload() -> None:
         snapshot = await store.load_snapshot("run-v3")
 
         assert snapshot is not None
-        assert snapshot.schema_version == 4
+        assert snapshot.schema_version == 5
         assert await store.load_legacy_payload("run-v3") == source
         assert (await store.load_snapshot("run-v3")).to_json() == snapshot.to_json()
 
@@ -596,10 +596,10 @@ def test_redis_migration_uses_additive_v4_key_and_preserves_legacy() -> None:
         assert snapshot is not None
         assert client.values["moduagent:checkpoint:run-v3"] == source
         assert (
-            RunSnapshot.from_json(client.values["moduagent:checkpoint:v4:run-v3"])
+            RunSnapshot.from_json(client.values["moduagent:checkpoint:v5:run-v3"])
             == snapshot
         )
-        assert client.expirations["moduagent:checkpoint:v4:run-v3"] == 30
+        assert client.expirations["moduagent:checkpoint:v5:run-v3"] == 30
 
     asyncio.run(scenario())
 

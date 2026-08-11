@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.6.0
+
+- Added immutable, exact-version `AgentDefinition` identities, a lifecycle-aware
+  `AgentRegistry`, replaceable `RuntimeBindings`, and Development/Test/Production
+  profiles. Production composition now fails closed when required semantic
+  digests, identity providers, durable stores, authorization, or telemetry are
+  missing.
+- Added typed Agent-to-Agent delegation through `Agent.as_tool()` and
+  `DelegationCoordinator`. The coordinator validates the caller/callee edge,
+  tenant, principal, data classification, cycle, depth, deadline, and aggregate
+  execution-group budgets before invoking a child Agent.
+- Added isolated HMAC-derived child sessions, deterministic delegation and child
+  run IDs, durable-store protocols for budget state and receipts, atomic
+  ownership/fencing, cancellation propagation, bounded resume/reconciliation,
+  and content-free delegation lifecycle events. The legacy `AgentTool` remains
+  available for compatibility but is rejected by the Production profile.
+- Added durable Context Memory with paginated conversation-tail reads,
+  tenant/Agent/session/policy composite keys, monotonic cursors, bounded source
+  provenance, structured summary schema v2, and compare-and-swap Redis/database
+  state adapters. `ScopedConversationStore` isolates raw session keys, while
+  `ScopedLegacyMemoryStateStore` enables a bounded, automatic two-pass migration
+  of verified 0.5 snapshots. ContextAssembler v1 applies one token budget to
+  system/Skill, task/run, Tool protocol, request schemas, summary, and recent
+  turns. Optional summaries are committed only when selected and omitted when
+  an existing snapshot or CAS winner cannot fit. The existing memory policies
+  remain available.
+- Upgraded checkpoint envelopes to schema v5 and event envelopes to schema v2.
+  `migrate_checkpoint_payload()` accepts checkpoint v1-v4 and projects older
+  runs as roots; v5 is not downgrade-readable by 0.5.x. Built-in Engine state
+  remains v1. Legacy summaries become usable only after the loader has derived
+  authoritative source message IDs from two matching canonical-prefix scans.
+- Added the offline WAF log analysis capstone with six read-only, event-scoped
+  evidence Tools, synthetic no-network threat intelligence, bounded decoding,
+  redacted previews by default, and structured provenance checks.
+- Added the document Q&A and cited-report capstone with Docling Serve parsing,
+  automatic request routing, replaceable retrieval, application-verified source
+  excerpts, page/bounding-box/line provenance, and deterministic Markdown report
+  assembly.
+
 ## 0.5.3
 
 - Made legacy `AgentTool` treat every non-successful child `AgentResult` as a

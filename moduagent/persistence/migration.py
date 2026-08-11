@@ -13,6 +13,7 @@ from moduagent.persistence.snapshot import (
     EngineSnapshot,
     FinalizationMarkers,
     RunSnapshot,
+    PREVIOUS_SNAPSHOT_SCHEMA_VERSION,
     SNAPSHOT_SCHEMA_VERSION,
     current_runtime_version,
 )
@@ -62,7 +63,8 @@ def migrate_checkpoint_payload(
 ) -> RunSnapshot:
     """Copy and migrate a legacy checkpoint without mutating its source.
 
-    Version 4 payloads are only decoded and validated. Versions 1-3 are copied
+    Version 5 payloads are decoded and validated. Version 4 is copied and
+    upgraded as a root run. Versions 1-3 are copied
     before any normalization, so a failed migration leaves the caller's object
     graph byte-for-byte representable as it was before the call.
     """
@@ -75,7 +77,10 @@ def migrate_checkpoint_payload(
             schema_version = _integer(source["schema_version"], "schema_version")
         except ValueError as exc:
             raise StateMigrationError(str(exc)) from exc
-        if schema_version != SNAPSHOT_SCHEMA_VERSION:
+        if schema_version not in {
+            PREVIOUS_SNAPSHOT_SCHEMA_VERSION,
+            SNAPSHOT_SCHEMA_VERSION,
+        }:
             raise StateMigrationError(
                 f"unsupported snapshot schema version: {schema_version}"
             )
@@ -334,6 +339,7 @@ def _migrate_legacy(
         sanitized_runtime_metadata=metadata,
         created_at=created_at,
         updated_at=updated_at,
+        migrated_from_schema_version=legacy_version,
     )
 
 

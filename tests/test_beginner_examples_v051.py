@@ -20,6 +20,7 @@ BEGINNER_EXAMPLES = tuple(
         "03_structured_output.py",
         "04_report_automation.py",
         "05_debug_a_run.py",
+        "06_waf_log_analysis.py",
     )
 )
 
@@ -62,6 +63,7 @@ def test_beginner_builders_need_no_network_access() -> None:
     agents = [module.build_agent(model) for module in modules[:4]]
     diagnostics = InMemoryDiagnosticSink()
     debug_agent = modules[4].build_agent(model, diagnostics)
+    waf_agent = modules[5].build_agent(model)
 
     assert agents[0].inspect().execution_profile.kind == "standard"
     assert [tool.name for tool in agents[1].tool_registry] == ["lookup_order"]
@@ -72,6 +74,19 @@ def test_beginner_builders_need_no_network_access() -> None:
     ]
     assert debug_agent.config.tool_trace_mode == "summary"
     assert debug_agent.diagnostic_reporter.sink is diagnostics
+    assert waf_agent.inspect().name == "waf-log-analyzer-v01"
+    assert waf_agent.inspect().output_contract["structured"] is True
+    assert waf_agent.inspect().output_contract["staged_finalization"] is True
+    assert waf_agent.config.model_options["parallel_tool_calls"] is False
+    assert waf_agent.config.limits.parallel_tool_calls is False
+    assert [tool.name for tool in waf_agent.tool_registry] == [
+        "analyze_payload_encoding",
+        "get_waf_rule_context",
+        "get_route_context",
+        "get_correlated_app_outcome",
+        "summarize_related_events",
+        "lookup_threat_intel",
+    ]
 
 
 def test_order_lookup_tool_returns_only_known_shipping_data() -> None:

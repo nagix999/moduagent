@@ -62,6 +62,17 @@ def test_function_tool_builds_schema_and_validates_arguments() -> None:
     assert extra.error.type is ToolErrorType.INVALID_ARGUMENTS
 
 
+def test_function_tool_validates_side_effect_classification() -> None:
+    @function_tool(side_effect_level="advisory")
+    def recommend() -> str:
+        return "review"
+
+    assert recommend.side_effect_level == "advisory"
+
+    with pytest.raises(ValueError, match="side_effect_level"):
+        function_tool(lambda: None, side_effect_level="external")
+
+
 def test_explicit_pydantic_input_model_is_supported() -> None:
     class SearchInput(BaseModel):
         query: str
@@ -128,6 +139,17 @@ def test_rbac_denies_before_invocation_and_supports_wildcard() -> None:
     assert "not authorized" in denied.model_content()
     assert allowed.success is True
     assert calls == 1
+
+
+def test_rbac_policy_mapping_is_immutable_after_fingerprinting() -> None:
+    authorizer = RBACToolAuthorizer({"analyst": {"lookup"}})
+    fingerprint = authorizer.policy_fingerprint
+
+    with pytest.raises(TypeError):
+        authorizer.role_permissions["analyst"] = frozenset({"admin"})
+
+    assert authorizer.policy_fingerprint == fingerprint
+    assert authorizer.role_permissions == {"analyst": frozenset({"lookup"})}
 
 
 def test_only_idempotent_tools_are_retried() -> None:
@@ -818,6 +840,47 @@ def test_registry_rejects_duplicates_and_unknown_tool_is_structured() -> None:
     assert result.error.type is ToolErrorType.NOT_FOUND
     assert result.error.recovery is ToolRecoveryAction.FAIL
     assert result.attempts == 0
+
+
+def test_registry_freeze_blocks_post_validation_replacement() -> None:
+    first = function_tool(lambda value: value, name="lookup")
+    replacement = function_tool(
+        lambda value: f"changed:{value}",
+        name="lookup",
+    )
+    registry = ToolRegistry((first,)).freeze()
+
+    assert registry.is_frozen is True
+    with pytest.raises(RuntimeError, match="frozen"):
+        registry.register(replacement, replace=True)
+    with pytest.raises(RuntimeError, match="frozen"):
+        registry.unregister("lookup")
+    assert registry.require("lookup") is first
+
+
+def test_regular_tool_cannot_observe_delegation_control_callback() -> None:
+    observed: dict[str, object] = {}
+
+    @function_tool
+    def inspect_context(context: ToolExecutionContext) -> str:
+        observed.update(context.metadata)
+        return "ok"
+
+    result = run(
+        ToolExecutor((inspect_context,)).execute(
+            ToolCall("inspect-1", "inspect_context", {}),
+            ToolExecutionContext(
+                metadata={
+                    "_moduagent_delegation_event_callback": lambda event: event,
+                    "_moduagent_parent_delegation_context": object(),
+                    "ordinary": "visible",
+                }
+            ),
+        )
+    )
+
+    assert result.success is True
+    assert observed == {"ordinary": "visible"}
 
 
 def test_agent_tool_delegates_to_agent_run_without_circular_dependency() -> None:

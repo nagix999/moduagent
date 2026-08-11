@@ -63,6 +63,28 @@ class ConversationMemoryPolicy(Protocol):
     async def prepare(self, request: MemoryRequest) -> MemoryResult: ...
 
 
+@dataclass(frozen=True, slots=True)
+class MemoryContextBound:
+    """Auditable finite bound declared by a Context Memory policy."""
+
+    kind: str
+    limit: int
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"turns", "tokens"}:
+            raise ValueError("memory context bound kind must be 'turns' or 'tokens'")
+        if type(self.limit) is not int or self.limit < 0:
+            raise ValueError(
+                "memory context bound limit must be a non-negative integer"
+            )
+
+
+@runtime_checkable
+class BoundedConversationMemoryPolicy(ConversationMemoryPolicy, Protocol):
+    @property
+    def context_bound(self) -> MemoryContextBound: ...
+
+
 class ConversationMemoryError(FrameworkMemoryError):
     """Base error raised while preparing a bounded conversation view."""
 
@@ -112,10 +134,12 @@ class MemoryIntegrityError(ConversationMemoryError):
 
 
 __all__ = [
+    "BoundedConversationMemoryPolicy",
     "ConversationMemoryError",
     "ConversationMemoryOverflowError",
     "ConversationMemoryPolicy",
     "MemoryIntegrityError",
+    "MemoryContextBound",
     "MemoryPhase",
     "MemoryRequest",
     "MemoryResult",

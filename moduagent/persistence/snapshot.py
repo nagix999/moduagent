@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -8,9 +10,10 @@ from typing import Any, TypeVar
 
 from moduagent.execution.state import EngineSnapshot, EngineStateCodec
 
-SNAPSHOT_SCHEMA_VERSION = 4
+SNAPSHOT_SCHEMA_VERSION = 5
+PREVIOUS_SNAPSHOT_SCHEMA_VERSION = 4
 DEFAULT_ENGINE_STATE_VERSION = 1
-SNAPSHOT_RUNTIME_VERSION = "0.5.3"
+SNAPSHOT_RUNTIME_VERSION = "0.6.0"
 StateT = TypeVar("StateT")
 
 
@@ -218,11 +221,12 @@ class FinalizationMarkers:
 
 @dataclass(frozen=True, slots=True)
 class RunSnapshot:
-    """Version 4 checkpoint envelope.
+    """Version 5 checkpoint envelope with delegation lineage.
 
     ``schema_version`` is the canonical discriminator. ``version`` is emitted
-    as a matching compatibility guard so 0.3 readers reject v4 instead of
-    silently interpreting it as their default v1 shape.
+    as a matching compatibility guard so older readers reject v5 instead of
+    silently interpreting it as their default shape. Version 4 payloads are
+    upgraded on read and are always interpreted as root runs.
     """
 
     runtime_version: str
@@ -239,6 +243,17 @@ class RunSnapshot:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     schema_version: int = SNAPSHOT_SCHEMA_VERSION
+    # v5 fields are appended after the complete v4 positional surface.
+    run_lineage: Mapping[str, Any] = field(default_factory=dict)
+    execution_group_id: str | None = None
+    agent_ref: Mapping[str, Any] = field(default_factory=dict)
+    agent_definition_fingerprint: str | None = None
+    delegation_id: str | None = None
+    parent_tool_call_id: str | None = None
+    budget_lease_id: str | None = None
+    migrated_from_schema_version: int | None = None
+    tenant_scope_digest: str | None = None
+    principal_scope_digest: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != SNAPSHOT_SCHEMA_VERSION:
@@ -280,6 +295,174 @@ class RunSnapshot:
                 "sanitized runtime metadata",
             ),
         )
+        lineage = _json_mapping_copy(self.run_lineage, "run_lineage")
+        if not lineage:
+            lineage = {
+                "root_run_id": self.run_id,
+                "parent_run_id": None,
+                "depth": 0,
+                "agent_path": [],
+            }
+        allowed_lineage_keys = {
+            "root_run_id",
+            "parent_run_id",
+            "delegation_id",
+            "parent_tool_call_id",
+            "caller_agent_id",
+            "agent_id",
+            "agent_version",
+            "agent_path",
+            "depth",
+        }
+        unknown_lineage_keys = set(lineage).difference(allowed_lineage_keys)
+        if unknown_lineage_keys:
+            raise ValueError("run_lineage contains unsupported fields")
+        root_run_id = lineage.get("root_run_id")
+        if not isinstance(root_run_id, str) or not root_run_id.strip():
+            raise ValueError("run_lineage root_run_id cannot be empty")
+        parent_run_id = lineage.get("parent_run_id")
+        if parent_run_id is not None and (
+            not isinstance(parent_run_id, str) or not parent_run_id.strip()
+        ):
+            raise ValueError("run_lineage parent_run_id cannot be empty")
+        depth = lineage.get("depth", 0)
+        if type(depth) is not int or depth < 0:
+            raise ValueError("run_lineage depth must be a non-negative integer")
+        agent_path = lineage.get("agent_path", [])
+        if isinstance(agent_path, (str, bytes)) or not isinstance(
+            agent_path, (list, tuple)
+        ):
+            raise ValueError("run_lineage agent_path must be an array")
+        if not all(isinstance(item, str) and item.strip() for item in agent_path):
+            raise ValueError("run_lineage agent_path must contain non-empty strings")
+        lineage["agent_path"] = list(agent_path)
+        execution_group_id = (
+            root_run_id if self.execution_group_id is None else self.execution_group_id
+        )
+        _validate_identifier(execution_group_id, "execution_group_id")
+        object.__setattr__(self, "execution_group_id", execution_group_id)
+        agent_ref = _json_mapping_copy(self.agent_ref, "agent_ref")
+        if set(agent_ref).difference({"agent_id", "version"}):
+            raise ValueError("agent_ref contains unsupported fields")
+        if agent_ref and set(agent_ref) != {"agent_id", "version"}:
+            raise ValueError("agent_ref requires agent_id and version")
+        for key in ("agent_id", "version"):
+            if key in agent_ref:
+                _validate_identifier(agent_ref[key], f"agent_ref {key}")
+        object.__setattr__(self, "agent_ref", agent_ref)
+        if depth == 0:
+            if root_run_id != self.run_id:
+                raise ValueError("root run_lineage root_run_id must match run_id")
+            if execution_group_id != root_run_id:
+                raise ValueError(
+                    "root execution_group_id must match run_lineage root_run_id"
+                )
+            for field_name in (
+                "parent_run_id",
+                "delegation_id",
+                "parent_tool_call_id",
+                "caller_agent_id",
+            ):
+                if lineage.get(field_name) is not None:
+                    raise ValueError(f"root run_lineage cannot contain {field_name}")
+            for value, field_name in (
+                (self.delegation_id, "delegation_id"),
+                (self.parent_tool_call_id, "parent_tool_call_id"),
+                (self.budget_lease_id, "budget_lease_id"),
+            ):
+                if value is not None:
+                    raise ValueError(f"root snapshot cannot contain {field_name}")
+            if agent_ref:
+                if len(agent_path) != 1:
+                    raise ValueError(
+                        "definition-bound root agent_path must contain one Agent"
+                    )
+                if (
+                    lineage.get("agent_id") != agent_ref["agent_id"]
+                    or lineage.get("agent_version") != agent_ref["version"]
+                ):
+                    raise ValueError(
+                        "root run_lineage current Agent does not match agent_ref"
+                    )
+        else:
+            _validate_identifier(self.budget_lease_id, "budget_lease_id")
+            if len(agent_path) != depth + 1:
+                raise ValueError("child agent_path length must equal depth + 1")
+            lineage.setdefault("delegation_id", self.delegation_id)
+            lineage.setdefault("parent_tool_call_id", self.parent_tool_call_id)
+            if agent_ref:
+                lineage.setdefault("agent_id", agent_ref["agent_id"])
+                lineage.setdefault("agent_version", agent_ref["version"])
+            if len(agent_path) >= 2:
+                prior_id = str(agent_path[-2]).rpartition("@")[0]
+                lineage.setdefault("caller_agent_id", prior_id or None)
+            for field_name in (
+                "parent_run_id",
+                "delegation_id",
+                "parent_tool_call_id",
+                "caller_agent_id",
+                "agent_id",
+                "agent_version",
+            ):
+                _validate_identifier(
+                    lineage.get(field_name), f"run_lineage {field_name}"
+                )
+            expected_tail = f"{lineage['agent_id']}@{lineage['agent_version']}"
+            if agent_path[-1] != expected_tail:
+                raise ValueError("run_lineage agent_path does not end at current Agent")
+            if agent_ref and (
+                lineage["agent_id"] != agent_ref["agent_id"]
+                or lineage["agent_version"] != agent_ref["version"]
+            ):
+                raise ValueError("run_lineage current Agent does not match agent_ref")
+            if self.delegation_id != lineage["delegation_id"]:
+                raise ValueError("delegation_id does not match run_lineage")
+            if self.parent_tool_call_id != lineage["parent_tool_call_id"]:
+                raise ValueError("parent_tool_call_id does not match run_lineage")
+        if agent_ref and agent_path:
+            expected_tail = f"{agent_ref['agent_id']}@{agent_ref['version']}"
+            if agent_path[-1] != expected_tail:
+                raise ValueError("agent_ref does not match run_lineage agent_path")
+        object.__setattr__(self, "run_lineage", lineage)
+        definition_fingerprint = (
+            self.agent_fingerprint
+            if self.agent_definition_fingerprint is None
+            else self.agent_definition_fingerprint
+        )
+        _validate_identifier(
+            definition_fingerprint,
+            "agent_definition_fingerprint",
+        )
+        object.__setattr__(
+            self,
+            "agent_definition_fingerprint",
+            definition_fingerprint,
+        )
+        for value, field_name in (
+            (self.delegation_id, "delegation_id"),
+            (self.parent_tool_call_id, "parent_tool_call_id"),
+            (self.budget_lease_id, "budget_lease_id"),
+        ):
+            if value is not None:
+                _validate_identifier(value, field_name)
+        if self.migrated_from_schema_version is not None and (
+            type(self.migrated_from_schema_version) is not int
+            or self.migrated_from_schema_version not in {1, 2, 3, 4}
+        ):
+            raise ValueError("migrated_from_schema_version must be 1-4 or None")
+        for value, field_name in (
+            (self.tenant_scope_digest, "tenant_scope_digest"),
+            (self.principal_scope_digest, "principal_scope_digest"),
+        ):
+            if (
+                value is not None
+                and re.fullmatch(
+                    r"sha256:[0-9a-f]{64}",
+                    value,
+                )
+                is None
+            ):
+                raise ValueError(f"{field_name} must use sha256")
         object.__setattr__(self, "created_at", _as_utc(self.created_at))
         object.__setattr__(self, "updated_at", _as_utc(self.updated_at))
         if self.updated_at < self.created_at:
@@ -307,6 +490,16 @@ class RunSnapshot:
                 self.sanitized_runtime_metadata,
                 "sanitized runtime metadata",
             ),
+            "run_lineage": _json_mapping_copy(self.run_lineage, "run_lineage"),
+            "execution_group_id": self.execution_group_id,
+            "agent_ref": _json_mapping_copy(self.agent_ref, "agent_ref"),
+            "agent_definition_fingerprint": self.agent_definition_fingerprint,
+            "delegation_id": self.delegation_id,
+            "parent_tool_call_id": self.parent_tool_call_id,
+            "budget_lease_id": self.budget_lease_id,
+            "migrated_from_schema_version": self.migrated_from_schema_version,
+            "tenant_scope_digest": self.tenant_scope_digest,
+            "principal_scope_digest": self.principal_scope_digest,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
         }
@@ -316,13 +509,58 @@ class RunSnapshot:
         if not isinstance(value, Mapping):
             raise ValueError("snapshot payload must be a JSON object")
         if "schema_version" not in value or "version" not in value:
-            raise ValueError("v4 snapshot requires schema_version and version")
+            raise ValueError("snapshot requires schema_version and version")
         schema_version = _integer(value["schema_version"], "schema_version")
         compatibility_version = _integer(value["version"], "version")
         if schema_version != compatibility_version:
             raise ValueError("snapshot schema_version and version must match")
-        if schema_version != SNAPSHOT_SCHEMA_VERSION:
+        if schema_version not in {
+            PREVIOUS_SNAPSHOT_SCHEMA_VERSION,
+            SNAPSHOT_SCHEMA_VERSION,
+        }:
             raise ValueError(f"unsupported snapshot schema version: {schema_version}")
+        if schema_version == SNAPSHOT_SCHEMA_VERSION:
+            required_v5_fields = {
+                "run_lineage",
+                "execution_group_id",
+                "agent_ref",
+                "agent_definition_fingerprint",
+                "delegation_id",
+                "parent_tool_call_id",
+                "budget_lease_id",
+                "migrated_from_schema_version",
+                "tenant_scope_digest",
+                "principal_scope_digest",
+            }
+            if not required_v5_fields.issubset(value):
+                raise ValueError("native v5 snapshot is missing identity fields")
+        migrated = dict(value)
+        if schema_version == PREVIOUS_SNAPSHOT_SCHEMA_VERSION:
+            run_id = str(value.get("run_id", ""))
+            migrated.update(
+                {
+                    "schema_version": SNAPSHOT_SCHEMA_VERSION,
+                    "version": SNAPSHOT_SCHEMA_VERSION,
+                    "run_lineage": {
+                        "root_run_id": run_id,
+                        "parent_run_id": None,
+                        "depth": 0,
+                        "agent_path": [],
+                    },
+                    "execution_group_id": run_id,
+                    "agent_ref": {},
+                    "agent_definition_fingerprint": str(
+                        value.get("agent_fingerprint", "legacy-unbound")
+                    ),
+                    "delegation_id": None,
+                    "parent_tool_call_id": None,
+                    "budget_lease_id": None,
+                    "migrated_from_schema_version": schema_version,
+                    "tenant_scope_digest": None,
+                    "principal_scope_digest": None,
+                }
+            )
+        value = migrated
         return cls(
             runtime_version=str(value.get("runtime_version", "")),
             run_id=str(value.get("run_id", "")),
@@ -345,9 +583,54 @@ class RunSnapshot:
                 value.get("sanitized_runtime_metadata", {}),
                 "sanitized runtime metadata",
             ),
+            run_lineage=_mapping(value.get("run_lineage", {}), "run_lineage"),
+            execution_group_id=(
+                None
+                if value.get("execution_group_id") is None
+                else str(value["execution_group_id"])
+            ),
+            agent_ref=_mapping(value.get("agent_ref", {}), "agent_ref"),
+            agent_definition_fingerprint=(
+                None
+                if value.get("agent_definition_fingerprint") is None
+                else str(value["agent_definition_fingerprint"])
+            ),
+            delegation_id=(
+                None
+                if value.get("delegation_id") is None
+                else str(value["delegation_id"])
+            ),
+            parent_tool_call_id=(
+                None
+                if value.get("parent_tool_call_id") is None
+                else str(value["parent_tool_call_id"])
+            ),
+            budget_lease_id=(
+                None
+                if value.get("budget_lease_id") is None
+                else str(value["budget_lease_id"])
+            ),
+            migrated_from_schema_version=(
+                None
+                if value.get("migrated_from_schema_version") is None
+                else _integer(
+                    value["migrated_from_schema_version"],
+                    "migrated_from_schema_version",
+                )
+            ),
+            tenant_scope_digest=(
+                None
+                if value.get("tenant_scope_digest") is None
+                else str(value["tenant_scope_digest"])
+            ),
+            principal_scope_digest=(
+                None
+                if value.get("principal_scope_digest") is None
+                else str(value["principal_scope_digest"])
+            ),
             created_at=_parse_datetime(value.get("created_at")),
             updated_at=_parse_datetime(value.get("updated_at")),
-            schema_version=schema_version,
+            schema_version=SNAPSHOT_SCHEMA_VERSION,
         )
 
     def to_json(self) -> str:
@@ -366,6 +649,16 @@ class RunSnapshot:
         if not isinstance(value, Mapping):
             raise ValueError("snapshot payload must be a JSON object")
         return cls.from_dict(value)
+
+
+def identity_scope_digest(kind: str, value: str) -> str:
+    """Return a stable, content-free binding for a trusted identity claim."""
+
+    if kind not in {"tenant", "principal"}:
+        raise ValueError("identity scope kind must be tenant or principal")
+    _validate_identifier(value, f"{kind} identity")
+    encoded = f"moduagent.identity-scope.v1\0{kind}\0{value}".encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def current_runtime_version() -> str:
@@ -542,10 +835,12 @@ __all__ = [
     "EngineSnapshot",
     "EngineStateCodec",
     "FinalizationMarkers",
+    "PREVIOUS_SNAPSHOT_SCHEMA_VERSION",
     "RunSnapshot",
     "SNAPSHOT_SCHEMA_VERSION",
     "SNAPSHOT_RUNTIME_VERSION",
     "current_runtime_version",
     "decode_engine_snapshot",
     "encode_engine_snapshot",
+    "identity_scope_digest",
 ]

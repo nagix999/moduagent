@@ -18,6 +18,22 @@ from pydantic import BaseModel
 
 
 _TOOL_REPAIR_METADATA_KEY = "_moduagent_tool_repair"
+TOOL_SIDE_EFFECT_LEVELS = frozenset({"none", "read", "advisory", "write"})
+
+
+def normalize_tool_side_effect_level(value: str | None) -> str | None:
+    """Validate the public, definition-facing Tool side-effect classification."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError("side_effect_level must be a string or None")
+    normalized = value.strip().casefold()
+    if normalized not in TOOL_SIDE_EFFECT_LEVELS:
+        raise ValueError(
+            "side_effect_level must be 'none', 'read', 'advisory', 'write', or None"
+        )
+    return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +80,25 @@ class ToolSchema(Mapping[str, Any]):
 
 
 @dataclass(frozen=True, slots=True)
+class ToolExecutionIdentity:
+    """Runtime-owned tenant/principal projection for Tool authorization."""
+
+    tenant_id: str
+    principal_id: str
+    delegated: bool = False
+
+    def __post_init__(self) -> None:
+        for value, field_name in (
+            (self.tenant_id, "tenant_id"),
+            (self.principal_id, "principal_id"),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} cannot be empty")
+        if type(self.delegated) is not bool:
+            raise TypeError("delegated must be a bool")
+
+
+@dataclass(frozen=True, slots=True)
 class ToolExecutionContext(Mapping[str, Any]):
     """Execution metadata supplied to authorizers and tools.
 
@@ -77,10 +112,16 @@ class ToolExecutionContext(Mapping[str, Any]):
     metadata: Mapping[str, Any] = field(default_factory=dict)
     tool_call_id: str | None = None
     attempt: int = 1
+    trusted_identity: ToolExecutionIdentity | None = None
 
     def __post_init__(self) -> None:
         if self.attempt < 1:
             raise ValueError("attempt must be at least 1")
+        if self.trusted_identity is not None and not isinstance(
+            self.trusted_identity,
+            ToolExecutionIdentity,
+        ):
+            raise TypeError("trusted_identity must be a ToolExecutionIdentity or None")
 
     def for_call(self, call_id: str, *, attempt: int = 1) -> "ToolExecutionContext":
         return replace(self, tool_call_id=call_id, attempt=attempt)

@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import time
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ValidationError
@@ -45,6 +45,51 @@ from moduagent.tools.failure import (
     tool_error_from_classification,
 )
 from moduagent.tools.registry import ToolRegistry
+
+
+def _scoped_tool_context(
+    context: ToolExecutionContext,
+    *,
+    call: ToolCall,
+    tool: Tool,
+) -> ToolExecutionContext:
+    """Expose delegation control metadata only to its exact delegated call."""
+
+    callback_key = "_moduagent_delegation_event_callback"
+    parent_key = "_moduagent_parent_delegation_context"
+    metadata = dict(context.metadata)
+    callback = metadata.pop(callback_key, None)
+    parent = metadata.pop(parent_key, None)
+
+    # Keep the generic Tool layer independent at import time; delegation itself
+    # imports Tool runtime types, so this boundary must remain lazy.
+    from moduagent.delegation.tool import DelegatedAgentTool
+
+    if isinstance(tool, DelegatedAgentTool):
+        if parent is not None:
+            metadata[parent_key] = parent
+        if callback is not None:
+
+            async def bound_callback(event: Any) -> None:
+                if (
+                    getattr(event, "parent_tool_call_id", None) != call.id
+                    or getattr(event, "caller", None) != tool.caller
+                    or getattr(event, "callee", None) != tool.callee
+                ):
+                    raise ValueError(
+                        "delegation event does not match the delegated Tool call"
+                    )
+                await _await_if_needed(callback(event))
+
+            metadata[callback_key] = bound_callback
+
+    return replace(
+        context,
+        metadata=metadata,
+        tool_call_id=call.id,
+        attempt=1,
+    )
+
 
 if TYPE_CHECKING:
     from moduagent.observability.diagnostics import DiagnosticReporter
@@ -422,6 +467,7 @@ class ToolRuntime:
             )
 
         profile = resolve_tool_safety_profile(tool)
+        call_context = _scoped_tool_context(context, call=call, tool=tool)
         if repair_constraint is not None and not profile.changed_argument_repair_safe:
             result = ToolResult.failed(
                 call_id=call.id,
@@ -522,7 +568,7 @@ class ToolRuntime:
 
         # Compatibility for 0.3.2 checkpoints and AgentRuntime. New execution
         # engines pass a typed ToolRepairConstraint instead.
-        legacy_repair = context.metadata.get(_TOOL_REPAIR_METADATA_KEY)
+        legacy_repair = call_context.metadata.get(_TOOL_REPAIR_METADATA_KEY)
         if (
             isinstance(legacy_repair, Mapping)
             and legacy_repair.get("tool_name") == call.name
@@ -545,12 +591,12 @@ class ToolRuntime:
             )
 
         try:
-            raw_decision = self.authorizer.authorize(tool, arguments, context)
+            raw_decision = self.authorizer.authorize(tool, arguments, call_context)
             decision = await _await_if_needed(raw_decision)
         except Exception as exc:
             failure_id = await self._capture_diagnostic(
                 exc,
-                context=context,
+                context=call_context,
                 call=call,
                 operation="authorize",
                 category="tool_authorization",
@@ -636,9 +682,9 @@ class ToolRuntime:
         failure_id: str | None = None
 
         for attempt in range(1, attempts + 1):
-            call_context = context.for_call(call.id, attempt=attempt)
+            attempt_context = call_context.for_call(call.id, attempt=attempt)
             try:
-                invocation = self._invoke_tool(tool, arguments, call_context)
+                invocation = self._invoke_tool(tool, arguments, attempt_context)
                 value = (
                     await asyncio.wait_for(invocation, timeout=timeout)
                     if timeout is not None
@@ -726,7 +772,7 @@ class ToolRuntime:
             classification = classification_from_tool_error(error)
             failure_id = await self._capture_diagnostic(
                 classified_error.diagnostic_error,
-                context=context,
+                context=attempt_context,
                 call=call,
                 operation=classified_error.diagnostic_operation,
                 category=classified_error.diagnostic_category,

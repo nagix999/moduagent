@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
 from moduagent.tools.base import Tool, ToolExecutionContext
@@ -34,6 +37,11 @@ class ToolAuthorizer(Protocol):
 
 
 class AllowAllAuthorizer:
+    policy_fingerprint = (
+        "sha256:"
+        + hashlib.sha256(b"moduagent.tool_authorizer.allow_all.v1").hexdigest()
+    )
+
     async def authorize(
         self,
         tool: Tool,
@@ -62,12 +70,29 @@ class RBACToolAuthorizer:
         if role_permissions is not None and permissions is not None:
             raise ValueError("use either role_permissions or permissions, not both")
         configured_permissions = role_permissions or permissions or {}
-        self.role_permissions = {
-            str(role): frozenset(str(name) for name in names)
-            for role, names in configured_permissions.items()
-        }
+        self.role_permissions = MappingProxyType(
+            {
+                str(role): frozenset(str(name) for name in names)
+                for role, names in configured_permissions.items()
+            }
+        )
         # Compatibility with the original PoC attribute name.
         self.permissions = self.role_permissions
+        payload = {
+            role: sorted(names) for role, names in sorted(self.role_permissions.items())
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self.policy_fingerprint = (
+            "sha256:"
+            + hashlib.sha256(
+                b"moduagent.tool_authorizer.rbac.v1\0" + encoded
+            ).hexdigest()
+        )
 
     async def authorize(
         self,

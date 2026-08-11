@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from moduagent import (
     Agent,
     AgentConfig,
+    AuthorizationDecision,
     EventType,
     InMemoryCheckpointStore,
     InMemoryConversationStore,
@@ -23,6 +24,7 @@ from moduagent import (
     PlanStep,
     PydanticOutputCodec,
     RetryConfig,
+    RuntimeBindings,
     RunLimits,
     TextOutputCodec,
     ToolCall,
@@ -409,6 +411,85 @@ def test_checkpoint_resumes_failed_run() -> None:
             "작업",
             "완료",
         ]
+
+    asyncio.run(scenario())
+
+
+def test_checkpoint_resume_is_bound_to_the_current_trusted_identity() -> None:
+    async def scenario() -> None:
+        class MutableIdentityProvider:
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+            def resolve(self) -> str:
+                return self.value
+
+        tenant = MutableIdentityProvider("tenant-a")
+        principal = MutableIdentityProvider("analyst-1")
+        checkpoints = InMemoryCheckpointStore()
+        observed_contexts: list[dict[str, Any]] = []
+
+        class RecordingAuthorizer:
+            async def authorize(self, tool, arguments, context=None, **kwargs):
+                del tool, arguments, kwargs
+                observed_contexts.append(dict(context.user_context))
+                return AuthorizationDecision.allow()
+
+        @function_tool
+        def inspect_scope() -> str:
+            return "ok"
+
+        model = ScriptedModel(
+            [
+                RuntimeError("model unavailable"),
+                ModelResponse(
+                    Message.assistant(""),
+                    tool_calls=(ToolCall("scope-1", "inspect_scope", {}),),
+                ),
+                ModelResponse(Message.assistant("완료")),
+            ]
+        )
+        agent = Agent(
+            config=AgentConfig("scoped-resume", "답한다."),
+            model=model,
+            tools=(inspect_scope,),
+            tool_authorizer=RecordingAuthorizer(),
+            checkpoint_store=checkpoints,
+            runtime_bindings=RuntimeBindings(
+                tenant_context_provider=tenant,
+                principal_context_provider=principal,
+            ),
+        )
+
+        failed = await agent.run(
+            "작업",
+            session_id="scoped-session",
+            user_context={"roles": ["operator"]},
+        )
+        checkpoint = await checkpoints.load(failed.run_id)
+        assert checkpoint is not None
+        assert checkpoint.tenant_scope_digest is not None
+        assert checkpoint.principal_scope_digest is not None
+
+        tenant.value = "tenant-b"
+        rejected = await agent.resume(
+            failed.run_id,
+            session_id="scoped-session",
+            user_context={"roles": ["viewer"]},
+        )
+
+        assert rejected.finish_reason == "error"
+        assert rejected.error_summary["category"] == "state_migration"
+        assert len(model.requests) == 1
+
+        tenant.value = "tenant-a"
+        resumed = await agent.resume(
+            failed.run_id,
+            session_id="scoped-session",
+            user_context={"roles": ["viewer"]},
+        )
+        assert resumed.output == "완료"
+        assert observed_contexts == [{"roles": ["viewer"]}]
 
     asyncio.run(scenario())
 

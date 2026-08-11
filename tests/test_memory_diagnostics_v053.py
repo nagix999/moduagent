@@ -451,7 +451,7 @@ def test_memory_compaction_event_has_consistent_content_free_measurements() -> N
         assert result.finish_reason is FinishReason.COMPLETED
         assert len(compacted) == 1
         event = compacted[0]
-        assert event.event_schema_version == 1
+        assert event.event_schema_version == 2
         assert event.data["phase"] == "act"
         assert event.data["original_tokens"] == 4
         assert event.data["selected_tokens"] == 3

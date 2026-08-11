@@ -12,6 +12,7 @@ from moduagent.tools.base import (
     ToolSchema,
     _await_if_needed,
     _run_sync_in_daemon,
+    normalize_tool_side_effect_level,
 )
 from moduagent.tools.failure import (
     ToolFailureClassification,
@@ -50,6 +51,7 @@ class FunctionTool:
             Callable[[Exception], ToolFailureClassification | None] | None
         ) = None,
         sync_scheduler: SyncToolScheduler | None = None,
+        side_effect_level: str | None = None,
     ) -> None:
         if input_model is not None and args_schema is not None:
             raise ValueError("use either input_model or args_schema, not both")
@@ -96,6 +98,7 @@ class FunctionTool:
         self.description = description or inspect.getdoc(function) or self.name
         self.timeout_seconds = timeout_seconds
         self.max_result_bytes = max_result_bytes
+        self.side_effect_level = normalize_tool_side_effect_level(side_effect_level)
         resolved_safety_profile = safety_profile or ToolSafetyProfile(
             same_call_retry_safe=idempotent,
             changed_argument_repair_safe=repair_safe,
@@ -250,6 +253,7 @@ def function_tool(
         Callable[[Exception], ToolFailureClassification | None] | None
     ) = None,
     sync_scheduler: SyncToolScheduler | None = None,
+    side_effect_level: str | None = None,
 ) -> Callable[[F], FunctionTool]: ...
 
 
@@ -272,6 +276,7 @@ def function_tool(
         Callable[[Exception], ToolFailureClassification | None] | None
     ) = None,
     sync_scheduler: SyncToolScheduler | None = None,
+    side_effect_level: str | None = None,
 ) -> FunctionTool | Callable[[F], FunctionTool]:
     """Create a FunctionTool, usable both directly and as a decorator."""
 
@@ -291,6 +296,7 @@ def function_tool(
             safety_profile=safety_profile,
             failure_classifier=failure_classifier,
             sync_scheduler=sync_scheduler,
+            side_effect_level=side_effect_level,
         )
 
     if function is None:
