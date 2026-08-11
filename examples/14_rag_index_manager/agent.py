@@ -11,6 +11,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from moduagent import (
     Agent,
+    DecisionKind,
+    ExecutionDecision,
+    ModelProtocolError,
+    ModelResponse,
     RunContext,
     RunLimits,
     StandardDecisionPolicy,
@@ -18,6 +22,7 @@ from moduagent import (
     ToolResult,
     function_tool,
 )
+from moduagent.errors import ToolRecoveryError
 
 from .pipeline import IndexStatus, RAGIndexManager, SyncReport
 
@@ -114,11 +119,73 @@ class _FinalizeAfterSuccessfulOperationPolicy(StandardDecisionPolicy):
     ) -> None:
         await super().observe(context, results)
         if len(results) != 1:
-            raise RuntimeError("management execution must observe exactly one Tool")
-        context.policy_state[self._STATE_KEY] = results[0].success is True
+            raise ToolRecoveryError(
+                "management execution did not return exactly one Tool result"
+            )
+        if results[0].success is not True:
+            self._record_failed_operation(context, results[0])
+            raise ToolRecoveryError(
+                "management Tool execution failed and cannot be repeated in this run"
+            )
+        context.policy_state[self._STATE_KEY] = True
+
+    @staticmethod
+    def _record_failed_operation(context: RunContext, result: ToolResult) -> None:
+        error = result.error
+        error_type = getattr(getattr(error, "type", None), "value", None)
+        reason = getattr(error, "reason", None)
+        code = _safe_failure_label(reason, fallback=error_type or "execution_error")
+        summary: dict[str, Any] = {
+            "component": "tool",
+            "operation": _safe_failure_label(
+                result.tool_name,
+                fallback="management_operation",
+            ),
+            "phase": "act",
+            "category": "tool_failure",
+            "code": code,
+            "retryable": bool(getattr(error, "retryable", False)),
+        }
+        failure_id = context.tool_failure_ids.get(result.call_id)
+        if isinstance(failure_id, str) and failure_id:
+            summary["failure_id"] = failure_id
+        context.primary_failure = {
+            **summary,
+            **dict(context.primary_failure or {}),
+        }
+
+    async def decide(
+        self,
+        context: RunContext,
+        response: ModelResponse,
+    ) -> ExecutionDecision:
+        decision = await super().decide(context, response)
+        if decision.kind is DecisionKind.CALL_TOOLS and len(decision.tool_calls) != 1:
+            raise ModelProtocolError(
+                "management model must select exactly one Tool operation"
+            )
+        if (
+            decision.kind is DecisionKind.FINISH
+            and context.policy_state.get(self._STATE_KEY) is not True
+        ):
+            raise ModelProtocolError(
+                "management model must select exactly one Tool operation"
+            )
+        return decision
 
     def should_stop(self, context: RunContext) -> bool:
         return context.policy_state.get(self._STATE_KEY) is True
+
+
+def _safe_failure_label(value: Any, *, fallback: str) -> str:
+    if (
+        isinstance(value, str)
+        and value.isascii()
+        and 0 < len(value) <= 128
+        and all(character.isalnum() or character in "_.:-" for character in value)
+    ):
+        return value
+    return fallback
 
 
 def make_management_tools(
@@ -257,6 +324,7 @@ def build_management_agent(
         model_options={
             "temperature": 0,
             "max_tokens": 1_024,
+            "tool_choice": "required",
             "parallel_tool_calls": False,
         },
         finalization_mode="structured_only",
@@ -301,7 +369,10 @@ async def run_management_request(
     )
     if len(result.tool_trace) != 1 or len(successful) != 1 or len(audit.records) != 1:
         raise RuntimeError(
-            "management contract requires exactly one successful Tool call"
+            "management audit mismatch "
+            f"(trace_count={len(result.tool_trace)}, "
+            f"successful_trace_count={len(successful)}, "
+            f"audit_count={len(audit.records)})"
         )
     tool_name, authoritative = audit.records[0]
     if successful[0].get("tool_name") != tool_name:
