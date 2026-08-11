@@ -607,10 +607,23 @@ class RuntimeServices:
                         code=classification.code,
                         retryable=classification.retryable,
                         terminal=True,
+                        # A non-protocol failure from the optional conversation
+                        # summarizer can be recovered by the Memory policy's
+                        # already-bounded recent-only view. Keep its operation
+                        # diagnostic, but do not let that recovered auxiliary
+                        # failure replace a later, actual run-terminal cause.
+                        # Protocol failures are deliberately not a fallback and
+                        # therefore retain their existing primary semantics.
+                        set_primary=(
+                            phase != "memory_summary"
+                            or classification.category == "model_protocol"
+                        ),
                     )
                     if isinstance(exc, asyncio.TimeoutError):
                         raise
-                    if classification.code == "model_protocol_error":
+                    if isinstance(exc, ModelOutputIncompleteError):
+                        raise
+                    if classification.category == "model_protocol":
                         raise ModelProtocolError(
                             "model protocol response is invalid"
                         ) from exc
@@ -818,7 +831,9 @@ class RuntimeServices:
                         )
                     if isinstance(exc, asyncio.TimeoutError):
                         raise
-                    if classification.code == "model_protocol_error":
+                    if isinstance(exc, ModelOutputIncompleteError):
+                        raise
+                    if classification.category == "model_protocol":
                         raise ModelProtocolError(
                             "model protocol response is invalid"
                         ) from exc

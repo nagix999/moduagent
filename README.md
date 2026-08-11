@@ -6,11 +6,11 @@
 ModuAgent is a composable Python runtime for building AI agents around your
 own model endpoints and Python functions.
 
-Start with a normal model or Tool-calling loop. Add bounded conversation
-memory, validated Pydantic output, strict Plan-and-Execute, checkpoint recovery,
+Start with a normal model or Tool-calling loop. Add bounded Context Memory,
+validated Pydantic output, strict Plan-and-Execute, checkpoint recovery,
 Skills, and observability only when your application needs them.
 
-> Current version: **0.5.2** · Status: **Alpha** · Python **3.10+** · **MIT License**
+> Current version: **0.5.3** · Status: **Alpha** · Python **3.10+** · **MIT License**
 
 New to ModuAgent? Follow the five short steps below. They use the 0.5 Quick
 API; the explicit component API remains available for advanced composition.
@@ -72,10 +72,10 @@ server; ModuAgent does not host a model itself.
 Install the package:
 
 ```bash
-python -m pip install "moduagent==0.5.2"
+python -m pip install "moduagent==0.5.3"
 ```
 
-If your package index does not contain `0.5.2` yet and you already have a 0.5
+If your package index does not contain `0.5.3` yet and you already have a 0.5
 source checkout, install it from the repository root:
 
 ```bash
@@ -265,6 +265,18 @@ Raw assistant Tool calls and raw Tool results are internal protocol messages.
 They are available to the model during the run but are not added to
 `ConversationStore` or `AgentResult.messages`. The default public Tool trace is
 a bounded, secret-safe summary.
+
+`AgentTool(child_agent)` is the legacy, in-process way to expose one Agent as a
+Tool. A non-successful child run is a Tool failure; it is never returned as a
+successful `None` value. Child terminal failures are non-retryable at this
+legacy boundary: generic Tool retry counts, changed-argument repair, timeout
+retry, and `idempotent=True` alone do not rerun them. A custom Agent-like object
+may explicitly raise a pre-classified `ToolFailure`; that declared safe contract
+is preserved. This adapter has no root budget, cycle/depth guard, receipt, or
+parent/child session namespace. Because it forwards the parent's `session_id`,
+composing parent and child with the same
+`ConversationStore` object emits a warning: use separate stores for legacy
+delegation and do not treat it as a production isolation boundary.
 
 ## Step 3: return validated structured output
 
@@ -600,7 +612,7 @@ composes and runs the components; the application remains responsible for:
 The Quick API only removes repetitive framework wiring. It does not infer
 domain semantics or Tool safety.
 
-## Advanced composition: conversation memory
+## Advanced composition: Context Memory
 
 Use the same `session_id` to continue a conversation. `Agent.create()` accepts
 the common stores, memory policy, authorization, checkpoints, Skills, and
@@ -646,13 +658,24 @@ The store and the memory policy have different jobs:
 | `ConversationStore` | Saves the complete public conversation |
 | `ConversationMemoryPolicy` | Selects the view sent to the model |
 
+These components provide **Context Memory** for the current session and bound
+what is sent in each model request. They do not provide **Long-Term Memory**
+for retrieving facts, preferences, or episodes across sessions.
+
 `RecentTurnsConversationMemoryPolicy` does not delete stored messages. It sends
 only the latest complete turns to the model. In-memory stores are intended for
-single-process development and tests.
+single-process development and tests. Because this policy does not count
+tokens, `MEMORY_COMPACTED` reports `original_tokens=0` and
+`selected_tokens=0`; those values mean “not measured,” not a zero-token
+request.
 
-For strict token limits and automatic summarization, see the
-[Conversation Memory guide](https://github.com/nagix999/moduagent/blob/main/docs/conversation-memory-policy.md).
-If exact vLLM tokenization is used repeatedly, wrap `VLLMTokenCounter` with
+The compatibility default, `FullConversationMemoryPolicy`, is unbounded and
+can exceed a production endpoint's context window as a session grows. For
+production, prefer `TokenBudgetConversationMemoryPolicy` with an exact counter
+for the deployed model, such as `VLLMTokenCounter`. Add a summarizer only when
+older context must be retained. See the
+[Context Memory guide](https://github.com/nagix999/moduagent/blob/main/docs/conversation-memory-policy.md).
+If exact vLLM tokenization is used repeatedly, wrap the counter with
 `CachingTokenCounter`; it stores only a bounded keyed digest and successful
 token count.
 
@@ -1016,7 +1039,7 @@ Use Redis or a durable custom store for multi-process or restart-safe systems.
 | Add Tools | `tool`, `function_tool`, `ToolSafetyProfile`, `ToolAuthorizer` |
 | Choose execution | `StandardExecutionProfile`, `PlanExecutionProfile` |
 | Validate output | `PydanticOutputCodec`, `TextOutputCodec` |
-| Keep conversations | `ConversationStore`, `RecentTurnsConversationMemoryPolicy` |
+| Keep bounded session context | `ConversationStore`, `RecentTurnsConversationMemoryPolicy` |
 | Resume work | `CheckpointStore`, `Agent.resume()` |
 | Add domain procedures | `SkillRegistry`, `SkillSelector` |
 | Observe runs | `Agent.stream_all()`, `EventSink`, `DiagnosticSink`, `failure_id` |
@@ -1043,8 +1066,8 @@ The detailed guides are currently written in Korean.
   custom Engines, Tool failure contracts, and extension points.
 - [Plan-and-Execute](https://github.com/nagix999/moduagent/blob/main/docs/plan-and-execute.md):
   strict state machine and recovery details.
-- [Conversation Memory](https://github.com/nagix999/moduagent/blob/main/docs/conversation-memory-policy.md):
-  recent turns, token budgets, and summarization.
+- [Context Memory](https://github.com/nagix999/moduagent/blob/main/docs/conversation-memory-policy.md):
+  bounded session context, token budgets, and summarization.
 - [Agent Skills](https://github.com/nagix999/moduagent/blob/main/docs/skills.md):
   reusable procedures and resource access.
 - [Operations](https://github.com/nagix999/moduagent/blob/main/docs/operations.md):
@@ -1053,6 +1076,8 @@ The detailed guides are currently written in Korean.
   step timelines, failure correlation, sanitized details, and custom sinks.
 - [0.4 migration](https://github.com/nagix999/moduagent/blob/main/docs/migration-0.4.md):
   source compatibility and checkpoint migration.
+- [0.5 migration](https://github.com/nagix999/moduagent/blob/main/docs/migration-0.5.md):
+  Quick API, safety changes, and the migration-free 0.5.3 PATCH.
 - [Changelog](https://github.com/nagix999/moduagent/blob/main/CHANGELOG.md)
 
 ## Development

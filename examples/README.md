@@ -8,10 +8,10 @@ order; each file is standalone.
 
 ## Before you start
 
-These examples target ModuAgent `0.5.2`. Install the exact version:
+These examples target ModuAgent `0.5.3`. Install the exact version:
 
 ```bash
-python -m pip install "moduagent==0.5.2"
+python -m pip install "moduagent==0.5.3"
 ```
 
 Alternatively, when running from a source checkout, install that working tree

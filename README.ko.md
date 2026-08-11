@@ -7,11 +7,11 @@ ModuAgent는 자체 모델 엔드포인트와 Python 함수를 바탕으로 AI �
 구축할 수 있는 조합형 Python 런타임입니다.
 
 일반 모델 호출이나 도구 호출 루프로 시작할 수 있습니다. 애플리케이션에
-필요해지는 시점에 범위가 제한된 대화 메모리, 검증된 Pydantic 출력, 엄격한
+필요해지는 시점에 범위가 제한된 Context Memory, 검증된 Pydantic 출력, 엄격한
 계획-실행(Plan-and-Execute), 체크포인트 복구, 스킬, 관측성 기능을 추가할 수
 있습니다.
 
-> 현재 버전: **0.5.2** · 상태: **Alpha** · Python **3.10+** · **MIT License**
+> 현재 버전: **0.5.3** · 상태: **Alpha** · Python **3.10+** · **MIT License**
 
 ModuAgent를 처음 사용한다면 아래의 짧은 다섯 단계를 따라갑니다. 이 단계는
 0.5 Quick API를 사용하며, 고급 조합에는 명시적인 구성 요소 API를 그대로
@@ -76,10 +76,10 @@ ModuAgent에는 Python 3.10 이상이 필요합니다. 접근 가능한 모델 �
 패키지를 설치합니다.
 
 ```bash
-python -m pip install "moduagent==0.5.2"
+python -m pip install "moduagent==0.5.3"
 ```
 
-패키지 인덱스에 아직 `0.5.2`가 없고 이미 0.5 소스를 체크아웃했다면 저장소
+패키지 인덱스에 아직 `0.5.3`이 없고 이미 0.5 소스를 체크아웃했다면 저장소
 루트에서 설치합니다.
 
 ```bash
@@ -267,6 +267,18 @@ def query_db(sql: str) -> list[dict]:
 실행 중에는 모델이 사용할 수 있지만 `ConversationStore`나
 `AgentResult.messages`에는 추가되지 않습니다. 기본 공개 도구 추적 정보는
 크기가 제한되며 비밀 정보를 노출하지 않는 요약입니다.
+
+`AgentTool(child_agent)`은 한 프로세스 안에서 다른 에이전트를 도구로 노출하는
+legacy 방식입니다. 실패한 child 실행은 도구 실패이며 성공한 `None` 값으로
+반환되지 않습니다. Child terminal 실패는 이 legacy 경계에서 재시도할 수 없는
+실패로 분류됩니다. 일반 Tool retry 횟수, 변경 인자 repair, timeout retry 또는
+`idempotent=True`만으로는 실패한 child를 다시 실행하지 않습니다. 사용자 정의
+Agent-like 객체가 이미 안전하게 분류한 `ToolFailure`를 명시적으로 발생시키면
+그 계약은 보존됩니다. 이 어댑터에는 root 예산, cycle/depth 차단, receipt,
+parent/child session namespace가 없습니다. Parent의 `session_id`를 그대로
+전달하므로 parent와 child가 같은 `ConversationStore`
+객체를 사용하면 경고가 발생합니다. legacy 위임에서는 저장소를 분리하고 이를
+프로덕션 격리 경계로 간주하지 마세요.
 
 ## 3단계: 검증된 구조화 출력 반환
 
@@ -598,7 +610,7 @@ ModuAgent 0.5에는 도메인 Recipe, Workflow DSL, 데이터베이스 추상화
 Quick API는 반복되는 프레임워크 연결 코드만 줄입니다. 도메인 의미나 도구
 안전성을 추론하지 않습니다.
 
-## 고급 조합: 대화 메모리
+## 고급 조합: Context Memory
 
 동일한 `session_id`를 사용하면 대화를 이어갈 수 있습니다. `Agent.create()`는
 일반적인 저장소, 메모리 정책, 인가, 체크포인트, 스킬과 관측성 구성 요소를
@@ -643,16 +655,25 @@ async def demonstrate_memory() -> None:
 | `ConversationStore` | 외부에 공개되는 전체 대화를 저장합니다. |
 | `ConversationMemoryPolicy` | 모델에 전달할 대화 범위를 선택합니다. |
 
+이 구성 요소는 현재 session에서 사용할 **Context Memory**를 만들고 각 모델
+요청의 입력 범위를 제한합니다. 여러 session에서 사실, 선호 또는 episode를
+검색하는 **Long-Term Memory**는 제공하지 않습니다.
+
 `RecentTurnsConversationMemoryPolicy`는 저장된 메시지를 삭제하지 않습니다.
 모델에는 가장 최근의 완전한 대화 턴만 전달합니다. 인메모리 저장소는 단일
-프로세스 개발 및 테스트 용도입니다.
+프로세스 개발 및 테스트 용도입니다. 이 정책은 token을 계산하지 않으므로
+`MEMORY_COMPACTED`의 `original_tokens=0`, `selected_tokens=0`은 실제 입력이
+0 token이라는 뜻이 아니라 “미계수”를 의미합니다.
 
-엄격한 토큰 제한과 자동 요약은
-[Conversation Memory 가이드](https://github.com/nagix999/moduagent/blob/main/docs/conversation-memory-policy.md)를
-참고합니다.
-vLLM의 정확한 토큰 계산을 반복해서 사용한다면 `VLLMTokenCounter`를
+호환 기본값인 `FullConversationMemoryPolicy`는 입력 길이를 제한하지 않으므로
+session이 길어지면 운영 endpoint의 context window를 초과할 수 있습니다.
+프로덕션에서는 배포 모델의 exact counter(예: `VLLMTokenCounter`)를 사용하는
+`TokenBudgetConversationMemoryPolicy`를 권장하며, 오래된 문맥을 보존해야 할
+때만 summarizer를 추가합니다. 자세한 내용은
+[Context Memory 가이드](https://github.com/nagix999/moduagent/blob/main/docs/conversation-memory-policy.md)를
+참고합니다. vLLM의 exact token 계산을 반복한다면 counter를
 `CachingTokenCounter`로 감쌉니다. cache에는 크기가 제한된 keyed digest와
-성공한 토큰 수만 저장됩니다.
+성공한 token 수만 저장됩니다.
 
 ### 애플리케이션 예제: 리포트 자동화
 
@@ -1013,7 +1034,7 @@ Redis 또는 영속 사용자 정의 저장소를 사용합니다.
 | 도구 추가 | `tool`, `function_tool`, `ToolSafetyProfile`, `ToolAuthorizer` |
 | 실행 방식 선택 | `StandardExecutionProfile`, `PlanExecutionProfile` |
 | 출력 검증 | `PydanticOutputCodec`, `TextOutputCodec` |
-| 대화 유지 | `ConversationStore`, `RecentTurnsConversationMemoryPolicy` |
+| 제한된 session 문맥 유지 | `ConversationStore`, `RecentTurnsConversationMemoryPolicy` |
 | 작업 재개 | `CheckpointStore`, `Agent.resume()` |
 | 도메인 절차 추가 | `SkillRegistry`, `SkillSelector` |
 | 실행 관측 | `Agent.stream_all()`, `EventSink`, `DiagnosticSink`, `failure_id` |
@@ -1040,8 +1061,8 @@ Redis 또는 영속 사용자 정의 저장소를 사용합니다.
   사용자 정의 `Engine`, 도구 실패 계약, 확장 지점을 설명합니다.
 - [계획-실행](https://github.com/nagix999/moduagent/blob/main/docs/plan-and-execute.md):
   엄격한 상태 머신과 복구 세부 정보를 설명합니다.
-- [Conversation Memory](https://github.com/nagix999/moduagent/blob/main/docs/conversation-memory-policy.md):
-  최근 대화 턴, 토큰 예산, 요약을 설명합니다.
+- [Context Memory](https://github.com/nagix999/moduagent/blob/main/docs/conversation-memory-policy.md):
+  제한된 session 문맥, token 예산, 요약을 설명합니다.
 - [에이전트 스킬](https://github.com/nagix999/moduagent/blob/main/docs/skills.md):
   재사용 가능한 절차와 리소스 접근을 설명합니다.
 - [Operations](https://github.com/nagix999/moduagent/blob/main/docs/operations.md):
@@ -1051,6 +1072,8 @@ Redis 또는 영속 사용자 정의 저장소를 사용합니다.
   설명합니다.
 - [0.4 마이그레이션](https://github.com/nagix999/moduagent/blob/main/docs/migration-0.4.md):
   소스 호환성과 체크포인트 마이그레이션을 설명합니다.
+- [0.5 마이그레이션](https://github.com/nagix999/moduagent/blob/main/docs/migration-0.5.md):
+  Quick API, 안전성 변경과 migration이 필요 없는 0.5.3 PATCH를 설명합니다.
 - [Changelog](https://github.com/nagix999/moduagent/blob/main/CHANGELOG.md)
 
 ## 개발

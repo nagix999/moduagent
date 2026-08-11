@@ -1,6 +1,6 @@
 # 중급 예제
 
-이 예제는 ModuAgent `0.5.2`를 기준으로 합니다. 먼저 [`README.md`](README.md)의
+이 예제는 ModuAgent `0.5.3`를 기준으로 합니다. 먼저 [`README.md`](README.md)의
 초급 과정을 마친 다음 `10` → `11` → `12` 순서로 진행하세요. 각 예제는 독립적으로
 실행할 수 있고 애플리케이션이 소유한 결정론적 데이터를 사용합니다. 따라서 Agent
 패턴을 바꾸지 않고 샘플 Tool을 자체 연동 코드로 교체할 수 있습니다.
@@ -10,7 +10,7 @@
 정확한 릴리스 버전을 설치합니다.
 
 ```bash
-python -m pip install "moduagent==0.5.2"
+python -m pip install "moduagent==0.5.3"
 ```
 
 또는 이 소스 체크아웃에서 현재 작업 트리를 사용합니다.

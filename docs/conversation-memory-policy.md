@@ -1,11 +1,17 @@
-# ConversationMemoryPolicy 설계
+# Context Memory: ConversationMemoryPolicy 설계
 
-상태: 구현 완료. 0.5.2에서 PLAN/replan 공통 준비 경로와 in-memory 저장소
-용량 제어까지 반영했으며 durable 저장소의 cursor pagination은 후속 범위다.
+상태: 구현 완료. 0.5.3에서 child delegation과 분리된 Context Memory 용어,
+phase별 진단 회귀, 운영 권고를 보강했다. Durable 저장소의 cursor pagination과
+Long-Term Memory는 후속 범위다.
 
 ## 목적
 
 대화 원문은 보존하면서 모델에 전달하는 요청만 context window 안으로 제한한다. 긴 세션에서도 vLLM의 context 초과와 입력 증가에 따른 timeout을 예방하고, Tool Calling·구조화 출력·체크포인트 동작은 유지한다.
+
+이 문서의 Memory는 현재 session의 요청 문맥을 구성하는 **Context Memory**다.
+여러 session에서 사실, 선호, episode 또는 장기 작업 상태를 검색·수정하는
+**Long-Term Memory**는 0.5.3에 포함되지 않는다. Context Memory의 summary도
+원문에서 다시 만들 수 있는 cache이며 장기 지식의 source of truth가 아니다.
 
 이 정책은 다음 두 대상을 구분한다.
 
@@ -31,16 +37,20 @@ ConversationStore ── 전체 원문 ──> RunContext
 새 모듈은 `moduagent.memory`에 둔다.
 
 ```python
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Mapping, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from moduagent.messages import Message, Usage
-from moduagent.models import ModelRequest
+from moduagent.models import ModelGateway, ModelRequest
 
 
 class MemoryPhase(str, Enum):
+    PLAN = "plan"
     ACT = "act"
+    STEP_RESULT = "step_result"
+    VERIFY = "verify"
     FINALIZE = "finalize"
 
 
@@ -52,6 +62,7 @@ class MemoryRequest:
     model_request: ModelRequest
     protected_from: int
     user_context: Mapping[str, object] = field(default_factory=dict)
+    model_gateway: ModelGateway | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +95,7 @@ conversation_memory_policy: ConversationMemoryPolicy | None = None
 
 ### FullConversationMemoryPolicy
 
-입력 메시지를 그대로 반환한다. 기존 사용자와 테스트의 동작을 보존하고 점진적으로 배포하기 위한 identity policy다.
+입력 메시지를 그대로 반환한다. 기존 사용자와 테스트의 동작을 보존하고 점진적으로 배포하기 위한 identity policy다. Token 상한을 보장하지 않으므로 session이 길어지는 프로덕션 환경에서는 권장하지 않는다. 운영 기본값으로 간주하지 말고 배포 모델의 exact counter를 사용하는 `TokenBudgetConversationMemoryPolicy`를 명시한다.
 
 ### RecentTurnsConversationMemoryPolicy
 
@@ -110,6 +121,11 @@ Agent system instruction
 - 요약 호출이나 별도 상태 저장소가 필요 없다.
 - 원본 `ConversationStore`와 `RunContext`는 변경하지 않는다.
 - 손상된 Tool 블록에 대한 원자성 검사는 TokenBudget 정책과 동일하게 적용한다.
+
+이 정책은 token을 세지 않는다. 따라서 compaction이 발생했을 때
+`MEMORY_COMPACTED.original_tokens`와 `selected_tokens`가 모두 `0`이면 실제
+요청이 0 token이라는 뜻이 아니라 **미계수**를 뜻한다. Message 수와 제외된
+turn 수는 별도 필드로 확인한다.
 
 이 정책은 동작과 비용이 단순하지만 context window를 보장하지 않는다. 최근 한 turn이나 현재 Tool 결과 하나가 매우 클 수 있기 때문이다. 엄격한 토큰 제한이 필요하면 아래 `TokenBudgetConversationMemoryPolicy`에 `max_history_turns`를 함께 설정한다.
 
@@ -180,7 +196,7 @@ class TokenCounter(Protocol):
     async def count_request(self, request: ModelRequest) -> int: ...
 ```
 
-운영 환경에서는 실제 모델 tokenizer를 사용한다. 제공되는 `VLLMTokenCounter`는 vLLM의 chat 메시지와 Tool을 받는 `/tokenize` API를 사용한다. 로컬 휴리스틱은 `ApproximateTokenCounter`로 명확히 이름 붙이고 큰 safety margin을 적용한다.
+운영 환경에서는 실제 배포 모델의 tokenizer를 사용한다. 제공되는 `VLLMTokenCounter`는 vLLM의 chat 메시지와 Tool을 받는 `/tokenize` API를 사용한다. 로컬 휴리스틱은 `ApproximateTokenCounter`로 명확히 이름 붙이고 큰 safety margin을 적용한다. Exact token 제한이 성공 기준이라면 `ApproximateTokenCounter`만으로 상한을 보장했다고 판단하지 않는다.
 
 동일한 요청이 여러 실행 단계에서 반복되면 exact tokenizer 호출도 재사용할 수
 있다. `CachingTokenCounter`는 delegate의 계산 방식을 바꾸지 않으며, 성공한
@@ -302,7 +318,9 @@ class MemoryStateStore(Protocol):
 
 ## Runtime 통합
 
-ACT와 FINALIZE 요청은 모두 공통 `_prepare_model_request()`를 거친다.
+PLAN/replan, ACT, STEP_RESULT와 FINALIZE 요청은 공통
+`_prepare_model_request()`를 거친다. `MemoryPhase.VERIFY`도 public phase 계약에
+포함되지만 현재 built-in 검증기는 별도 VERIFY model 요청을 만들지 않는다.
 
 ```python
 async def _prepare_model_request(
@@ -317,6 +335,7 @@ async def _prepare_model_request(
         request,
         messages=compose_skill_prompt(request.messages, context.skill_messages),
     )
+    usage_before_memory = context.usage
     memory = await self._within(
         deadline,
         lambda: self.conversation_memory_policy.prepare(
@@ -329,10 +348,14 @@ async def _prepare_model_request(
                     context.current_run_start + len(context.skill_messages)
                 ),
                 user_context=context.request.user_context,
+                model_gateway=context.model_gateway,
             )
         ),
     )
-    context.usage = context.usage + memory.usage
+    # model_gateway를 사용한 summary 호출은 gateway가 usage를 이미 집계한다.
+    # 직접 집계되지 않은 custom summarizer usage만 한 번 더한다.
+    if context.usage == usage_before_memory:
+        context.usage = context.usage + memory.usage
     prepared = replace(request, messages=tuple(memory.messages))
     compacted = (
         prepared.messages != request.messages
@@ -360,14 +383,20 @@ ConversationStore.load
 → bounded ModelRequest 전송
 ```
 
-체크포인트는 전체 실행 메시지와 `current_run_start`, 누적 usage를 저장한다. 요약 cache의 `policy_fingerprint`와 covered-prefix digest는 `MemoryStateStore`의 `MemorySnapshot`이 관리하며 0.2.0 checkpoint에는 snapshot 식별자를 중복 저장하지 않는다. Resume 후 cache가 현재 Policy나 원문 prefix와 맞지 않으면 MemoryPolicy가 cache를 사용하지 않고 다시 요약한다.
+Checkpoint v4 envelope은 실행 메시지와 `current_run_start`, 누적 usage 및
+Engine state를 저장한다. 요약 cache의 `policy_fingerprint`와 covered-prefix
+digest는 별도 `MemoryStateStore`의 `MemorySnapshot`이 관리하며 checkpoint에
+snapshot 본문이나 식별자를 중복 저장하지 않는다. Resume 후 cache가 현재
+Policy나 원문 prefix와 맞지 않으면 MemoryPolicy가 cache를 사용하지 않고 다시
+요약한다. 0.5.3은 checkpoint v4, event v1, built-in Engine state v1과
+`MemorySnapshot` 구조를 변경하지 않으므로 migration이 필요 없다.
 
 0.5.2부터 `LLMPlanGenerator`의 PLAN과 replan 요청도 Runtime의 동일한
 request-preparation 경로를 사용한다. `history_limit`가 먼저 공개 대화 후보 수를
 제한하고, `ConversationMemoryPolicy`가 그 후보를 token 또는 최근 turn 기준으로
 다시 선택한다. 현재 사용자 요청과 Plan protocol 지침은 protected 영역이므로
 제거되지 않으며, compaction이 발생하면 `phase="plan"`인
-`MEMORY_COMPACTED` 이벤트가 기록된다.
+`MEMORY_COMPACTED` 이벤트가 기록된다. 이 계약은 0.5.3에서도 그대로 유지된다.
 
 ## 오류와 관측성
 
@@ -377,7 +406,12 @@ request-preparation 경로를 사용한다. `history_limit`가 먼저 공개 대
 - `ConversationMemoryOverflowError`: 필수 입력이 예산을 초과함
 - `MemoryIntegrityError`: Tool 메시지 관계가 손상됨
 
-`EventType.MEMORY_COMPACTED`를 추가한다. 이벤트에는 원문이나 요약 본문을 넣지 않는다.
+Summary model의 protocol 오류와 model guard 실패는 recent-only fallback으로
+변환하지 않고 run을 종료한다. Provider가 `timeout`, `length`,
+`max_tokens`로 끝낸 부분 summary도 `model_output_incomplete`로 실패하며,
+부분 content를 model context나 `MemoryStateStore` cache에 넣지 않는다.
+
+`EventType.MEMORY_COMPACTED` 이벤트에는 원문이나 요약 본문을 넣지 않는다.
 
 ```python
 {
@@ -388,8 +422,15 @@ request-preparation 경로를 사용한다. `history_limit`가 먼저 공개 대
     "dropped_messages": 0,
     "budget_tokens": 29_696,
     "cache_hit": True,
+    "duration_seconds": 0.012,
 }
 ```
+
+`original_tokens`와 `selected_tokens`는 provider의 사후 usage가 아니라 설정한
+`TokenCounter`가 계산한 전체 `ModelRequest` 크기다. `duration_seconds`는 token
+계산과 선택적 요약을 포함한 Context Memory 준비 wall time이다. 이벤트는
+PLAN/ACT/FINALIZE에서 같은 필드 의미를 사용하며 원문이나 summary 본문을
+포함하지 않는다. Token을 계산하지 않는 RecentTurns 정책의 `0/0`은 미계수다.
 
 권장 metric은 `memory.context_tokens`, `memory.compactions`, `memory.summary_tokens`, `memory.compression_ratio`, `memory.overflow`다. `session_id`는 metric label로 사용하지 않는다.
 
@@ -397,7 +438,7 @@ request-preparation 경로를 사용한다. `history_limit`가 먼저 공개 대
 
 ConversationMemoryPolicy는 모델 입력 토큰만 제한한다. `InMemoryConversationStore`의 Python 메모리 사용량과 전체 기록 조회 비용은 별도 문제다.
 
-0.5.2의 저장소 용량 제어와 후속 durable 저장소 개선은 다음과 같이 분리한다.
+0.5.2에서 도입된 저장소 용량 제어와 후속 durable 저장소 개선은 다음과 같이 분리한다.
 
 - `InMemoryConversationStore`: `max_sessions`, `max_total_bytes`, lazy periodic TTL sweep, 세션 단위 LRU eviction을 제공한다. 메시지는 caller가 중첩 mapping을 변경해 byte 회계를 우회하지 못하도록 canonical JSON row로 보관하며, `stats()`는 본문 없이 세션 수와 직렬화된 메시지 byte 수만 반환하고 `sweep_expired()`로 즉시 정리할 수 있다. 이 수치는 Python 객체 overhead나 process RSS의 상한이 아니다.
 - `RedisConversationStore`/`DatabaseConversationStore`: summary cursor 이후 tail 조회와 pagination은 저장소별 원자성·cursor 계약이 필요하므로 후속 버전 범위다.
@@ -423,7 +464,7 @@ moduagent/memory/
 통합 대상은 다음과 같다.
 
 - `moduagent/agent.py`: policy 주입
-- `moduagent/runtime/runtime.py`: ACT/FINALIZE 공통 준비 경로
+- `moduagent/runtime/runtime.py`: phase별 공통 요청 준비 경로
 - `moduagent/runtime/context.py`: `current_run_start`와 memory metadata
 - `moduagent/persistence/checkpoint.py`: resume용 memory 필드
 - `moduagent/runtime/events.py`: `MEMORY_COMPACTED`
@@ -441,7 +482,7 @@ moduagent/memory/
 
 - 예산 이하 요청은 메시지와 호출 순서가 기존과 동일하다.
 - RecentTurns 정책은 최근 완료 turn N개와 현재 실행만 정확히 선택한다.
-- 모든 ACT/FINALIZE 요청이 설정한 input budget 이하이다.
+- TokenBudget 정책을 거친 모든 built-in phase 요청이 설정한 input budget 이하이다.
 - Tool Call과 모든 결과가 절대 분리되지 않는다.
 - system instruction과 현재 실행 메시지는 제거되지 않는다.
 - 원본 store, `RunContext`, `AgentResult.messages`는 변경되지 않는다.

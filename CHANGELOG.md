@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.5.3
+
+- Made legacy `AgentTool` treat every non-successful child `AgentResult` as a
+  stable Tool failure instead of returning a failed child's `output=None` as a
+  successful Tool value. Child timeout, cancellation, model-guard, output-
+  validation, limit, and generic terminal failures now retain bounded,
+  payload-free classifications.
+- Kept canonical child terminal results and direct framework failures
+  non-retryable at the legacy delegation boundary: generic Tool retry counts,
+  changed-argument repair, timeout retry, and `idempotent=True` alone do not
+  rerun them. A custom Agent-like object's explicitly pre-classified
+  `ToolFailure` retains its declared safe contract.
+- Added a composition-time warning when a parent and its legacy `AgentTool`
+  child use the same `ConversationStore` object, because the legacy adapter
+  forwards the parent's `session_id` and can mix their Context Memory histories.
+- Hardened Context Memory regressions across PLAN, ACT, and FINALIZE, including
+  consistent content-free compaction counters and duration, and terminal
+  propagation of summary-model guard and protocol failures. Incomplete summary
+  responses (`timeout`, `length`, `max_tokens`) are never used or cached.
+- Clarified that `ConversationMemoryPolicy` provides request-scoped Context
+  Memory, not cross-session Long-Term Memory. Documented the production risk of
+  unbounded `FullConversationMemoryPolicy` and recommended an exact-token
+  `TokenBudgetConversationMemoryPolicy` for production endpoints.
+- This PATCH requires no data migration. Checkpoint envelope schema v4, event
+  schema v1, built-in Engine state v1, Context Memory snapshot structure, and
+  ConversationStore persistence formats are unchanged.
+
 ## 0.5.2
 
 - Extended `Agent.create()` with checkpoint, Tool authorization, Skill,
