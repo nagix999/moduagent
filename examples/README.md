@@ -202,6 +202,11 @@ Once the five small examples feel familiar, continue with:
   report workflow with persistence, recovery, and SQLite/PostgreSQL support.
 - [`gemma4_postgresql_report_agent.py`](gemma4_postgresql_report_agent.py) for
   a PostgreSQL-focused Gemma deployment example.
+- [`14_rag_index_manager/`](14_rag_index_manager/) for an application-scoped
+  Docling → Gemma text/vision enrichment → BGE-M3 embedding → Milvus
+  blue/green ingestion manager. It hashes a document directory, plans
+  fingerprint-aware incremental work, preserves Docling provenance, and
+  exposes status/dry-run Tools unless the CLI explicitly enables writes.
 
 Those examples intentionally include production concerns that are omitted from
 the beginner path.
