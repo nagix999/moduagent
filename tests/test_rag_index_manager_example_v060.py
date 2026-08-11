@@ -323,7 +323,6 @@ def _management_model_responses(payload: dict[str, Any]) -> list[Any]:
             (tool_call,),
             finish_reason="tool_calls",
         ),
-        moduagent.ModelResponse(messages.Message.assistant("상태를 확인했습니다.")),
         moduagent.ModelResponse(
             messages.Message.assistant(json.dumps(payload, ensure_ascii=False))
         ),
@@ -1843,7 +1842,10 @@ def test_management_agent_structured_finalization_matches_authoritative_tool_res
         assert response.status == "observed"
         assert response.document_count == 0
         assert response.chunk_count == 0
-        assert len(model.requests) == 3
+        assert len(model.requests) == 2
+        assert model.requests[0].tools
+        assert model.requests[1].tools == ()
+        assert model.requests[1].output_schema is not None
         assert model.responses == []
 
     try:
