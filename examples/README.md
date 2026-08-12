@@ -206,7 +206,9 @@ Once the five small examples feel familiar, continue with:
   Docling → Gemma text/vision enrichment → BGE-M3 embedding → Milvus
   blue/green ingestion manager. It hashes a document directory, plans
   fingerprint-aware incremental work, preserves Docling provenance, and
-  exposes status/dry-run Tools unless the CLI explicitly enables writes.
+  exposes status/dry-run Tools unless the CLI explicitly enables writes. Its
+  opt-in Jupyter/CLI diagnostics correlate content-free pipeline-stage logs
+  with the Agent failure ID without printing document or credential data.
 
 Those examples intentionally include production concerns that are omitted from
 the beginner path.

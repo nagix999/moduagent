@@ -63,6 +63,18 @@ class BackendError(RuntimeError):
     """A backend failed without exposing credentials or response bodies."""
 
 
+class BackendHTTPStatusError(BackendError):
+    """A backend returned a non-success HTTP status without retaining its body."""
+
+    def __init__(self, service_name: str, status_code: int) -> None:
+        if not isinstance(service_name, str) or not service_name.strip():
+            raise ValueError("service_name must be non-empty")
+        if type(status_code) is not int or not 100 <= status_code <= 599:
+            raise ValueError("status_code must be between 100 and 599")
+        self.status_code = status_code
+        super().__init__(f"{service_name} returned HTTP {status_code}")
+
+
 class DoclingBackendError(BackendError):
     """Docling Serve did not return one complete DoclingDocument."""
 
@@ -279,7 +291,7 @@ class _BoundedJSONClient:
                 await self._retry_delay(attempt, deadline)
                 continue
             if not 200 <= status < 300:
-                raise BackendError(f"{self.service_name} returned HTTP {status}")
+                raise BackendHTTPStatusError(self.service_name, status)
             try:
                 value = json.loads(body)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:

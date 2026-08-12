@@ -91,6 +91,7 @@ jobs:
               "examples/14_rag_index_manager/catalog.py",
               "examples/14_rag_index_manager/chunking.py",
               "examples/14_rag_index_manager/cli.py",
+              "examples/14_rag_index_manager/diagnostics.py",
               "examples/14_rag_index_manager/models.py",
               "examples/14_rag_index_manager/pipeline.py",
               "examples/14_rag_index_manager/planner.py",

@@ -10,9 +10,9 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from moduagent import AgentRunError, VLLMClient
+from moduagent import AgentRunError, InMemoryDiagnosticSink, VLLMClient
 
-from .agent import run_management_request
+from .agent import format_management_failure, run_management_request
 from .artifacts import ArtifactStore
 from .backends import (
     DEFAULT_GEMMA_MODEL,
@@ -24,6 +24,7 @@ from .backends import (
 )
 from .catalog import ManifestCatalog
 from .chunking import ChunkingConfig
+from .diagnostics import PipelineExecutionLog
 from .models import RAGIndexError
 from .pipeline import ManagerConfig, RAGIndexManager
 from .restructure import RESTRUCTURING_FINGERPRINT
@@ -63,6 +64,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=int(os.getenv("RAG_EMBEDDING_DIMENSION", "1024")),
         help="expected BGE-M3 dense dimension (default: 1024)",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="stream content-free pipeline stages and print safe failure diagnostics",
+    )
     return parser.parse_args(argv)
 
 
@@ -73,6 +79,12 @@ async def run_cli(args: argparse.Namespace) -> str:
     state_root = Path(args.state_dir).expanduser()
     safe_kb = _milvus_identifier(args.kb_id)
     do_ocr = _environment_bool("DOCLING_SERVE_DO_OCR", default=False)
+    execution_log = (
+        PipelineExecutionLog.console(stream=sys.stderr, include_timestamp=True)
+        if args.verbose
+        else None
+    )
+    diagnostic_sink = InMemoryDiagnosticSink(max_records=100) if args.verbose else None
 
     parser = DoclingServeClient(do_ocr=do_ocr, generate_page_images=True)
     refiner = VLLMLayoutRefinementClient(allow_exclusions=False)
@@ -111,6 +123,7 @@ async def run_cli(args: argparse.Namespace) -> str:
             enricher=enricher,
             embedder=embedder,
             vector_store=vector_store,
+            execution_log=execution_log,
         )
         management_model = VLLMClient(
             base_url=os.getenv(
@@ -123,12 +136,25 @@ async def run_cli(args: argparse.Namespace) -> str:
             default_options={"temperature": 0, "max_tokens": 1_024},
         )
         async with parser, refiner, enricher, embedder, vector_store, management_model:
-            response = await run_management_request(
-                management_model,
-                manager,
-                args.request,
-                allow_writes=args.apply,
-            )
+            try:
+                response = await run_management_request(
+                    management_model,
+                    manager,
+                    args.request,
+                    allow_writes=args.apply,
+                    diagnostic_sink=diagnostic_sink,
+                )
+            except AgentRunError as exc:
+                if execution_log is not None:
+                    print(
+                        format_management_failure(
+                            exc,
+                            execution_log=execution_log,
+                            diagnostic_sink=diagnostic_sink,
+                        ),
+                        file=sys.stderr,
+                    )
+                raise
             return response.model_dump_json(indent=2)
     finally:
         catalog.close()
