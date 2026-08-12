@@ -10,6 +10,7 @@ import os
 import sqlite3
 import sys
 from dataclasses import fields
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -334,6 +335,7 @@ def _manager_fixture(
     document_root: Path,
     *,
     store: Any | None = None,
+    execution_log: Any | None = None,
 ) -> SimpleNamespace:
     artifacts_module = _module("artifacts")
     catalog_module = _module("catalog")
@@ -356,6 +358,9 @@ def _manager_fixture(
     )
     catalog = catalog_module.ManifestCatalog(":memory:")
     artifacts = artifacts_module.ArtifactStore(tmp_path / "artifacts")
+    manager_options: dict[str, Any] = {}
+    if execution_log is not None:
+        manager_options["execution_log"] = execution_log
     manager = pipeline_module.RAGIndexManager(
         config=pipeline_module.ManagerConfig(
             document_root=document_root,
@@ -371,6 +376,7 @@ def _manager_fixture(
         enricher=enricher,
         embedder=embedder,
         vector_store=vector_store,
+        **manager_options,
     )
     return SimpleNamespace(
         manager=manager,
@@ -2031,6 +2037,386 @@ def test_management_agent_never_marks_a_failed_write_operation_retryable(
         fixture.catalog.close()
 
 
+def test_pipeline_execution_log_is_ordered_opt_in_and_content_free(
+    tmp_path: Path,
+) -> None:
+    diagnostics_module = _module("diagnostics")
+    root = tmp_path / "documents"
+    private_path = "finance/private-merger-plan.txt"
+    private_content = "PRIVATE-DOCUMENT-CONTENT must never enter progress logs"
+    _write(root, private_path, private_content.encode())
+    delivered: list[Any] = []
+    console = StringIO()
+    execution_log = diagnostics_module.PipelineExecutionLog.console(
+        max_events=128,
+        stream=console,
+        sink=delivered.append,
+    )
+    fixture = _manager_fixture(
+        tmp_path,
+        root,
+        execution_log=execution_log,
+    )
+
+    async def scenario() -> None:
+        report = await fixture.manager.sync()
+        assert report.status == "published"
+
+    try:
+        _run(scenario())
+        events = execution_log.events
+        assert events
+        assert tuple(delivered) == events
+        assert [event.sequence for event in events] == list(range(1, len(events) + 1))
+        assert all(event.operation == "sync" for event in events)
+        correlation_ids = {event.correlation_id for event in events}
+        assert len(correlation_ids) == 1
+        assert next(iter(correlation_ids)).startswith("pipe_")
+        assert events[0].status == "started"
+        assert events[-1].status == "completed"
+        assert {event.status for event in events} <= {
+            "started",
+            "completed",
+            "failed",
+        }
+        assert not any(event.status == "failed" for event in events)
+        assert {"parse", "embed"} <= {event.stage for event in events}
+        assert all(
+            event.source_id is None or event.source_id.startswith("src_")
+            for event in events
+        )
+        assert all(
+            not hasattr(event, field_name)
+            for event in events
+            for field_name in (
+                "relative_path",
+                "message",
+                "arguments",
+                "result",
+            )
+        )
+        console_lines = console.getvalue().splitlines()
+        assert len(console_lines) == len(events)
+        assert all(line.startswith("rag_index_progress ") for line in console_lines)
+        console_events = [
+            json.loads(line.removeprefix("rag_index_progress "))
+            for line in console_lines
+        ]
+        assert [event["sequence"] for event in console_events] == list(
+            range(1, len(events) + 1)
+        )
+        assert all("occurred_at" not in event for event in console_events)
+        serialized = repr(events) + console.getvalue()
+        assert private_path not in serialized
+        assert private_content not in serialized
+        assert str(root.resolve()) not in serialized
+    finally:
+        fixture.catalog.close()
+
+
+def test_management_failure_correlates_pipeline_stage_and_safe_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SensitiveEmbeddingFailure(RuntimeError):
+        pass
+
+    agent_module = _module("agent")
+    diagnostics_module = _module("diagnostics")
+    moduagent = importlib.import_module("moduagent")
+    messages = importlib.import_module("moduagent.messages")
+    observability = importlib.import_module("moduagent.observability")
+    root = tmp_path / "documents"
+    private_path = "finance/private-merger-plan.txt"
+    private_content = "PRIVATE-DOCUMENT-CONTENT-7f6336"
+    private_url = "https://user:password@milvus.internal/v1?token=PRIVATE-TOKEN"
+    private_error = (
+        f"{private_url} failed while embedding {private_content} "
+        "api_key=PRIVATE-API-KEY"
+    )
+    _write(root, private_path, private_content.encode())
+    delivered: list[Any] = []
+    execution_log = diagnostics_module.PipelineExecutionLog(
+        max_events=128,
+        sink=delivered.append,
+    )
+    fixture = _manager_fixture(
+        tmp_path,
+        root,
+        execution_log=execution_log,
+    )
+    tool_call = moduagent.ToolCall("sync-failure", "apply_incremental_sync", {})
+    model = ScriptedManagementModel(
+        [
+            moduagent.ModelResponse(
+                messages.Message.assistant(None, (tool_call,)),
+                (tool_call,),
+                finish_reason="tool_calls",
+            )
+        ]
+    )
+    event_sink = observability.AuditEventSink()
+    diagnostic_sink = observability.InMemoryDiagnosticSink()
+
+    async def fail_embed(_texts: Any) -> Any:
+        transport_error = ConnectionRefusedError(111, private_error)
+        raise SensitiveEmbeddingFailure(private_error) from transport_error
+
+    monkeypatch.setattr(fixture.embedder, "embed", fail_embed)
+
+    async def scenario() -> Any:
+        with pytest.raises(moduagent.AgentRunError) as caught:
+            await agent_module.run_management_request(
+                model,
+                fixture.manager,
+                "변경 사항을 동기화해줘",
+                allow_writes=True,
+                event_sink=event_sink,
+                diagnostic_sink=diagnostic_sink,
+            )
+        return caught.value
+
+    try:
+        error = _run(scenario())
+        failed = [event for event in execution_log.events if event.status == "failed"]
+        assert failed
+        assert failed[-1].operation == "sync"
+        assert failed[-1].stage == "embed"
+        assert failed[-1].error_code == "embed_failed"
+        assert failed[-1].exception_type == "SensitiveEmbeddingFailure"
+        assert failed[-1].cause_types == ("ConnectionRefusedError",)
+        assert failed[-1].errno == 111
+        assert failed[-1].correlation_id is not None
+        assert failed[-1].correlation_id.startswith("mgmt_")
+        assert tuple(delivered) == execution_log.events
+
+        assert error.category == "tool_failure"
+        assert error.error_summary["operation"] == "apply_incremental_sync"
+        assert error.failure_id is not None
+        assert execution_log.failure_for_run(error.run_id) == failed[-1]
+        diagnostic = diagnostic_sink.get(error.failure_id)
+        assert diagnostic is not None
+        assert diagnostic.failure_id == error.failure_id
+        assert diagnostic.exception_type == "SensitiveEmbeddingFailure"
+        assert diagnostic.cause_types == ("ConnectionRefusedError",)
+        assert diagnostic.safe_details["errno"] == 111
+        assert diagnostic.tool_name == "apply_incremental_sync"
+        assert diagnostic.operation == "invoke"
+
+        tool_failures = [
+            record
+            for record in event_sink.records
+            if record["event_type"] == "tool_completed"
+        ]
+        assert len(tool_failures) == 1
+        assert tool_failures[0]["data"]["success"] is False
+        assert tool_failures[0]["data"]["failure"]["failure_id"] == error.failure_id
+
+        formatted = agent_module.format_management_failure(
+            error,
+            execution_log=execution_log,
+            diagnostic_sink=diagnostic_sink,
+        )
+        assert "apply_incremental_sync" in formatted
+        assert "embed_failed" in formatted
+        assert "SensitiveEmbeddingFailure" in formatted
+        assert "ConnectionRefusedError" in formatted
+        assert "errno: 111" in formatted
+        assert error.failure_id in formatted
+
+        serialized = "\n".join(
+            (
+                str(error),
+                repr(execution_log.events),
+                repr(event_sink.records),
+                repr(diagnostic.to_dict()),
+                formatted,
+            )
+        )
+        for secret in (
+            private_path,
+            private_content,
+            private_url,
+            "PRIVATE-TOKEN",
+            "PRIVATE-API-KEY",
+            private_error,
+            str(root.resolve()),
+        ):
+            assert secret not in serialized
+    finally:
+        fixture.catalog.close()
+
+
+def test_concurrent_management_failures_keep_request_local_pipeline_causes() -> None:
+    agent_module = _module("agent")
+    diagnostics_module = _module("diagnostics")
+    moduagent = importlib.import_module("moduagent")
+    execution_log = diagnostics_module.PipelineExecutionLog(max_events=64)
+    first_correlation = "mgmt_" + "a" * 32
+    second_correlation = "mgmt_" + "b" * 32
+    first_ready = asyncio.Event()
+    second_ready = asyncio.Event()
+    first_inner_failed = asyncio.Event()
+    second_failed = asyncio.Event()
+
+    async def first() -> None:
+        try:
+            with execution_log.bind(first_correlation):
+                with execution_log.stage("sync", "run"):
+                    try:
+                        with execution_log.stage("sync", "embed"):
+                            first_ready.set()
+                            await second_ready.wait()
+                            raise ConnectionRefusedError(
+                                111,
+                                "PRIVATE-FIRST-CAUSE",
+                            )
+                    except ConnectionRefusedError:
+                        # Keep A's outer run scope open until B has emitted its
+                        # own failure. This reproduces the interleaving that
+                        # previously replaced A/embed with a less useful A/run.
+                        first_inner_failed.set()
+                        await second_failed.wait()
+                        raise
+        except ConnectionRefusedError:
+            pass
+
+    async def second() -> None:
+        await first_ready.wait()
+        try:
+            with execution_log.bind(second_correlation):
+                with execution_log.stage("sync", "run"):
+                    second_ready.set()
+                    await first_inner_failed.wait()
+                    with execution_log.stage("sync", "validate_staging"):
+                        raise TimeoutError("PRIVATE-SECOND-CAUSE")
+        except TimeoutError:
+            second_failed.set()
+
+    async def scenario() -> None:
+        await asyncio.gather(first(), second())
+
+    _run(scenario())
+    first_failure = execution_log.associate_run("run_first", first_correlation)
+    second_failure = execution_log.associate_run("run_second", second_correlation)
+    assert first_failure is not None
+    assert first_failure.stage == "embed"
+    assert first_failure.exception_type == "ConnectionRefusedError"
+    assert first_failure.errno == 111
+    assert second_failure is not None
+    assert second_failure.stage == "validate_staging"
+    assert second_failure.exception_type == "TimeoutError"
+    assert not any(
+        event.correlation_id == first_correlation
+        and event.stage == "run"
+        and event.status == "failed"
+        for event in execution_log.events
+    )
+
+    common_summary = {
+        "category": "tool_failure",
+        "code": "execution_error",
+        "component": "tool",
+        "operation": "apply_incremental_sync",
+        "retryable": False,
+    }
+    first_error = moduagent.AgentRunError(
+        run_id="run_first",
+        finish_reason="error",
+        error_summary=common_summary,
+    )
+    second_error = moduagent.AgentRunError(
+        run_id="run_second",
+        finish_reason="error",
+        error_summary=common_summary,
+    )
+    first_report = agent_module.format_management_failure(
+        first_error,
+        execution_log=execution_log,
+    )
+    second_report = agent_module.format_management_failure(
+        second_error,
+        execution_log=execution_log,
+    )
+    unrelated_error = moduagent.AgentRunError(
+        run_id="run_unrelated",
+        finish_reason="error",
+        error_summary=common_summary,
+    )
+    unrelated_report = agent_module.format_management_failure(
+        unrelated_error,
+        execution_log=execution_log,
+    )
+    assert "stage: embed" in first_report
+    assert "ConnectionRefusedError" in first_report
+    assert "validate_staging" not in first_report
+    assert "stage: validate_staging" in second_report
+    assert "TimeoutError" in second_report
+    assert "stage: embed" not in second_report
+    assert "pipeline failure" not in unrelated_report
+    serialized = repr(execution_log.events) + first_report + second_report
+    assert "PRIVATE-FIRST-CAUSE" not in serialized
+    assert "PRIVATE-SECOND-CAUSE" not in serialized
+
+
+def test_vllm_http_status_survives_real_adapter_failure_diagnostics() -> None:
+    agent_module = _module("agent")
+    backends = _module("backends")
+    diagnostics_module = _module("diagnostics")
+    moduagent = importlib.import_module("moduagent")
+    private_body = "PRIVATE-PROVIDER-RESPONSE"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"detail": private_body})
+
+    execution_log = diagnostics_module.PipelineExecutionLog(max_events=32)
+    correlation_id = "mgmt_" + "c" * 32
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+        ) as http_client:
+            embedder = backends.VLLMEmbeddingClient(
+                base_url="http://embedding.example.test/v1",
+                http_client=http_client,
+                max_attempts=1,
+            )
+            with pytest.raises(backends.ModelBackendError):
+                with execution_log.bind(correlation_id):
+                    with execution_log.stage("sync", "run"):
+                        with execution_log.stage("sync", "embed"):
+                            await embedder.embed(("bounded input",))
+
+    _run(scenario())
+    failure = execution_log.associate_run("run_http_status", correlation_id)
+    assert failure is not None
+    assert failure.stage == "embed"
+    assert failure.http_status == 429
+    assert failure.exception_type == "ModelBackendError"
+    assert failure.cause_types == ("BackendHTTPStatusError",)
+
+    error = moduagent.AgentRunError(
+        run_id="run_http_status",
+        finish_reason="error",
+        error_summary={
+            "category": "tool_failure",
+            "code": "execution_error",
+            "component": "tool",
+            "operation": "apply_incremental_sync",
+            "retryable": False,
+        },
+    )
+    report = agent_module.format_management_failure(
+        error,
+        execution_log=execution_log,
+    )
+    assert "stage: embed" in report
+    assert "http_status: 429" in report
+    assert "BackendHTTPStatusError" in report
+    assert private_body not in report
+    assert private_body not in repr(execution_log.events)
+
+
 def test_management_agent_rejects_model_forged_counts_and_generation(
     tmp_path: Path,
 ) -> None:
@@ -2100,6 +2486,17 @@ def test_cli_defaults_environment_mapping_and_main_import_guard(
     assert explicit.kb_id == "corporate-assistant"
     assert explicit.embedding_dimension == 1024
     assert explicit.apply is False
+    assert explicit.verbose is False
+    verbose = cli.parse_args(
+        [
+            "--documents",
+            str(tmp_path / "documents"),
+            "--request",
+            "상태 확인",
+            "--verbose",
+        ]
+    )
+    assert verbose.verbose is True
     assert backends.VLLMEnrichmentClient().model == "gemma-4-26B-A4B-it"
     layout_client = backends.VLLMLayoutRefinementClient()
     assert layout_client.model == "gemma-4-26B-A4B-it"
@@ -2125,6 +2522,13 @@ def test_cli_defaults_environment_mapping_and_main_import_guard(
     assert "generate_page_images=True" in cli_source
     assert "refiner = VLLMLayoutRefinementClient(allow_exclusions=False)" in cli_source
     assert "refiner=refiner" in cli_source
+
+    package = _module()
+    agent_module = _module("agent")
+    diagnostics_module = _module("diagnostics")
+    assert package.PipelineExecutionLog is diagnostics_module.PipelineExecutionLog
+    assert package.PipelineLogEvent is diagnostics_module.PipelineLogEvent
+    assert package.format_management_failure is agent_module.format_management_failure
 
 
 def test_backend_defaults_use_requested_models_and_credential_free_urls() -> None:

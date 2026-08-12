@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import nullcontext
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from moduagent import (
     Agent,
+    AgentRunError,
     DecisionKind,
+    DiagnosticSink,
+    EventSink,
     ExecutionDecision,
+    FailureDiagnostic,
     ModelProtocolError,
     ModelResponse,
     RunContext,
@@ -24,11 +30,19 @@ from moduagent import (
 )
 from moduagent.errors import ToolRecoveryError
 
+from .diagnostics import PipelineExecutionLog
 from .pipeline import IndexStatus, RAGIndexManager, SyncReport
 
 
 ToolOperation = Literal["status", "preview", "sync", "rebuild", "rollback"]
 ToolStatus = Literal["observed", "dry_run", "noop", "published", "rolled_back"]
+_PIPELINE_OPERATION_BY_TOOL = {
+    "inspect_index_status": "status",
+    "preview_incremental_sync": "preview",
+    "apply_incremental_sync": "sync",
+    "rebuild_entire_index": "rebuild",
+    "rollback_previous_generation": "rollback",
+}
 
 
 class ManagementResponse(BaseModel):
@@ -65,9 +79,32 @@ class ManagementResponse(BaseModel):
 class ManagementAudit:
     """Application-owned record of the single successful management operation."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        execution_log: PipelineExecutionLog | None = None,
+        correlation_id: str | None = None,
+    ) -> None:
+        if execution_log is not None and not isinstance(
+            execution_log,
+            PipelineExecutionLog,
+        ):
+            raise TypeError("execution_log must be a PipelineExecutionLog")
+        if correlation_id is not None and (
+            not isinstance(correlation_id, str)
+            or not correlation_id.isascii()
+            or not correlation_id.startswith("mgmt_")
+            or len(correlation_id) != 37
+            or any(
+                character not in "0123456789abcdef"
+                for character in correlation_id.removeprefix("mgmt_")
+            )
+        ):
+            raise ValueError("correlation_id must be an opaque management ID")
         self._lock = asyncio.Lock()
         self.records: list[tuple[str, dict[str, Any]]] = []
+        self.execution_log = execution_log
+        self.correlation_id = correlation_id or f"mgmt_{secrets.token_hex(16)}"
 
     async def execute(
         self,
@@ -79,7 +116,13 @@ class ManagementAudit:
                 raise RuntimeError(
                     "one management request may execute only one operation"
                 )
-            result = await operation()
+            correlation = (
+                self.execution_log.bind(self.correlation_id)
+                if self.execution_log is not None
+                else nullcontext()
+            )
+            with correlation:
+                result = await operation()
             self.records.append((name, result))
             return result
 
@@ -200,7 +243,7 @@ def make_management_tools(
         raise TypeError("manager must be a RAGIndexManager")
     if type(allow_writes) is not bool:
         raise TypeError("allow_writes must be a bool")
-    resolved_audit = audit or ManagementAudit()
+    resolved_audit = audit or ManagementAudit(execution_log=manager.execution_log)
     if not isinstance(resolved_audit, ManagementAudit):
         raise TypeError("audit must be a ManagementAudit")
 
@@ -296,6 +339,8 @@ def build_management_agent(
     *,
     allow_writes: bool = False,
     audit: ManagementAudit | None = None,
+    event_sink: EventSink | None = None,
+    diagnostic_sink: DiagnosticSink | None = None,
 ) -> Agent:
     """Build a bounded Agent; write Tools exist only after application opt-in."""
 
@@ -329,6 +374,8 @@ def build_management_agent(
         },
         finalization_mode="structured_only",
         tool_trace_mode="summary",
+        event_sink=event_sink,
+        diagnostic_sink=diagnostic_sink,
     )
 
 
@@ -338,6 +385,8 @@ async def run_management_request(
     request: str,
     *,
     allow_writes: bool = False,
+    event_sink: EventSink | None = None,
+    diagnostic_sink: DiagnosticSink | None = None,
 ) -> ManagementResponse:
     """Execute exactly one authorized operation and verify the final narration."""
 
@@ -345,23 +394,31 @@ async def run_management_request(
         raise ValueError("request must contain between 1 and 4000 characters")
     if type(allow_writes) is not bool:
         raise TypeError("allow_writes must be a bool")
-    audit = ManagementAudit()
+    execution_log = manager.execution_log
+    audit = ManagementAudit(execution_log=execution_log)
     agent = build_management_agent(
         model,
         manager,
         allow_writes=allow_writes,
         audit=audit,
+        event_sink=event_sink,
+        diagnostic_sink=diagnostic_sink,
     )
-    result = await agent.run(
-        json.dumps(
-            {
-                "untrusted_management_request": request.strip(),
-                "writes_enabled_by_application": allow_writes,
-            },
-            ensure_ascii=False,
+    try:
+        result = await agent.run(
+            json.dumps(
+                {
+                    "untrusted_management_request": request.strip(),
+                    "writes_enabled_by_application": allow_writes,
+                },
+                ensure_ascii=False,
+            )
         )
-    )
-    value = result.unwrap()
+        value = result.unwrap()
+    except AgentRunError as error:
+        if execution_log is not None:
+            execution_log.associate_run(error.run_id, audit.correlation_id)
+        raise
     if not isinstance(value, ManagementResponse):
         raise TypeError("management Agent returned an unexpected output type")
     successful = tuple(
@@ -381,6 +438,110 @@ async def run_management_request(
         )
     _verify_response(value, authoritative)
     return value
+
+
+def format_management_failure(
+    error: AgentRunError,
+    *,
+    execution_log: PipelineExecutionLog | None = None,
+    diagnostic_sink: Any | None = None,
+) -> str:
+    """Render a content-free diagnosis for one failed management request."""
+
+    if not isinstance(error, AgentRunError):
+        raise TypeError("error must be an AgentRunError")
+    if execution_log is not None and not isinstance(
+        execution_log,
+        PipelineExecutionLog,
+    ):
+        raise TypeError("execution_log must be a PipelineExecutionLog")
+
+    summary = error.error_summary
+    lines = [
+        "management Agent failed",
+        f"- run_id: {error.run_id}",
+        f"- category: {summary.get('category', 'unknown')}",
+        f"- code: {summary.get('code', 'unknown')}",
+        f"- operation: {summary.get('operation', 'unknown')}",
+        f"- retryable: {summary.get('retryable', False)}",
+    ]
+    if error.failure_id:
+        lines.append(f"- failure_id: {error.failure_id}")
+
+    pipeline_failure = (
+        execution_log.failure_for_run(error.run_id)
+        if execution_log is not None
+        else None
+    )
+    expected_pipeline_operation = _PIPELINE_OPERATION_BY_TOOL.get(
+        summary.get("operation")
+    )
+    if (
+        pipeline_failure is not None
+        and pipeline_failure.operation != expected_pipeline_operation
+    ):
+        pipeline_failure = None
+    if pipeline_failure is not None:
+        lines.extend(
+            (
+                "pipeline failure",
+                f"- operation: {pipeline_failure.operation}",
+                f"- stage: {pipeline_failure.stage}",
+                f"- source_id: {pipeline_failure.source_id or 'n/a'}",
+                f"- generation_id: {pipeline_failure.generation_id or 'n/a'}",
+                f"- error_code: {pipeline_failure.error_code or 'unknown'}",
+                f"- exception_chain: {_format_exception_chain(pipeline_failure)}",
+            )
+        )
+        if pipeline_failure.http_status is not None:
+            lines.append(f"- http_status: {pipeline_failure.http_status}")
+        if pipeline_failure.errno is not None:
+            lines.append(f"- errno: {pipeline_failure.errno}")
+
+    record = _failure_diagnostic(diagnostic_sink, error.failure_id)
+    if record is not None:
+        lines.extend(
+            (
+                "runtime diagnostic",
+                f"- exception_chain: {' -> '.join((record.exception_type, *record.cause_types))}",
+            )
+        )
+        for key in ("http_status", "errno", "sqlstate"):
+            value = record.safe_details.get(key)
+            if value is not None:
+                lines.append(f"- {key}: {value}")
+        if record.frames:
+            frames = " -> ".join(
+                f"{frame.filename}:{frame.function}:{frame.lineno}"
+                for frame in record.frames[-8:]
+            )
+            lines.append(f"- frames: {frames}")
+    return "\n".join(lines)
+
+
+def _format_exception_chain(event: Any) -> str:
+    values = tuple(
+        value
+        for value in (event.exception_type, *event.cause_types)
+        if isinstance(value, str) and value
+    )
+    return " -> ".join(values) if values else "unknown"
+
+
+def _failure_diagnostic(
+    sink: Any,
+    failure_id: str | None,
+) -> FailureDiagnostic | None:
+    if sink is None or not failure_id:
+        return None
+    getter = getattr(sink, "get", None)
+    if not callable(getter):
+        return None
+    try:
+        record = getter(failure_id)
+    except Exception:
+        return None
+    return record if isinstance(record, FailureDiagnostic) else None
 
 
 def _status_payload(value: IndexStatus) -> dict[str, Any]:
@@ -422,6 +583,7 @@ __all__ = [
     "ManagementAudit",
     "ManagementResponse",
     "build_management_agent",
+    "format_management_failure",
     "make_management_tools",
     "run_management_request",
 ]

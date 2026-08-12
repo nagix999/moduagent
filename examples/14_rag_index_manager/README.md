@@ -138,8 +138,84 @@ The same request can then publish a validated generation:
 ```bash
 python3 -m examples.14_rag_index_manager \
   --request "변경된 문서를 반영해서 인덱스를 동기화해줘" \
-  --apply
+  --apply \
+  --verbose
 ```
+
+`--verbose` streams content-free `rag_index_progress` JSON records to stderr.
+Each record identifies the operation, deterministic pipeline stage, opaque
+request correlation ID, `source_id`, generation, progress count, and terminal
+status. A failed stage
+also includes a stable error code, exception type chain, and allowlisted HTTP
+status or `errno` when available. It never includes document text, filenames,
+absolute paths, service URLs, credentials, Tool arguments, or backend response
+bodies. The final management JSON remains the only stdout output.
+
+### Jupyter failure diagnosis
+
+Use a bounded execution log together with ModuAgent's diagnostic sink when
+constructing the manager in a notebook. The Agent event sink shows the safe
+model/Tool lifecycle, while the pipeline log prints ingestion progress as it
+happens:
+
+```python
+import importlib
+import logging
+
+from moduagent import (
+    AgentRunError,
+    InMemoryDiagnosticSink,
+    LoggingEventSink,
+)
+
+rag = importlib.import_module("examples.14_rag_index_manager")
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+execution_log = rag.PipelineExecutionLog.console(include_timestamp=True)
+diagnostics = InMemoryDiagnosticSink(max_records=100)
+
+# Add execution_log to the same application-owned manager construction shown
+# in this example. All other parser/model/store arguments stay unchanged.
+manager = rag.RAGIndexManager(
+    config=config,
+    pipeline=pipeline,
+    catalog=catalog,
+    artifacts=artifacts,
+    parser=docling,
+    refiner=layout_refiner,
+    enricher=enricher,
+    embedder=embedder,
+    vector_store=milvus,
+    execution_log=execution_log,
+)
+
+try:
+    response = await rag.run_management_request(
+        management_model,
+        manager,
+        "변경된 문서를 반영해서 인덱스를 동기화해줘",
+        allow_writes=True,
+        event_sink=LoggingEventSink(),
+        diagnostic_sink=diagnostics,
+    )
+except AgentRunError as error:
+    print(
+        rag.format_management_failure(
+            error,
+            execution_log=execution_log,
+            diagnostic_sink=diagnostics,
+        )
+    )
+    raise
+```
+
+The formatted diagnosis correlates `AgentRunError.failure_id` with the runtime
+diagnostic and reports the precise pipeline stage, stable failure code,
+exception type chain, safe HTTP/OS facts, and bounded source-code frames. Raw
+provider messages are intentionally excluded because they may contain document
+or credential data. If the remaining cause is an external service failure,
+use the timestamp, stage, generation, and opaque source ID to inspect the
+corresponding Docling, vLLM, or Milvus server log.
 
 Other supported intents are current status, full rebuild, and immediate
 previous-generation rollback. `--documents`, `--state-dir`, `--kb-id`, and

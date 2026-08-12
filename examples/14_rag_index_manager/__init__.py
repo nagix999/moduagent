@@ -4,6 +4,7 @@ from .agent import (
     ManagementAudit,
     ManagementResponse,
     build_management_agent,
+    format_management_failure,
     make_management_tools,
     run_management_request,
 )
@@ -12,6 +13,7 @@ from .backends import (
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_GEMMA_MODEL,
     BackendError,
+    BackendHTTPStatusError,
     BlockEnricher,
     DoclingBackendError,
     DoclingParser,
@@ -29,6 +31,7 @@ from .backends import (
 )
 from .catalog import ManifestCatalog
 from .chunking import ChunkingConfig, chunk_blocks
+from .diagnostics import PipelineExecutionLog, PipelineLogEvent
 from .models import (
     BlockEnrichment,
     BlockModality,
@@ -87,6 +90,7 @@ __all__ = [
     "BlockEnricher",
     "BlockModality",
     "BackendError",
+    "BackendHTTPStatusError",
     "CatalogError",
     "ChangeKind",
     "Chunk",
@@ -113,7 +117,9 @@ __all__ = [
     "PageCapture",
     "PipelineFingerprint",
     "PipelineError",
+    "PipelineExecutionLog",
     "PlanningError",
+    "PipelineLogEvent",
     "ProcessingStage",
     "Provenance",
     "RAGIndexError",
@@ -150,6 +156,7 @@ __all__ = [
     "chunk_blocks",
     "component_fingerprint",
     "extract_page_captures",
+    "format_management_failure",
     "plan_incremental_sync",
     "make_management_tools",
     "read_source_bytes",
