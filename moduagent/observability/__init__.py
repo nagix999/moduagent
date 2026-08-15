@@ -11,6 +11,7 @@ from moduagent.observability.diagnostics import (
 from moduagent.observability.sinks import (
     AuditEventSink,
     CompositeEventSink,
+    ConsoleEventSink,
     DEFAULT_SENSITIVE_KEYS,
     EventSink,
     InMemoryMetricRecorder,
@@ -26,6 +27,7 @@ __all__ = [
     "AuditEventSink",
     "CompositeDiagnosticSink",
     "CompositeEventSink",
+    "ConsoleEventSink",
     "DEFAULT_SENSITIVE_KEYS",
     "DiagnosticFrame",
     "DiagnosticReporter",

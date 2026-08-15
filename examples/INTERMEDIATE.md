@@ -1,6 +1,6 @@
 # Intermediate examples
 
-These examples target ModuAgent `0.6.0`. Complete the beginner path in
+These examples target ModuAgent `0.6.2`. Complete the beginner path in
 [`README.md`](README.md) first, then follow `10` → `11` → `12` → `13`. Each
 example is standalone. Examples `10`–`12` use deterministic application-owned
 data; example `13` uses operator-approved local files and a Docling Serve
@@ -12,7 +12,7 @@ without changing the Agent pattern.
 Install the exact version:
 
 ```bash
-python -m pip install "moduagent==0.6.0"
+python -m pip install "moduagent==0.6.2"
 ```
 
 Or, from this source checkout, use the current working tree:
@@ -29,6 +29,11 @@ export VLLM_BASE_URL="<your vLLM base URL>"
 export VLLM_MODEL="<your tool-capable model>"
 export VLLM_API_KEY="<optional token>"
 ```
+
+Runnable examples attach `ConsoleEventSink` and render content-free Agent,
+model, and Tool progress on stderr. Pass a custom sink through each builder's
+`event_sink=` argument to select Korean labels, detailed output, JSON, or no
+console rendering in a notebook.
 
 ## Learning path
 

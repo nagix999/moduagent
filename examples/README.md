@@ -8,10 +8,10 @@ order; each file is standalone.
 
 ## Before you start
 
-These examples target ModuAgent `0.6.0`. Install the exact version:
+These examples target ModuAgent `0.6.2`. Install the exact version:
 
 ```bash
-python -m pip install "moduagent==0.6.0"
+python -m pip install "moduagent==0.6.2"
 ```
 
 Alternatively, when running from a source checkout, install that working tree
@@ -31,6 +31,11 @@ export VLLM_API_KEY="<your optional token>"  # Omit when no token is required.
 
 The examples read these values with `VLLMClient.from_env()`. They do not store
 credentials in source code.
+
+The runnable examples attach `ConsoleEventSink` and show content-free Agent,
+model, and Tool progress on stderr. Their answer remains on stdout. Builders
+also accept `event_sink=` so notebooks can select Korean labels, detailed mode,
+JSON, or no console output without changing Agent behavior.
 
 ## Learning path
 
@@ -204,11 +209,12 @@ Once the five small examples feel familiar, continue with:
   a PostgreSQL-focused Gemma deployment example.
 - [`14_rag_index_manager/`](14_rag_index_manager/) for an application-scoped
   Docling → Gemma text/vision enrichment → BGE-M3 embedding → Milvus
-  blue/green ingestion manager. It hashes a document directory, plans
-  fingerprint-aware incremental work, preserves Docling provenance, and
-  exposes status/dry-run Tools unless the CLI explicitly enables writes. Its
-  opt-in Jupyter/CLI diagnostics correlate content-free pipeline-stage logs
-  with the Agent failure ID without printing document or credential data.
+  blue/green ingestion manager. Its long-lived supervisor stabilizes incoming
+  file snapshots, applies incremental changes, retries or quarantines failures,
+  and resumes from durable state. The management Agent exposes status, dry-run,
+  rebuild, and rollback controls. Jupyter/CLI diagnostics correlate content-free
+  pipeline-stage logs with the Agent failure ID without printing document or
+  credential data.
 
 Those examples intentionally include production concerns that are omitted from
 the beginner path.

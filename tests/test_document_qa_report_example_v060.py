@@ -2139,7 +2139,9 @@ def test_cli_converts_each_document_and_builds_one_corpus_before_routing(
         prompt: str,
         *,
         mode: str,
+        event_sink: object | None = None,
     ) -> str:
+        assert event_sink is not None
         routed.append((received_model, received_corpus, prompt, mode))
         return "# 자동 결과\n"
 

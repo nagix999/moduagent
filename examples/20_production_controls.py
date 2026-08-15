@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field, model_validator
 from moduagent import (
     Agent,
     AuthorizationDecision,
+    ConsoleEventSink,
     InMemoryCheckpointStore,
     InMemoryConversationStore,
     InMemoryDiagnosticSink,
@@ -400,6 +401,7 @@ def build_agent(
     diagnostic_sink=None,
     tool_authorizer=None,
     memory=None,
+    event_sink=None,
 ):
     """Compose the Agent while keeping infrastructure replaceable by the app."""
 
@@ -475,6 +477,7 @@ def build_agent(
         diagnostic_max_pending_deliveries=128,
         tool_authorizer=authorizer,
         tool_trace_mode="summary",
+        event_sink=event_sink,
         metadata={
             "example": "production-controls",
             "write_safety": "application-idempotency",
@@ -488,7 +491,11 @@ async def main() -> None:
     idempotency_key = "approval:CHG-2048:ticket-4815"
     approval_store = InMemoryApprovalStore()
     async with VLLMClient.from_env() as model:
-        agent = build_agent(model, approval_store=approval_store)
+        agent = build_agent(
+            model,
+            approval_store=approval_store,
+            event_sink=ConsoleEventSink(),
+        )
         result = await agent.run(
             "Approve CHG-2048 if all verified controls pass.",
             session_id="change-ticket-4815",

@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field
 from moduagent import (
     Agent,
     AgentConfig,
+    ConsoleEventSink,
     InMemoryCheckpointStore,
     InMemoryConversationStore,
     LLMPlanGenerator,
@@ -606,6 +607,7 @@ async def main() -> None:
         output_codec=PydanticOutputCodec(model=ReportOutput),
         conversation_store=InMemoryConversationStore(ttl_seconds=3600),
         checkpoint_store=InMemoryCheckpointStore(),
+        event_sink=ConsoleEventSink(language="ko"),
     )
 
     result = await agent.run(

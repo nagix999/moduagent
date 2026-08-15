@@ -8,7 +8,14 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from moduagent import Agent, InMemoryDiagnosticSink, RunLimits, VLLMClient, tool
+from moduagent import (
+    Agent,
+    ConsoleEventSink,
+    InMemoryDiagnosticSink,
+    RunLimits,
+    VLLMClient,
+    tool,
+)
 
 
 ServiceName = Literal["checkout-api", "payments-api", "inventory-api"]
@@ -415,7 +422,7 @@ def inspect_dependency_health(
     return {"service": service, "snapshots": snapshots}
 
 
-def build_agent(model, *, diagnostic_sink=None):
+def build_agent(model, *, diagnostic_sink=None, event_sink=None):
     return Agent.create(
         name="incident-investigator",
         model=model,
@@ -457,6 +464,7 @@ def build_agent(model, *, diagnostic_sink=None):
         ),
         tool_trace_mode="summary",
         diagnostic_sink=diagnostic_sink,
+        event_sink=event_sink,
     )
 
 
@@ -468,7 +476,11 @@ async def main() -> None:
         # reserve more output space than the smaller beginner examples.
         default_options={"temperature": 0, "max_tokens": 8192},
     ) as model:
-        agent = build_agent(model, diagnostic_sink=diagnostics)
+        agent = build_agent(
+            model,
+            diagnostic_sink=diagnostics,
+            event_sink=ConsoleEventSink(),
+        )
         result = await agent.run("Investigate incident INC-2042.")
 
     print("run usage:", dict(result.run_usage))

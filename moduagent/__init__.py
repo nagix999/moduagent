@@ -176,6 +176,7 @@ from moduagent.observability import (
     AuditEventSink,
     CompositeDiagnosticSink,
     CompositeEventSink,
+    ConsoleEventSink,
     DiagnosticFrame,
     DiagnosticReporter,
     DiagnosticSink,
@@ -304,7 +305,7 @@ from moduagent.tools import (
     tool,
 )
 
-__version__ = "0.6.0"
+__version__ = "0.6.2"
 
 __all__ = [
     "__version__",
@@ -379,6 +380,7 @@ __all__ = [
     "CommonRunState",
     "CompositeDiagnosticSink",
     "CompositeEventSink",
+    "ConsoleEventSink",
     "ConversationMemoryError",
     "ConversationMemoryOverflowError",
     "ConversationMemoryPolicy",

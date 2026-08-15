@@ -173,6 +173,9 @@ class PipelineExecutionLog:
         stream: TextIO | None = None,
         sink: Callable[[PipelineLogEvent], None] | None = None,
         include_timestamp: bool = False,
+        output_format: str = "json",
+        language: str = "en",
+        color: bool | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if type(max_events) is not int:
@@ -183,6 +186,12 @@ class PipelineExecutionLog:
             raise TypeError("console must be a bool")
         if type(include_timestamp) is not bool:
             raise TypeError("include_timestamp must be a bool")
+        if output_format not in {"json", "pretty"}:
+            raise ValueError("output_format must be json or pretty")
+        if language not in {"en", "ko"}:
+            raise ValueError("language must be en or ko")
+        if color is not None and type(color) is not bool:
+            raise TypeError("color must be a bool or None")
         if stream is not None and not callable(getattr(stream, "write", None)):
             raise TypeError("stream must provide write() or be None")
         if sink is not None and not callable(sink):
@@ -194,6 +203,9 @@ class PipelineExecutionLog:
         self._stream = stream
         self._sink = sink
         self.include_timestamp = include_timestamp
+        self.output_format = output_format
+        self.language = language
+        self.color = color
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._events: deque[PipelineLogEvent] = deque(maxlen=max_events)
         self._sequence = 0
@@ -215,6 +227,9 @@ class PipelineExecutionLog:
         stream: TextIO | None = None,
         sink: Callable[[PipelineLogEvent], None] | None = None,
         include_timestamp: bool = False,
+        output_format: str = "json",
+        language: str = "en",
+        color: bool | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> PipelineExecutionLog:
         """Create a collector that also renders each event immediately."""
@@ -225,6 +240,34 @@ class PipelineExecutionLog:
             stream=stream,
             sink=sink,
             include_timestamp=include_timestamp,
+            output_format=output_format,
+            language=language,
+            color=color,
+            clock=clock,
+        )
+
+    @classmethod
+    def pretty(
+        cls,
+        *,
+        max_events: int = 1_000,
+        stream: TextIO | None = None,
+        sink: Callable[[PipelineLogEvent], None] | None = None,
+        include_timestamp: bool = False,
+        language: str = "ko",
+        color: bool | None = None,
+        clock: Callable[[], datetime] | None = None,
+    ) -> PipelineExecutionLog:
+        """Create a content-free, human-friendly progress renderer."""
+
+        return cls.console(
+            max_events=max_events,
+            stream=stream,
+            sink=sink,
+            include_timestamp=include_timestamp,
+            output_format="pretty",
+            language=language,
+            color=color,
             clock=clock,
         )
 
@@ -409,13 +452,23 @@ class PipelineExecutionLog:
     def _write_console(self, event: PipelineLogEvent) -> None:
         try:
             stream = self._stream if self._stream is not None else sys.stdout
-            payload = json.dumps(
-                event.to_dict(include_timestamp=self.include_timestamp),
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
+            rendered = (
+                _pretty_pipeline_line(
+                    event,
+                    language=self.language,
+                    color=self._color_enabled(stream),
+                    include_timestamp=self.include_timestamp,
+                )
+                if self.output_format == "pretty"
+                else "rag_index_progress "
+                + json.dumps(
+                    event.to_dict(include_timestamp=self.include_timestamp),
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
             )
-            stream.write(f"rag_index_progress {payload}\n")
+            stream.write(f"{rendered}\n")
             flush = getattr(stream, "flush", None)
             if callable(flush):
                 flush()
@@ -424,6 +477,15 @@ class PipelineExecutionLog:
             # Console output is observability and cannot alter index execution.
             self.console_error_count += 1
             self.last_console_error_type = _safe_type_name(exc)
+
+    def _color_enabled(self, stream: TextIO) -> bool:
+        if self.color is not None:
+            return self.color
+        isatty = getattr(stream, "isatty", None)
+        try:
+            return bool(isatty()) if callable(isatty) else False
+        except BaseException:
+            return False
 
     def _deliver_sink(self, event: PipelineLogEvent) -> None:
         try:
@@ -692,6 +754,117 @@ def _validated_counts(value: Mapping[str, int]) -> dict[str, int]:
 
 def _is_stable_label(value: Any) -> bool:
     return isinstance(value, str) and _STABLE_LABEL.fullmatch(value) is not None
+
+
+_KOREAN_OPERATION_LABELS = {
+    "status": "인덱스 상태 확인",
+    "preview": "변경 계획 분석",
+    "sync": "증분 동기화",
+    "rebuild": "전체 인덱스 재구축",
+    "rollback": "이전 세대 롤백",
+}
+_KOREAN_STAGE_LABELS = {
+    "run": "작업",
+    "load_status": "상태 불러오기",
+    "scan": "문서 디렉터리 스캔",
+    "consistency_check": "카탈로그·인덱스 정합성 확인",
+    "build_report": "결과 리포트 구성",
+    "validate_plan": "변경 계획 검증",
+    "begin_generation": "새 인덱스 세대 준비",
+    "create_staging": "Milvus 스테이징 생성",
+    "carry_forward": "기존 문서 유지",
+    "delete_source": "삭제 문서 반영",
+    "reuse_index": "기존 벡터 재사용",
+    "validate_action": "문서 작업 검증",
+    "replace_source": "변경 문서 교체",
+    "parse": "Docling 문서 파싱",
+    "load_parse_artifact": "파싱 결과 불러오기",
+    "restructure": "검색 친화 구조로 재구성",
+    "extract_page_captures": "페이지 이미지 추출",
+    "refine_layout": "VLM 레이아웃 정교화",
+    "enrich": "Gemma 텍스트·이미지 분석",
+    "chunk": "문서 청킹",
+    "embed": "BGE-M3 임베딩",
+    "index": "Milvus 벡터 인덱싱",
+    "record_manifest": "문서 메타데이터 기록",
+    "validate_staging": "스테이징 인덱스 검증",
+    "publish_generation": "새 인덱스 게시",
+    "verify_publication": "게시 결과 확인",
+    "commit_manifest": "카탈로그 게시 확정",
+    "verify_commit": "카탈로그 확정 검증",
+}
+
+
+def _pretty_pipeline_line(
+    event: PipelineLogEvent,
+    *,
+    language: str,
+    color: bool,
+    include_timestamp: bool,
+) -> str:
+    if event.status == "started":
+        icon, ansi = "◌", "36"
+    elif event.status == "completed":
+        icon, ansi = "✓", "32"
+    else:
+        icon, ansi = "✗", "31"
+    if event.stage == "run":
+        base = (
+            _KOREAN_OPERATION_LABELS.get(event.operation, event.operation)
+            if language == "ko"
+            else event.operation.replace("_", " ")
+        )
+        status = (
+            {
+                "started": "시작",
+                "completed": "완료",
+                "failed": "실패",
+            }[event.status]
+            if language == "ko"
+            else event.status
+        )
+        label = f"{base} {status}"
+        indent = "    "
+    else:
+        base = (
+            _KOREAN_STAGE_LABELS.get(event.stage, event.stage)
+            if language == "ko"
+            else event.stage.replace("_", " ")
+        )
+        status = (
+            {
+                "started": "중",
+                "completed": "완료",
+                "failed": "실패",
+            }[event.status]
+            if language == "ko"
+            else event.status
+        )
+        label = f"{base} {status}"
+        indent = "      "
+    if color:
+        icon = f"\x1b[{ansi}m{icon}\x1b[0m"
+        label = f"\x1b[1m{label}\x1b[0m"
+    timestamp = (
+        f"[{event.occurred_at.astimezone().strftime('%H:%M:%S')}] "
+        if include_timestamp
+        else ""
+    )
+    details: list[str] = []
+    if event.item_index is not None and event.item_count is not None:
+        details.append(f"{event.item_index}/{event.item_count}")
+    details.extend(f"{key}={value:,}" for key, value in event.counts.items())
+    if event.status == "failed":
+        if event.error_code is not None:
+            details.append(event.error_code)
+        if event.http_status is not None:
+            details.append(f"HTTP {event.http_status}")
+        if event.errno is not None:
+            details.append(f"errno={event.errno}")
+        if event.exception_type is not None:
+            details.append(event.exception_type)
+    suffix = f" · {' · '.join(details)}" if details else ""
+    return f"{timestamp}{indent}{icon} {label}{suffix}"
 
 
 __all__ = ["PipelineExecutionLog", "PipelineLogEvent"]

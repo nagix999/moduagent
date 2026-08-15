@@ -84,7 +84,9 @@ jobs:
               "examples/13_document_qa_and_report.py",
               "examples/14_rag_index_manager/__init__.py",
               "examples/14_rag_index_manager/__main__.py",
+              "examples/14_rag_index_manager/.env.example",
               "examples/14_rag_index_manager/README.md",
+              "examples/14_rag_index_manager/README.ko.md",
               "examples/14_rag_index_manager/agent.py",
               "examples/14_rag_index_manager/artifacts.py",
               "examples/14_rag_index_manager/backends.py",
@@ -92,13 +94,21 @@ jobs:
               "examples/14_rag_index_manager/chunking.py",
               "examples/14_rag_index_manager/cli.py",
               "examples/14_rag_index_manager/diagnostics.py",
+              "examples/14_rag_index_manager/environment.py",
+              "examples/14_rag_index_manager/evaluation.py",
               "examples/14_rag_index_manager/models.py",
               "examples/14_rag_index_manager/pipeline.py",
               "examples/14_rag_index_manager/planner.py",
               "examples/14_rag_index_manager/requirements.txt",
               "examples/14_rag_index_manager/restructure.py",
               "examples/14_rag_index_manager/scanner.py",
+              "examples/14_rag_index_manager/sample_data/__init__.py",
+              "examples/14_rag_index_manager/sample_data/__main__.py",
+              "examples/14_rag_index_manager/sample_data/nist.py",
               "examples/14_rag_index_manager/stores.py",
+              "examples/14_rag_index_manager/supervisor.py",
+              "examples/14_rag_index_manager/validation.py",
+              "examples/14_rag_index_manager/compose.yaml",
               "examples/20_production_controls.py",
               "examples/INTERMEDIATE.md",
               "examples/INTERMEDIATE.ko.md",
@@ -107,6 +117,7 @@ jobs:
               "examples/README.md",
               "examples/SCENARIO_REVIEW.md",
               "tests/integration/test_live_agent_scenarios_v051.py",
+              "tests/integration/test_live_console_examples_v062.py",
               "tests/integration/test_live_intermediate_scenarios_v051a.py",
               "tests/integration/test_live_models.py",
               "tests/integration/test_live_persistence.py",
@@ -123,6 +134,7 @@ jobs:
               "tests/test_context_history_runtime_v060.py",
               "tests/test_context_assembler_runtime_v060.py",
               "tests/test_context_memory_v060.py",
+              "tests/test_console_logging_v062.py",
               "tests/test_conversation_pagination_v060.py",
               "tests/test_definitions_v060.py",
               "tests/test_delegation_foundation_v060.py",
@@ -180,5 +192,5 @@ jobs:
           /tmp/moduagent-venv/bin/python -m pip install /tmp/moduagent-wheel/moduagent-*.whl
           cd /tmp
           /tmp/moduagent-venv/bin/python -c \
-            "import moduagent; assert moduagent.__version__ == '0.6.0'"
+            "import moduagent; assert moduagent.__version__ == '0.6.2'"
           /tmp/moduagent-venv/bin/moduagent --help

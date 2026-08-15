@@ -11,7 +11,7 @@ ModuAgent는 자체 모델 엔드포인트와 Python 함수를 바탕으로 AI �
 계획-실행(Plan-and-Execute), 체크포인트 복구, 스킬, 관측성 기능을 추가할 수
 있습니다.
 
-> 현재 버전: **0.6.0** · 상태: **Alpha** · Python **3.10+** · **MIT License**
+> 현재 버전: **0.6.2** · 상태: **Alpha** · Python **3.10+** · **MIT License**
 
 ModuAgent를 처음 사용한다면 아래의 짧은 다섯 단계를 따라갑니다. 이 단계는
 안정된 Quick API를 사용하며, 고급 조합에는 명시적인 구성 요소 API를 그대로
@@ -82,10 +82,10 @@ ModuAgent에는 Python 3.10 이상이 필요합니다. 접근 가능한 모델 �
 패키지를 설치합니다.
 
 ```bash
-python -m pip install "moduagent==0.6.0"
+python -m pip install "moduagent==0.6.2"
 ```
 
-패키지 인덱스에 아직 `0.6.0`이 없고 이미 0.6 소스를 체크아웃했다면 저장소
+패키지 인덱스에 아직 `0.6.2`가 없고 이미 0.6 소스를 체크아웃했다면 저장소
 루트에서 설치합니다.
 
 ```bash
@@ -839,11 +839,9 @@ async def stream_result() -> None:
 
 ```python
 import asyncio
-import logging
 
-from moduagent import Agent, InMemoryDiagnosticSink, LoggingEventSink
+from moduagent import Agent, ConsoleEventSink, InMemoryDiagnosticSink
 
-logging.basicConfig(level=logging.INFO)
 diagnostics = InMemoryDiagnosticSink(max_records=1_000)
 
 observable_agent = Agent.create(
@@ -851,7 +849,7 @@ observable_agent = Agent.create(
     instructions="Complete the request using the available Tools.",
     model=model,
     tools=[add],
-    event_sink=LoggingEventSink(),
+    event_sink=ConsoleEventSink(language="ko", detail="detailed"),
     diagnostic_sink=diagnostics,
 )
 
@@ -875,6 +873,22 @@ async def main() -> None:
 
 asyncio.run(main())
 ```
+
+터미널과 Jupyter에서는 위 한 줄만으로 다음처럼 실행 흐름을 볼 수 있습니다.
+
+```text
+● Agent 실행 시작
+  ● 모델 응답 생성 중 · phase=act · turn=1
+    ● Tool 실행 중 · search_documents
+    ✓ Tool 실행 완료 · search_documents · 42ms
+  ● 최종 답변 구성 중
+✓ Agent 실행 완료 · 248 토큰
+```
+
+이는 모델의 비공개 추론문을 노출하는 기능이 아닙니다. 프롬프트, 델타 원문,
+Tool 인자·결과는 제외하고 런타임이 확정한 단계와 정제된 상태만 표시합니다.
+운영 로그 수집기에는 `ConsoleEventSink(output_format="json")`을 사용하거나 기존
+`LoggingEventSink`를 사용할 수 있습니다.
 
 `result.tool_trace`에는 실제 실행된 도구와 연관 ID가 기록됩니다.
 `result.failure_id`는 종료된 실행의 근본 오류를 가리킵니다. 연관된 도구

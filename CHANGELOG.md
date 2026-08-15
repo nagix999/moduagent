@@ -2,10 +2,50 @@
 
 ## Unreleased
 
+## 0.6.2
+
+- Added `ConsoleEventSink` for one-line, Jupyter-friendly Agent progress with
+  pretty English/Korean lifecycle, model, Tool, retry, delegation, and
+  finalization output. Its sealed projection never prints prompts, deltas, Tool
+  arguments/results, or private reasoning, and can emit JSON for log collectors.
+  The RAG manager now composes this Agent timeline with pretty, hierarchical
+  Docling/Gemma/BGE-M3/Milvus pipeline progress via `--verbose`.
+- Connected the runnable beginner, WAF, intermediate, document, production,
+  and report-automation examples through additive `event_sink=` builder seams.
+  Added opt-in live Gemma 4 coverage for free text, structured output, sequential
+  and parallel Tools, planning, citations, authorization, and content-free
+  console projections.
+- Fixed direct structured responses ending with provider `length`, `max_tokens`,
+  or `timeout` so they fail as `model_output_incomplete` before policy or output
+  decoding instead of being misreported as output validation errors. The
+  structured-output example now explicitly requires all schema fields to avoid
+  Gemma guided-decoding whitespace stalls.
 - Added an incremental RAG index-manager example using Docling, Gemma 4 visual
   layout refinement, BGE-M3 embeddings, and Milvus blue/green indexing. It
   detects content and pipeline changes, preserves canonical provenance, and
-  supports resumable synchronization, validation, and rollback.
+  supports continuous directory supervision, resumable synchronization,
+  content-free failure diagnostics, validation, and rollback.
+- Added active-index retrieval evaluation with content-free per-case results,
+  source-deduplicated Hit@1/Hit@K, MRR, Recall@K, MAP, hard-negative rates,
+  tagged slice gates, duration, and throughput. A generated 2-200 document
+  validation harness now exercises baseline publication, no-op, mutation,
+  deletion, addition, rollback, recovery, and final consistency.
+- Added bounded dense-plus-lexical hybrid retrieval for the RAG example and
+  repeated canonical document context in embedding text to improve retrieval
+  from fragmented structured formats without changing cited chunk content.
+- Added a fingerprinted LibreOffice/`pdftocairo` whole-page capture fallback
+  for PPT and office files when Docling omits page images. Layout refinement now
+  preserves canonical order for same-bounding-box blocks and discards
+  unsupported optional section relationships while continuing to reject forged
+  or cross-page identities.
+- Fixed generated lifecycle validation CLI serialization so a successfully
+  completed lifecycle is returned instead of failing while formatting its
+  report.
+- Fixed real Milvus 2.6 publication verification by using the server alias
+  catalog instead of stale collection-level alias metadata. Incremental builds
+  now start from an empty staging collection and selectively copy only retained
+  sources, preventing changed or deleted rows from surviving an immediate
+  copy-then-delete sequence.
 
 ## 0.6.0
 

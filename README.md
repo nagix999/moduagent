@@ -10,7 +10,7 @@ Start with a normal model or Tool-calling loop. Add bounded Context Memory,
 validated Pydantic output, strict Plan-and-Execute, checkpoint recovery,
 Skills, and observability only when your application needs them.
 
-> Current version: **0.6.0** · Status: **Alpha** · Python **3.10+** · **MIT License**
+> Current version: **0.6.2** · Status: **Alpha** · Python **3.10+** · **MIT License**
 
 New to ModuAgent? Follow the five short steps below. They use the stable Quick
 API; the explicit component API remains available for advanced composition.
@@ -78,10 +78,10 @@ server; ModuAgent does not host a model itself.
 Install the package:
 
 ```bash
-python -m pip install "moduagent==0.6.0"
+python -m pip install "moduagent==0.6.2"
 ```
 
-If your package index does not contain `0.6.0` yet and you already have a 0.6
+If your package index does not contain `0.6.2` yet and you already have a 0.6
 source checkout, install it from the repository root:
 
 ```bash
@@ -845,11 +845,9 @@ Use an `EventSink` or `stream_all()` for the execution timeline. Add a
 
 ```python
 import asyncio
-import logging
 
-from moduagent import Agent, InMemoryDiagnosticSink, LoggingEventSink
+from moduagent import Agent, ConsoleEventSink, InMemoryDiagnosticSink
 
-logging.basicConfig(level=logging.INFO)
 diagnostics = InMemoryDiagnosticSink(max_records=1_000)
 
 observable_agent = Agent.create(
@@ -857,7 +855,7 @@ observable_agent = Agent.create(
     instructions="Complete the request using the available Tools.",
     model=model,
     tools=[add],
-    event_sink=LoggingEventSink(),
+    event_sink=ConsoleEventSink(detail="detailed"),
     diagnostic_sink=diagnostics,
 )
 
@@ -881,6 +879,22 @@ async def main() -> None:
 
 asyncio.run(main())
 ```
+
+That single sink gives terminals and notebooks a readable live timeline:
+
+```text
+● Agent run started
+  ● Generating model response · phase=act · turn=1
+    ● Running tool · search_documents
+    ✓ Tool completed · search_documents · 42ms
+  ● Composing final answer
+✓ Agent run completed · 248 tokens
+```
+
+This is not private model reasoning. Prompts, raw deltas, Tool arguments, and
+Tool results are excluded; only runtime-confirmed stages and sanitized status
+are rendered. Use `ConsoleEventSink(output_format="json")` or the existing
+`LoggingEventSink` for machine-consumed operational logs.
 
 `result.tool_trace` shows executed Tools and their correlation IDs.
 `result.failure_id` identifies the root failure of a terminal run. Its Tool

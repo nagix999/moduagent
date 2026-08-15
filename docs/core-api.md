@@ -5,7 +5,7 @@
 ## 설치
 
 ```bash
-python -m pip install moduagent==0.6.0
+python -m pip install moduagent==0.6.2
 ```
 
 Python 3.10 이상이 필요합니다. Redis adapter를 사용하면 `redis` 패키지도 설치합니다.

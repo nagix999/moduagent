@@ -27,6 +27,9 @@ MAX_DELETE_IDS = 100_000
 MAX_MANAGED_COLLECTIONS = 1_000
 MAX_FILTER_IDS = 256
 MAX_TEXT_FIELD_CHARS = 65_000
+MAX_HYBRID_QUERY_CHARS = 4_096
+MAX_HYBRID_TOKENS = 2_048
+MAX_HYBRID_CANDIDATES = 500
 _SAFE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
 _SAFE_GENERATION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
@@ -64,6 +67,23 @@ class PublishedGeneration:
     alias: str
     collection_name: str
     previous_collection: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SearchHit:
+    """Content-free retrieval result used by index quality evaluation."""
+
+    chunk_id: str
+    source_id: str
+    score: float
+
+    def __post_init__(self) -> None:
+        _identifiers((self.chunk_id,), "chunk_id", 1)
+        _identifiers((self.source_id,), "source_id", 1)
+        if isinstance(self.score, bool) or not isinstance(self.score, (int, float)):
+            raise TypeError("score must be a number")
+        if not math.isfinite(float(self.score)):
+            raise ValueError("score must be finite")
 
 
 class VectorStore(Protocol):
@@ -115,6 +135,18 @@ class VectorStore(Protocol):
     async def current_alias(self) -> str | None: ...
 
     async def active_generation_id(self) -> str | None: ...
+
+    async def search(
+        self, query_vector: Sequence[float], *, limit: int = 5
+    ) -> tuple[SearchHit, ...]: ...
+
+    async def hybrid_search(
+        self,
+        query_text: str,
+        query_vector: Sequence[float],
+        *,
+        limit: int = 5,
+    ) -> tuple[SearchHit, ...]: ...
 
     async def drop_staging(self, staging: StagingGeneration) -> None: ...
 
@@ -351,6 +383,91 @@ class InMemoryMilvusStore:
             if collection_name is None:
                 return None
             return self._collections[collection_name].staging.generation_id
+
+    async def search(
+        self, query_vector: Sequence[float], *, limit: int = 5
+    ) -> tuple[SearchHit, ...]:
+        _search_limit(limit)
+        async with self._lock:
+            collection_name = self._aliases.get(self.alias)
+            if collection_name is None:
+                return ()
+            collection = self._collections[collection_name]
+            query = _vector(query_vector, collection.staging.dimension)
+            query_norm = math.sqrt(sum(value * value for value in query))
+            if query_norm == 0:
+                raise VectorStoreError("query vector must not be all zero")
+            hits: list[SearchHit] = []
+            for row in collection.rows.values():
+                vector = _vector(
+                    row.get("dense_vector", ()), collection.staging.dimension
+                )
+                vector_norm = math.sqrt(sum(value * value for value in vector))
+                if vector_norm == 0:
+                    raise VectorStoreError("stored vector must not be all zero")
+                score = sum(
+                    query_value * vector_value
+                    for query_value, vector_value in zip(query, vector)
+                ) / (query_norm * vector_norm)
+                hits.append(
+                    SearchHit(
+                        chunk_id=str(row.get("chunk_id", "")),
+                        source_id=str(row.get("source_id", "")),
+                        score=score,
+                    )
+                )
+            hits.sort(key=lambda hit: (-hit.score, hit.chunk_id))
+            return tuple(hits[:limit])
+
+    async def hybrid_search(
+        self,
+        query_text: str,
+        query_vector: Sequence[float],
+        *,
+        limit: int = 5,
+    ) -> tuple[SearchHit, ...]:
+        """Rerank bounded dense candidates with private lexical overlap."""
+
+        _hybrid_query(query_text)
+        _search_limit(limit)
+        candidate_limit = _hybrid_candidate_limit(limit)
+        async with self._lock:
+            collection_name = self._aliases.get(self.alias)
+            if collection_name is None:
+                return ()
+            collection = self._collections[collection_name]
+            query = _vector(query_vector, collection.staging.dimension)
+            query_norm = math.sqrt(sum(value * value for value in query))
+            if query_norm == 0:
+                raise VectorStoreError("query vector must not be all zero")
+            candidates: list[tuple[SearchHit, str]] = []
+            for row in collection.rows.values():
+                vector = _vector(
+                    row.get("dense_vector", ()), collection.staging.dimension
+                )
+                vector_norm = math.sqrt(sum(value * value for value in vector))
+                if vector_norm == 0:
+                    raise VectorStoreError("stored vector must not be all zero")
+                score = sum(
+                    query_value * vector_value
+                    for query_value, vector_value in zip(query, vector)
+                ) / (query_norm * vector_norm)
+                candidates.append(
+                    (
+                        SearchHit(
+                            chunk_id=str(row.get("chunk_id", "")),
+                            source_id=str(row.get("source_id", "")),
+                            score=score,
+                        ),
+                        _stored_search_text(row.get("embedding_text")),
+                    )
+                )
+            candidates.sort(key=lambda item: (-item[0].score, item[0].chunk_id))
+            return _hybrid_rerank(
+                query_text,
+                tuple(candidates[:candidate_limit]),
+                limit=limit,
+            )
 
     async def drop_staging(self, staging: StagingGeneration) -> None:
         async with self._lock:
@@ -970,8 +1087,101 @@ class MilvusStore:
                 raise VectorStoreError("active Milvus generation identity is invalid")
             return generation_id
 
+    async def search(
+        self, query_vector: Sequence[float], *, limit: int = 5
+    ) -> tuple[SearchHit, ...]:
+        _search_limit(limit)
+        async with self._lock:
+            collection = await self.current_alias(_already_locked=True)
+            if collection is None:
+                return ()
+            client = self._get_client()
+            description = await self._run(
+                client.describe_collection,
+                collection_name=collection,
+                timeout=self.operation_timeout,
+            )
+            dimension = _collection_dimension(description)
+            query = _vector(query_vector, dimension)
+            raw = await self._run(
+                client.search,
+                collection_name=collection,
+                data=[list(query)],
+                anns_field="dense_vector",
+                limit=limit,
+                output_fields=["chunk_id", "source_id"],
+                search_params={"metric_type": self.metric_type, "params": {}},
+                timeout=self.operation_timeout,
+            )
+            return _search_hits(raw, limit=limit)
+
+    async def hybrid_search(
+        self,
+        query_text: str,
+        query_vector: Sequence[float],
+        *,
+        limit: int = 5,
+    ) -> tuple[SearchHit, ...]:
+        """Rerank at most 100 dense candidates without returning stored text."""
+
+        _hybrid_query(query_text)
+        _search_limit(limit)
+        candidate_limit = _hybrid_candidate_limit(limit)
+        async with self._lock:
+            collection = await self.current_alias(_already_locked=True)
+            if collection is None:
+                return ()
+            client = self._get_client()
+            description = await self._run(
+                client.describe_collection,
+                collection_name=collection,
+                timeout=self.operation_timeout,
+            )
+            dimension = _collection_dimension(description)
+            query = _vector(query_vector, dimension)
+            raw = await self._run(
+                client.search,
+                collection_name=collection,
+                data=[list(query)],
+                anns_field="dense_vector",
+                limit=candidate_limit,
+                output_fields=["chunk_id", "source_id", "embedding_text"],
+                search_params={"metric_type": self.metric_type, "params": {}},
+                timeout=self.operation_timeout,
+            )
+            candidates = _search_candidates(raw, limit=candidate_limit)
+            return _hybrid_rerank(query_text, candidates, limit=limit)
+
     async def _describe_alias(self, alias: str) -> str | None:
         client = self._get_client()
+        # Milvus 2.6 does not reliably mirror aliases in
+        # ``describe_collection()["aliases"]`` even though ``describe_alias``
+        # resolves them.  Prefer the server's alias catalog when available so
+        # an absent alias can still be distinguished from an unavailable
+        # server without relying on exception text.
+        if hasattr(client, "list_aliases") and hasattr(client, "describe_alias"):
+            catalog = await self._run(
+                client.list_aliases,
+                timeout=self.operation_timeout,
+            )
+            aliases = catalog.get("aliases") if isinstance(catalog, Mapping) else None
+            if not isinstance(aliases, Sequence) or isinstance(aliases, (str, bytes)):
+                raise VectorStoreError("Milvus returned an invalid alias catalog")
+            if len(aliases) > MAX_MANAGED_COLLECTIONS:
+                raise VectorStoreError("Milvus alias scan exceeds its safety limit")
+            if any(
+                not isinstance(value, str) or _SAFE_NAME.fullmatch(value) is None
+                for value in aliases
+            ):
+                raise VectorStoreError("Milvus returned an invalid alias name")
+            if alias not in aliases:
+                return None
+            value = await self._run(
+                client.describe_alias,
+                alias,
+                timeout=self.operation_timeout,
+            )
+            return _alias_collection(value)
         # ``describe_alias`` raises the same public exception class for an
         # absent alias and an unavailable server. Enumerating collection
         # descriptions avoids misclassifying an outage as "no active index".
@@ -987,12 +1197,7 @@ class MilvusStore:
             if isinstance(exc.__cause__, (KeyError, LookupError)):
                 return None
             raise
-        if not isinstance(value, Mapping):
-            raise VectorStoreError("Milvus returned an invalid alias description")
-        collection = value.get("collection_name") or value.get("collection")
-        if not isinstance(collection, str) or not collection:
-            raise VectorStoreError("Milvus alias has no collection")
-        return collection
+        return _alias_collection(value)
 
     def _find_alias_sync(self, alias: str) -> str | None:
         client = self._get_client()
@@ -1070,6 +1275,170 @@ class MilvusStore:
             raise TypeError("staging must be a StagingGeneration")
         if self._staging_handles.get(staging.collection_name) != staging:
             raise VectorStoreError("staging collection is not owned by this run")
+
+
+def _alias_collection(value: Any) -> str:
+    if not isinstance(value, Mapping):
+        raise VectorStoreError("Milvus returned an invalid alias description")
+    collection = value.get("collection_name") or value.get("collection")
+    if not isinstance(collection, str) or _SAFE_NAME.fullmatch(collection) is None:
+        raise VectorStoreError("Milvus alias has no valid collection")
+    return collection
+
+
+def _collection_dimension(value: Any) -> int:
+    if not isinstance(value, Mapping):
+        raise VectorStoreError("Milvus returned an invalid collection schema")
+    fields = value.get("fields")
+    if not isinstance(fields, Sequence) or isinstance(fields, (str, bytes)):
+        raise VectorStoreError("Milvus returned an invalid collection schema")
+    vector = next(
+        (
+            field
+            for field in fields
+            if isinstance(field, Mapping) and field.get("name") == "dense_vector"
+        ),
+        None,
+    )
+    params = vector.get("params") if isinstance(vector, Mapping) else None
+    try:
+        dimension = int(params.get("dim")) if isinstance(params, Mapping) else -1
+    except (TypeError, ValueError) as exc:
+        raise VectorStoreError("Milvus returned an invalid vector dimension") from exc
+    if not 1 <= dimension <= 65_536:
+        raise VectorStoreError("Milvus returned an invalid vector dimension")
+    return dimension
+
+
+def _search_limit(value: int) -> None:
+    if type(value) is not int or not 1 <= value <= 100:
+        raise ValueError("search limit must be between one and 100")
+
+
+def _search_hits(value: Any, *, limit: int) -> tuple[SearchHit, ...]:
+    return tuple(hit for hit, _text in _search_candidates(value, limit=limit))
+
+
+def _search_candidates(
+    value: Any,
+    *,
+    limit: int,
+) -> tuple[tuple[SearchHit, str], ...]:
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes))
+        or len(value) != 1
+    ):
+        raise VectorStoreError("Milvus returned an invalid search result")
+    raw_hits = value[0]
+    if not isinstance(raw_hits, Sequence) or isinstance(raw_hits, (str, bytes)):
+        raise VectorStoreError("Milvus returned an invalid search result")
+    if len(raw_hits) > limit:
+        raise VectorStoreError("Milvus search result exceeds the requested limit")
+    hits: list[tuple[SearchHit, str]] = []
+    seen: set[str] = set()
+    for raw_hit in raw_hits:
+        if not isinstance(raw_hit, Mapping):
+            raise VectorStoreError("Milvus returned an invalid search hit")
+        raw_entity = raw_hit.get("entity")
+        entity = _entity_mapping(raw_entity) if raw_entity is not None else raw_hit
+        chunk_id = entity.get("chunk_id", raw_hit.get("id"))
+        source_id = entity.get("source_id")
+        score = raw_hit.get("distance", raw_hit.get("score"))
+        hit = SearchHit(chunk_id=chunk_id, source_id=source_id, score=score)
+        if hit.chunk_id in seen:
+            raise VectorStoreError("Milvus returned duplicate search hits")
+        seen.add(hit.chunk_id)
+        hits.append((hit, _stored_search_text(entity.get("embedding_text", ""))))
+    return tuple(hits)
+
+
+def _hybrid_query(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > MAX_HYBRID_QUERY_CHARS
+        or any(ord(character) < 32 and character not in "\t\n\r" for character in value)
+    ):
+        raise ValueError("hybrid query text must be non-empty and bounded")
+    return value.strip()
+
+
+def _hybrid_candidate_limit(limit: int) -> int:
+    return min(MAX_HYBRID_CANDIDATES, max(limit, limit * 10))
+
+
+def _stored_search_text(value: Any) -> str:
+    if not isinstance(value, str) or len(value.encode("utf-8")) > MAX_TEXT_FIELD_CHARS:
+        raise VectorStoreError("Milvus returned invalid retrieval text")
+    return value
+
+
+def _lexical_tokens(value: str) -> frozenset[str]:
+    tokens = re.findall(r"[A-Za-z0-9]+|[가-힣]+", value.casefold())
+    if len(tokens) > MAX_HYBRID_TOKENS:
+        tokens = tokens[:MAX_HYBRID_TOKENS]
+    return frozenset(tokens)
+
+
+def _identifier_anchors(value: str) -> frozenset[str]:
+    """Keep digit-bearing compound identifiers intact for exact retrieval."""
+
+    return frozenset(
+        re.findall(
+            r"\b(?=[a-z0-9-]*\d)[a-z0-9]+(?:-[a-z0-9]+)+\b",
+            value.casefold(),
+        )[:64]
+    )
+
+
+def _hybrid_rerank(
+    query_text: str,
+    candidates: tuple[tuple[SearchHit, str], ...],
+    *,
+    limit: int,
+) -> tuple[SearchHit, ...]:
+    if not candidates:
+        return ()
+    query_tokens = _lexical_tokens(_hybrid_query(query_text))
+    query_anchors = _identifier_anchors(query_text)
+    if not query_tokens:
+        return tuple(hit for hit, _text in candidates[:limit])
+    document_tokens = tuple(_lexical_tokens(text) for _hit, text in candidates)
+    document_count = len(document_tokens)
+    document_frequency = {
+        token: sum(token in tokens for tokens in document_tokens)
+        for token in query_tokens
+    }
+    weights = {
+        token: math.log((document_count + 1) / (frequency + 1)) + 1.0
+        for token, frequency in document_frequency.items()
+    }
+    maximum_coverage = sum(weights.values())
+    reranked: list[SearchHit] = []
+    for (hit, text), tokens in zip(candidates, document_tokens):
+        lexical = (
+            sum(weights[token] for token in query_tokens & tokens) / maximum_coverage
+        )
+        # COSINE is in [-1, 1].  Preserve its absolute distance instead of
+        # min-max stretching tiny candidate differences into a full 0..1 gap.
+        dense = min(1.0, max(0.0, (hit.score + 1.0) / 2.0))
+        anchors = (
+            len(query_anchors & _identifier_anchors(text)) / len(query_anchors)
+            if query_anchors
+            else 0.0
+        )
+        # Exact compound identifiers need a separate signal: tokenizing
+        # ``CORP-INCIDENT-001`` loses the relation between its common and
+        # unique parts. Dense similarity remains dominant when no identifier
+        # is present.
+        if query_anchors:
+            combined = dense * 0.50 + lexical * 0.20 + anchors * 0.30
+        else:
+            combined = dense * 0.65 + lexical * 0.35
+        reranked.append(SearchHit(hit.chunk_id, hit.source_id, combined))
+    reranked.sort(key=lambda hit: (-hit.score, hit.chunk_id))
+    return tuple(reranked[:limit])
 
 
 def staging_handle(
@@ -1253,8 +1622,12 @@ __all__ = [
     "CopyResult",
     "InMemoryMilvusStore",
     "IndexValidation",
+    "MAX_HYBRID_CANDIDATES",
+    "MAX_HYBRID_QUERY_CHARS",
+    "MAX_HYBRID_TOKENS",
     "MilvusStore",
     "PublishedGeneration",
+    "SearchHit",
     "StagingGeneration",
     "VectorStore",
     "VectorStoreError",

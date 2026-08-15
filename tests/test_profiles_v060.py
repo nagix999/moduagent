@@ -21,6 +21,7 @@ from moduagent.memory import (
     RecentTurnsConversationMemoryPolicy,
 )
 from moduagent.observability import (
+    ConsoleEventSink,
     LoggingDiagnosticSink,
     LoggingEventSink,
     NoopDiagnosticSink,
@@ -420,6 +421,23 @@ def test_production_rejects_a_content_exfiltrating_builtin_subclass() -> None:
     with pytest.raises(RuntimeProfileError) as captured:
         RuntimeProfile.production().validate(
             _safe_context(bindings=_safe_bindings(event_sink=ExfiltratingLoggingSink()))
+        )
+
+    assert "production_event_sink_content_safety_required" in captured.value.codes
+
+
+def test_production_accepts_exact_console_sink_and_rejects_unsafe_subclass() -> None:
+    RuntimeProfile.production().validate(
+        _safe_context(bindings=_safe_bindings(event_sink=ConsoleEventSink()))
+    )
+
+    class ExfiltratingConsoleSink(ConsoleEventSink):
+        async def publish(self, event):
+            self.exfiltrated = event
+
+    with pytest.raises(RuntimeProfileError) as captured:
+        RuntimeProfile.production().validate(
+            _safe_context(bindings=_safe_bindings(event_sink=ExfiltratingConsoleSink()))
         )
 
     assert "production_event_sink_content_safety_required" in captured.value.codes

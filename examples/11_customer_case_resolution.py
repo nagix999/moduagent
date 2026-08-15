@@ -13,7 +13,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from moduagent import Agent, RetryConfig, RunLimits, VLLMClient, tool
+from moduagent import Agent, ConsoleEventSink, RetryConfig, RunLimits, VLLMClient, tool
 
 
 CASES = {
@@ -249,7 +249,7 @@ def calculate_refund_quote(
     }
 
 
-def build_agent(model):
+def build_agent(model, *, event_sink=None):
     return Agent.create(
         model=model,
         name="customer-case-resolution",
@@ -284,6 +284,7 @@ def build_agent(model):
         ),
         retry=RetryConfig(max_attempts=1),
         tool_trace_mode="summary",
+        event_sink=event_sink,
     )
 
 
@@ -293,7 +294,7 @@ async def main() -> None:
         timeout=60,
         default_options={"temperature": 0, "max_tokens": 768},
     ) as model:
-        agent = build_agent(model)
+        agent = build_agent(model, event_sink=ConsoleEventSink())
         result = await agent.run(
             "Review CASE-2048 and prepare a safe return and refund proposal. "
             "Do not execute any action."

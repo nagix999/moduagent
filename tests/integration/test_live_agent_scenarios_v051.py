@@ -3,12 +3,21 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Mapping
+from io import StringIO
 from typing import Any, Literal
 
 import pytest
 from pydantic import BaseModel, Field
 
-from moduagent import Agent, FinishReason, RetryConfig, RunLimits, VLLMClient, tool
+from moduagent import (
+    Agent,
+    ConsoleEventSink,
+    FinishReason,
+    RetryConfig,
+    RunLimits,
+    VLLMClient,
+    tool,
+)
 
 
 _TOOL_CALLS: list[dict[str, Any]] = []
@@ -104,6 +113,7 @@ class SalesReport(BaseModel):
 def test_vllm_quick_api_calls_one_typed_tool_live() -> None:
     async def scenario() -> None:
         _TOOL_CALLS.clear()
+        console = StringIO()
         async with _client(max_tokens=192) as model:
             agent = Agent.create(
                 model=model,
@@ -114,6 +124,7 @@ def test_vllm_quick_api_calls_one_typed_tool_live() -> None:
                 tools=[add],
                 limits=_limits(model_turns=4, tool_calls=1),
                 retry=RetryConfig(max_attempts=1),
+                event_sink=ConsoleEventSink(stream=console, color=False),
             )
             result = await agent.run("Add 17 and 25.")
 
@@ -124,6 +135,11 @@ def test_vllm_quick_api_calls_one_typed_tool_live() -> None:
         assert result.run_usage["tool_calls"] == 1
         assert result.run_usage["duration_seconds"] > 0
         assert [trace["tool_name"] for trace in result.tool_trace] == ["add"]
+        rendered = console.getvalue()
+        assert "Agent run started" in rendered
+        assert "Running tool · add" in rendered
+        assert "Agent run completed" in rendered
+        assert "17" not in rendered and "25" not in rendered
 
     asyncio.run(scenario())
 
@@ -131,6 +147,7 @@ def test_vllm_quick_api_calls_one_typed_tool_live() -> None:
 def test_vllm_standard_report_uses_two_tools_and_structured_output_live() -> None:
     async def scenario() -> None:
         _TOOL_CALLS.clear()
+        console = StringIO()
         async with _client(max_tokens=512) as model:
             agent = Agent.create(
                 model=model,
@@ -144,6 +161,11 @@ def test_vllm_standard_report_uses_two_tools_and_structured_output_live() -> Non
                 output=SalesReport,
                 limits=_limits(model_turns=8, tool_calls=3),
                 retry=RetryConfig(max_attempts=1),
+                event_sink=ConsoleEventSink(
+                    stream=console,
+                    detail="detailed",
+                    color=False,
+                ),
             )
             result = await agent.run("2026년 1분기 월별 매출 리포트를 만들어줘.")
 
@@ -162,5 +184,10 @@ def test_vllm_standard_report_uses_two_tools_and_structured_output_live() -> Non
             "query_sales",
             "plot_graph",
         ]
+        rendered = console.getvalue()
+        assert "Running tool · query_sales" in rendered
+        assert "Running tool · plot_graph" in rendered
+        assert "Composing final answer" in rendered
+        assert "2026-01" not in rendered
 
     asyncio.run(scenario())

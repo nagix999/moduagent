@@ -27,6 +27,7 @@ class ChunkingConfig:
     max_chars: int = 2_400
     overlap_chars: int = 240
     max_embedding_chars: int = 32_000
+    max_document_context_chars: int = 1_000
     separate_modalities: bool = True
     algorithm: str = "docling-structure-v1"
 
@@ -44,6 +45,11 @@ class ChunkingConfig:
             or not self.max_chars <= self.max_embedding_chars <= 32_000
         ):
             raise ValueError("max_embedding_chars must be between max_chars and 32000")
+        if (
+            type(self.max_document_context_chars) is not int
+            or not 0 <= self.max_document_context_chars <= 8_000
+        ):
+            raise ValueError("max_document_context_chars must be between zero and 8000")
         if type(self.separate_modalities) is not bool:
             raise TypeError("separate_modalities must be a bool")
         if not isinstance(self.algorithm, str) or not self.algorithm.strip():
@@ -56,6 +62,7 @@ class ChunkingConfig:
             max_chars=self.max_chars,
             overlap_chars=self.overlap_chars,
             max_embedding_chars=self.max_embedding_chars,
+            max_document_context_chars=self.max_document_context_chars,
             separate_modalities=self.separate_modalities,
         )
 
@@ -185,6 +192,9 @@ def chunk_blocks(
         if pipeline is not None
         else next(iter(model_fingerprints), "none")
     )
+    document_context = _document_context(
+        tuple(blocks), maximum=resolved_config.max_document_context_chars
+    )
     for ordinal, group in enumerate(groups):
         content = "\n\n".join(piece.text for piece in group)
         if not content.strip() or len(content) > resolved_config.max_chars:
@@ -195,6 +205,8 @@ def chunk_blocks(
             tuple(location for piece in group for location in piece.provenance)
         )
         hints = _enrichment_hints(group, enrichment_by_block)
+        if document_context:
+            hints = (f"Document context: {document_context}", *hints)
         embedding_text = _embedding_text(
             section_path,
             content,
@@ -382,3 +394,35 @@ def _embedding_text(
             break
         base += "\n" + hint[:available]
     return base.strip()
+
+
+def _document_context(
+    blocks: tuple[StructuredBlock, ...],
+    *,
+    maximum: int,
+) -> str:
+    """Return bounded leading context for retrieval only, never citation content.
+
+    Structured formats often split a document identifier, business unit, and
+    body into separate blocks.  Repeating a small canonical prefix in the
+    embedding input keeps those chunks associated without changing ``content``
+    or provenance used for grounded answers.
+    """
+
+    if maximum == 0:
+        return ""
+    parts: list[str] = []
+    length = 0
+    for block in blocks:
+        text = " ".join(block.text.split())
+        if not text:
+            continue
+        delimiter = 2 if parts else 0
+        available = maximum - length - delimiter
+        if available <= 0:
+            break
+        parts.append(text[:available])
+        length += delimiter + min(len(text), available)
+        if len(text) > available:
+            break
+    return "\n\n".join(parts)

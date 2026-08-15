@@ -26,6 +26,7 @@ from moduagent.observability import (
     AuditEventSink,
     CompositeDiagnosticSink,
     CompositeEventSink,
+    ConsoleEventSink,
     InMemoryDiagnosticSink,
     LoggingEventSink,
     MetricsEventSink,
@@ -765,7 +766,12 @@ def _event_sink_is_unsafe(sink: object | None) -> bool:
 def _event_sink_has_sealed_content_projection(sink: object | None) -> bool:
     """Accept only built-ins whose publish methods cannot be overridden."""
 
-    if type(sink) in {LoggingEventSink, MetricsEventSink, AuditEventSink}:
+    if type(sink) in {
+        ConsoleEventSink,
+        LoggingEventSink,
+        MetricsEventSink,
+        AuditEventSink,
+    }:
         return True
     if type(sink) is CompositeEventSink:
         return bool(sink.sinks) and all(
