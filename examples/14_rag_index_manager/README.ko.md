@@ -724,6 +724,7 @@ parser/model/store와 manager를 먼저 새로 구성한다.
 def show_supervisor(report):
     print("rag_ingestion_supervisor", report.to_dict())
 
+
 supervisor = rag.ContinuousIngestionSupervisor(
     manager,
     supervisor_state,
