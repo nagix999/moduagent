@@ -8,12 +8,14 @@ import json
 import logging
 import math
 import re
+import sys
+import threading
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, TextIO, runtime_checkable
 
 from moduagent.messages import Usage
 from moduagent.observability._background import run_in_daemon_thread
@@ -391,6 +393,126 @@ class LoggingEventSink:
 
     async def emit(self, event: AgentEvent) -> None:
         await self.publish(event)
+
+
+class ConsoleEventSink:
+    """Render content-free Agent progress for terminals and notebooks.
+
+    The pretty view uses only the same sealed projection as
+    :class:`LoggingEventSink`. Prompts, model deltas, tool arguments/results,
+    and private model reasoning are never rendered. Use ``output_format="json"``
+    when the same stream is consumed by an operational log collector.
+    """
+
+    content_safe = True
+    _DELTA_EVENTS = frozenset(
+        {
+            EventType.MODEL_DELTA,
+            EventType.STEP_MODEL_DELTA,
+            EventType.FINAL_DELTA,
+        }
+    )
+    _SUMMARY_EVENTS = frozenset(
+        {
+            EventType.RUN_STARTED,
+            EventType.MODEL_STARTED,
+            EventType.MODEL_COMPLETED,
+            EventType.MODEL_FAILED,
+            EventType.TOOL_STARTED,
+            EventType.TOOL_COMPLETED,
+            EventType.TOOL_REPAIR_SCHEDULED,
+            EventType.TOOL_REPAIR_EXHAUSTED,
+            EventType.DELEGATION_STARTED,
+            EventType.DELEGATION_COMPLETED,
+            EventType.DELEGATION_FAILED,
+            EventType.FINALIZATION_STARTED,
+            EventType.FINALIZATION_COMPLETED,
+            EventType.RETRY,
+            EventType.STEP_RETRY,
+            EventType.RUN_COMPLETED,
+            EventType.RUN_FAILED,
+        }
+    )
+
+    def __init__(
+        self,
+        *,
+        stream: TextIO | None = None,
+        output_format: str = "pretty",
+        detail: str = "summary",
+        language: str = "en",
+        color: bool | None = None,
+        include_timestamp: bool = False,
+    ) -> None:
+        if stream is not None and not callable(getattr(stream, "write", None)):
+            raise TypeError("stream must provide write() or be None")
+        if output_format not in {"pretty", "json"}:
+            raise ValueError("output_format must be pretty or json")
+        if detail not in {"summary", "detailed"}:
+            raise ValueError("detail must be summary or detailed")
+        if language not in {"en", "ko"}:
+            raise ValueError("language must be en or ko")
+        if color is not None and type(color) is not bool:
+            raise TypeError("color must be a bool or None")
+        if type(include_timestamp) is not bool:
+            raise TypeError("include_timestamp must be a bool")
+        self.stream = stream
+        self.output_format = output_format
+        self.detail = detail
+        self.language = language
+        self.color = color
+        self.include_timestamp = include_timestamp
+        self.last_error: BaseException | None = None
+        self._write_lock = threading.Lock()
+
+    async def publish(self, event: AgentEvent) -> None:
+        if event.type in self._DELTA_EVENTS:
+            return
+        if self.detail == "summary" and event.type not in self._SUMMARY_EVENTS:
+            return
+        try:
+            record = _observability_event_to_dict(event)
+            line = (
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if self.output_format == "json"
+                else _pretty_console_line(
+                    event,
+                    record,
+                    language=self.language,
+                    color=self._color_enabled(),
+                    include_timestamp=self.include_timestamp,
+                )
+            )
+            await run_in_daemon_thread(self._write_line, line)
+            self.last_error = None
+        except Exception as exc:
+            self.last_error = exc
+
+    async def emit(self, event: AgentEvent) -> None:
+        await self.publish(event)
+
+    def _color_enabled(self) -> bool:
+        if self.color is not None:
+            return self.color
+        stream = self.stream if self.stream is not None else sys.stderr
+        isatty = getattr(stream, "isatty", None)
+        try:
+            return bool(isatty()) if callable(isatty) else False
+        except Exception:
+            return False
+
+    def _write_line(self, line: str) -> None:
+        stream = self.stream if self.stream is not None else sys.stderr
+        with self._write_lock:
+            stream.write(f"{line}\n")
+            flush = getattr(stream, "flush", None)
+            if callable(flush):
+                flush()
 
 
 @runtime_checkable
@@ -972,6 +1094,266 @@ def _safe_error_summary(metadata: Any) -> dict[str, Any] | None:
     return summary or None
 
 
+_CONSOLE_LABELS: Mapping[str, Mapping[EventType, str]] = {
+    "en": {
+        EventType.RUN_STARTED: "Agent run started",
+        EventType.CHECKPOINT_LOADED: "Checkpoint restored",
+        EventType.CHECKPOINT_SAVED: "Checkpoint saved",
+        EventType.SKILLS_DISCOVERED: "Skills discovered",
+        EventType.SKILL_SELECTION_STARTED: "Selecting skills",
+        EventType.SKILL_SELECTION_COMPLETED: "Skill selection completed",
+        EventType.SKILL_SELECTED: "Skill selected",
+        EventType.SKILL_ACTIVATED: "Skill activated",
+        EventType.SKILL_RESOURCE_READ: "Skill resource read",
+        EventType.SKILL_SKIPPED: "Skill skipped",
+        EventType.SKILL_DENIED: "Skill denied",
+        EventType.SKILL_ERROR: "Skill failed",
+        EventType.MODEL_STARTED: "Generating model response",
+        EventType.MODEL_COMPLETED: "Model response received",
+        EventType.MODEL_FAILED: "Model request failed",
+        EventType.MEMORY_COMPACTED: "Context memory prepared",
+        EventType.DELEGATION_REQUESTED: "Delegation requested",
+        EventType.DELEGATION_AUTHORIZED: "Delegation authorized",
+        EventType.DELEGATION_REJECTED: "Delegation rejected",
+        EventType.DELEGATION_STARTED: "Delegated Agent running",
+        EventType.DELEGATION_RESUMED: "Delegated Agent resumed",
+        EventType.DELEGATION_COMPLETED: "Delegated Agent completed",
+        EventType.DELEGATION_FAILED: "Delegated Agent failed",
+        EventType.DELEGATION_RECONCILIATION_REQUIRED: "Delegation needs review",
+        EventType.TOOL_STARTED: "Running tool",
+        EventType.TOOL_COMPLETED: "Tool completed",
+        EventType.TOOL_REPAIR_SCHEDULED: "Repairing tool call",
+        EventType.TOOL_REPAIR_EXHAUSTED: "Tool repair exhausted",
+        EventType.POLICY_DECISION: "Policy decision",
+        EventType.PLAN_CREATED: "Plan created",
+        EventType.STEP_STARTED: "Plan step running",
+        EventType.STEP_RESULT_CREATED: "Step result created",
+        EventType.STEP_VALIDATED: "Step validated",
+        EventType.STEP_COMMITTED: "Step committed",
+        EventType.STEP_RETRY: "Retrying plan step",
+        EventType.STEP_FAILED: "Plan step failed",
+        EventType.PLAN_REVISED: "Plan revised",
+        EventType.FINALIZATION_STARTED: "Composing final answer",
+        EventType.FINALIZATION_COMPLETED: "Final answer composed",
+        EventType.RETRY: "Retrying operation",
+        EventType.RUN_COMPLETED: "Agent run completed",
+        EventType.RUN_FAILED: "Agent run failed",
+    },
+    "ko": {
+        EventType.RUN_STARTED: "Agent 실행 시작",
+        EventType.CHECKPOINT_LOADED: "체크포인트 복원 완료",
+        EventType.CHECKPOINT_SAVED: "체크포인트 저장 완료",
+        EventType.SKILLS_DISCOVERED: "Skill 탐색 완료",
+        EventType.SKILL_SELECTION_STARTED: "Skill 선택 중",
+        EventType.SKILL_SELECTION_COMPLETED: "Skill 선택 완료",
+        EventType.SKILL_SELECTED: "Skill 선택됨",
+        EventType.SKILL_ACTIVATED: "Skill 활성화",
+        EventType.SKILL_RESOURCE_READ: "Skill 리소스 읽기 완료",
+        EventType.SKILL_SKIPPED: "Skill 건너뜀",
+        EventType.SKILL_DENIED: "Skill 사용 거부됨",
+        EventType.SKILL_ERROR: "Skill 처리 실패",
+        EventType.MODEL_STARTED: "모델 응답 생성 중",
+        EventType.MODEL_COMPLETED: "모델 응답 수신 완료",
+        EventType.MODEL_FAILED: "모델 호출 실패",
+        EventType.MEMORY_COMPACTED: "대화 컨텍스트 준비 완료",
+        EventType.DELEGATION_REQUESTED: "Agent 위임 요청",
+        EventType.DELEGATION_AUTHORIZED: "Agent 위임 승인",
+        EventType.DELEGATION_REJECTED: "Agent 위임 거부",
+        EventType.DELEGATION_STARTED: "위임 Agent 실행 중",
+        EventType.DELEGATION_RESUMED: "위임 Agent 실행 재개",
+        EventType.DELEGATION_COMPLETED: "위임 Agent 실행 완료",
+        EventType.DELEGATION_FAILED: "위임 Agent 실행 실패",
+        EventType.DELEGATION_RECONCILIATION_REQUIRED: "위임 상태 확인 필요",
+        EventType.TOOL_STARTED: "Tool 실행 중",
+        EventType.TOOL_COMPLETED: "Tool 실행 완료",
+        EventType.TOOL_REPAIR_SCHEDULED: "Tool 호출 복구 중",
+        EventType.TOOL_REPAIR_EXHAUSTED: "Tool 호출 복구 실패",
+        EventType.POLICY_DECISION: "실행 정책 판단",
+        EventType.PLAN_CREATED: "실행 계획 생성 완료",
+        EventType.STEP_STARTED: "계획 단계 실행 중",
+        EventType.STEP_RESULT_CREATED: "단계 결과 생성 완료",
+        EventType.STEP_VALIDATED: "단계 결과 검증 완료",
+        EventType.STEP_COMMITTED: "계획 단계 반영 완료",
+        EventType.STEP_RETRY: "계획 단계 재시도 중",
+        EventType.STEP_FAILED: "계획 단계 실패",
+        EventType.PLAN_REVISED: "실행 계획 수정 완료",
+        EventType.FINALIZATION_STARTED: "최종 답변 구성 중",
+        EventType.FINALIZATION_COMPLETED: "최종 답변 구성 완료",
+        EventType.RETRY: "작업 재시도 중",
+        EventType.RUN_COMPLETED: "Agent 실행 완료",
+        EventType.RUN_FAILED: "Agent 실행 실패",
+    },
+}
+
+_CONSOLE_STARTED_EVENTS = frozenset(
+    {
+        EventType.RUN_STARTED,
+        EventType.SKILL_SELECTION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.DELEGATION_REQUESTED,
+        EventType.DELEGATION_STARTED,
+        EventType.TOOL_STARTED,
+        EventType.STEP_STARTED,
+        EventType.FINALIZATION_STARTED,
+    }
+)
+_CONSOLE_FAILED_EVENTS = frozenset(
+    {
+        EventType.SKILL_DENIED,
+        EventType.SKILL_ERROR,
+        EventType.MODEL_FAILED,
+        EventType.DELEGATION_REJECTED,
+        EventType.DELEGATION_FAILED,
+        EventType.DELEGATION_RECONCILIATION_REQUIRED,
+        EventType.TOOL_REPAIR_EXHAUSTED,
+        EventType.STEP_FAILED,
+        EventType.RUN_FAILED,
+    }
+)
+_CONSOLE_RETRY_EVENTS = frozenset(
+    {
+        EventType.RETRY,
+        EventType.STEP_RETRY,
+        EventType.TOOL_REPAIR_SCHEDULED,
+        EventType.PLAN_REVISED,
+    }
+)
+
+
+def _pretty_console_line(
+    event: AgentEvent,
+    record: Mapping[str, Any],
+    *,
+    language: str,
+    color: bool,
+    include_timestamp: bool,
+) -> str:
+    data = record.get("data")
+    safe_data = data if isinstance(data, Mapping) else {}
+    failed_tool = event.type is EventType.TOOL_COMPLETED and (
+        safe_data.get("success") is False or "failure" in safe_data
+    )
+    if event.type in _CONSOLE_FAILED_EVENTS or failed_tool:
+        icon, ansi = "✗", "31"
+    elif event.type in _CONSOLE_RETRY_EVENTS:
+        icon, ansi = "↻", "33"
+    elif event.type in _CONSOLE_STARTED_EVENTS:
+        icon, ansi = "●", "36"
+    else:
+        icon, ansi = "✓", "32"
+    label = _CONSOLE_LABELS[language].get(
+        event.type,
+        event.type.value.replace("_", " "),
+    )
+    if color:
+        icon = f"\x1b[{ansi}m{icon}\x1b[0m"
+        label = f"\x1b[1m{label}\x1b[0m"
+    indent = (
+        ""
+        if event.type
+        in {EventType.RUN_STARTED, EventType.RUN_COMPLETED, EventType.RUN_FAILED}
+        else "  "
+    )
+    if event.type in {
+        EventType.TOOL_STARTED,
+        EventType.TOOL_COMPLETED,
+        EventType.TOOL_REPAIR_SCHEDULED,
+        EventType.TOOL_REPAIR_EXHAUSTED,
+        EventType.STEP_STARTED,
+        EventType.STEP_RESULT_CREATED,
+        EventType.STEP_VALIDATED,
+        EventType.STEP_COMMITTED,
+        EventType.STEP_RETRY,
+        EventType.STEP_FAILED,
+    }:
+        indent = "    "
+    prefix = (
+        f"[{event.occurred_at.astimezone().strftime('%H:%M:%S')}] "
+        if include_timestamp
+        else ""
+    )
+    details = _pretty_console_details(event.type, safe_data, language=language)
+    suffix = f" · {' · '.join(details)}" if details else ""
+    return f"{prefix}{indent}{icon} {label}{suffix}"
+
+
+def _pretty_console_details(
+    event_type: EventType,
+    data: Mapping[str, Any],
+    *,
+    language: str,
+) -> list[str]:
+    details: list[str] = []
+    if event_type in {EventType.TOOL_STARTED, EventType.TOOL_COMPLETED}:
+        _append_console_detail(details, data.get("tool_name"))
+    elif event_type in {
+        EventType.SKILL_SELECTED,
+        EventType.SKILL_ACTIVATED,
+        EventType.SKILL_SKIPPED,
+        EventType.SKILL_DENIED,
+    }:
+        _append_console_detail(details, data.get("name") or data.get("skill_name"))
+    elif event_type in {
+        EventType.DELEGATION_REQUESTED,
+        EventType.DELEGATION_AUTHORIZED,
+        EventType.DELEGATION_REJECTED,
+        EventType.DELEGATION_STARTED,
+        EventType.DELEGATION_RESUMED,
+        EventType.DELEGATION_COMPLETED,
+        EventType.DELEGATION_FAILED,
+    }:
+        caller = data.get("caller_agent_id")
+        callee = data.get("callee_agent_id")
+        if isinstance(caller, str) and isinstance(callee, str):
+            details.append(f"{caller} → {callee}")
+
+    phase = data.get("phase")
+    if isinstance(phase, str):
+        details.append(f"phase={phase}")
+    turn = data.get("model_turn")
+    if type(turn) is int:
+        details.append(f"turn={turn}")
+    attempt = data.get("attempt")
+    if type(attempt) is int and attempt > 1:
+        details.append(f"attempt={attempt}")
+    duration = data.get("duration_seconds")
+    if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+        details.append(_format_console_duration(float(duration)))
+    usage = data.get("usage")
+    if isinstance(usage, Mapping) and type(usage.get("total_tokens")) is int:
+        unit = "토큰" if language == "ko" else "tokens"
+        details.append(f"{usage['total_tokens']:,} {unit}")
+    tool_calls = data.get("tool_call_count")
+    if type(tool_calls) is int and tool_calls > 0:
+        unit = "개 Tool 호출" if language == "ko" else "tool calls"
+        details.append(f"{tool_calls} {unit}")
+    if event_type in {EventType.RUN_COMPLETED, EventType.RUN_FAILED}:
+        summary = data.get("error_summary")
+        if isinstance(summary, Mapping):
+            _append_console_detail(details, summary.get("operation"))
+            _append_console_detail(details, summary.get("code"))
+    failure = data.get("failure")
+    if isinstance(failure, Mapping):
+        _append_console_detail(details, failure.get("type"))
+        _append_console_detail(details, failure.get("reason"))
+    elif event_type in _CONSOLE_FAILED_EVENTS:
+        _append_console_detail(details, data.get("code") or data.get("error_type"))
+    return details
+
+
+def _append_console_detail(details: list[str], value: Any) -> None:
+    if isinstance(value, str) and value and value not in details:
+        details.append(value)
+
+
+def _format_console_duration(seconds: float) -> str:
+    if seconds < 1:
+        return f"{max(0.0, seconds) * 1_000:.0f}ms"
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    return f"{seconds / 60:.1f}m"
+
+
 def mask_sensitive(
     value: Any,
     *,
@@ -1016,6 +1398,7 @@ def _event_sink_requires_coordinator_copy(sink: Any) -> bool:
     return type(sink) not in {
         NoopEventSink,
         CompositeEventSink,
+        ConsoleEventSink,
         LoggingEventSink,
         MetricsEventSink,
         AuditEventSink,

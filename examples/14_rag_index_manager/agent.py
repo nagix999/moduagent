@@ -32,6 +32,7 @@ from moduagent.errors import ToolRecoveryError
 
 from .diagnostics import PipelineExecutionLog
 from .pipeline import IndexStatus, RAGIndexManager, SyncReport
+from .supervisor import SupervisorState
 
 
 ToolOperation = Literal["status", "preview", "sync", "rebuild", "rollback"]
@@ -142,7 +143,8 @@ MANAGEMENT_INSTRUCTIONS = """
 
 Tool 결과의 숫자, 상태, generation ID, warning을 그대로 ManagementResponse에 옮긴다.
 summary만 짧은 한국어로 작성한다. 문서 본문이나 자격 증명을 요청하거나 출력하지
-않는다. Tool 실패를 성공으로 표현하지 않는다.
+않는다. continuous_ingestion warning이 있으면 자동 수집 상태와 재시도/격리 여부를
+summary에 설명한다. Tool 실패를 성공으로 표현하지 않는다.
 """
 
 
@@ -236,6 +238,7 @@ def make_management_tools(
     *,
     allow_writes: bool = False,
     audit: ManagementAudit | None = None,
+    supervisor_state_provider: Callable[[], SupervisorState] | None = None,
 ) -> tuple[Any, ...]:
     """Bind zero-argument Tools to one application-approved manager instance."""
 
@@ -243,6 +246,10 @@ def make_management_tools(
         raise TypeError("manager must be a RAGIndexManager")
     if type(allow_writes) is not bool:
         raise TypeError("allow_writes must be a bool")
+    if supervisor_state_provider is not None and not callable(
+        supervisor_state_provider
+    ):
+        raise TypeError("supervisor_state_provider must be callable or None")
     resolved_audit = audit or ManagementAudit(execution_log=manager.execution_log)
     if not isinstance(resolved_audit, ManagementAudit):
         raise TypeError("audit must be a ManagementAudit")
@@ -258,7 +265,15 @@ def make_management_tools(
         """Read manifest/Milvus consistency, counts, and rollback availability."""
 
         async def run() -> dict[str, Any]:
-            return _status_payload(await manager.status())
+            payload = _status_payload(await manager.status())
+            if supervisor_state_provider is not None:
+                state = supervisor_state_provider()
+                if not isinstance(state, SupervisorState):
+                    raise TypeError(
+                        "supervisor state provider returned an invalid value"
+                    )
+                payload["warnings"] = _supervisor_status_warnings(state)
+            return payload
 
         return await resolved_audit.execute("inspect_index_status", run)
 
@@ -341,6 +356,7 @@ def build_management_agent(
     audit: ManagementAudit | None = None,
     event_sink: EventSink | None = None,
     diagnostic_sink: DiagnosticSink | None = None,
+    supervisor_state_provider: Callable[[], SupervisorState] | None = None,
 ) -> Agent:
     """Build a bounded Agent; write Tools exist only after application opt-in."""
 
@@ -352,6 +368,7 @@ def build_management_agent(
             manager,
             allow_writes=allow_writes,
             audit=audit,
+            supervisor_state_provider=supervisor_state_provider,
         ),
         execution=StandardExecutionProfile(
             decision_policy=_FinalizeAfterSuccessfulOperationPolicy(),
@@ -387,6 +404,7 @@ async def run_management_request(
     allow_writes: bool = False,
     event_sink: EventSink | None = None,
     diagnostic_sink: DiagnosticSink | None = None,
+    supervisor_state_provider: Callable[[], SupervisorState] | None = None,
 ) -> ManagementResponse:
     """Execute exactly one authorized operation and verify the final narration."""
 
@@ -403,6 +421,7 @@ async def run_management_request(
         audit=audit,
         event_sink=event_sink,
         diagnostic_sink=diagnostic_sink,
+        supervisor_state_provider=supervisor_state_provider,
     )
     try:
         result = await agent.run(
@@ -569,6 +588,23 @@ def _report_payload(value: SyncReport) -> dict[str, Any]:
     payload.pop("actions", None)
     payload.pop("details_truncated", None)
     return payload
+
+
+def _supervisor_status_warnings(state: SupervisorState) -> list[str]:
+    if state.quarantined_digest is not None:
+        status = "quarantined"
+    elif state.last_failure_code is not None:
+        status = "retrying"
+    elif state.last_success_at is not None:
+        status = "healthy"
+    else:
+        status = "initializing"
+    warnings = [f"continuous_ingestion={status}"]
+    if state.retry_attempts:
+        warnings.append(f"continuous_ingestion_retry_attempts={state.retry_attempts}")
+    if state.last_failure_code is not None:
+        warnings.append(f"continuous_ingestion_error={state.last_failure_code}")
+    return warnings
 
 
 def _verify_response(value: ManagementResponse, authoritative: dict[str, Any]) -> None:

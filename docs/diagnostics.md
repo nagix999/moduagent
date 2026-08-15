@@ -11,6 +11,31 @@ Use an `EventSink` for normal operational timelines. Use a `DiagnosticSink`
 only in an access-controlled diagnostic path. Diagnostic records are never
 sent to the model or added to conversation history.
 
+## Pretty console progress
+
+For a terminal or Jupyter notebook, progress logging is one Agent option:
+
+```python
+from moduagent import ConsoleEventSink
+
+agent = Agent.create(
+    name="report-agent",
+    model=model,
+    instructions="Use the available Tools and answer the request.",
+    tools=tools,
+    event_sink=ConsoleEventSink(
+        language="ko",       # "en" is the default
+        detail="detailed",  # or "summary"
+    ),
+)
+```
+
+`ConsoleEventSink` renders run, model, Tool, retry, delegation, planning, and
+finalization events as an indented timeline. It uses a sealed, content-free
+projection: prompts, model delta text, Tool arguments/results, and private model
+reasoning are never printed. ANSI color is enabled automatically only for a TTY.
+Use `output_format="json"` to write the same safe event projection as JSON.
+
 ## In-memory diagnostics
 
 Pass a diagnostic sink when constructing the Agent:

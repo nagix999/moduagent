@@ -11,11 +11,14 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import math
 import mimetypes
 import os
 import re
+import shutil
 import stat
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -50,6 +53,7 @@ MAX_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_PAGE_CAPTURES = 256
 MAX_PAGE_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_PAGE_IMAGE_BYTES = 32 * 1024 * 1024
+MAX_OFFICE_RENDER_PAGES = 128
 MAX_ENRICH_BLOCKS = 512
 MAX_ENRICH_SOURCE_CHARS = 32_000
 MAX_EMBED_TEXTS = 10_000
@@ -57,6 +61,7 @@ MAX_EMBED_TEXT_CHARS = 32_000
 MAX_EMBED_BATCH_CHARS = 512_000
 MAX_EMBED_TOTAL_CHARS = 16_000_000
 MAX_VECTOR_DIMENSION = 65_536
+_LOGGER = logging.getLogger("moduagent.examples.rag_index_manager")
 
 
 class BackendError(RuntimeError):
@@ -461,7 +466,7 @@ class DoclingServeClient:
             revision=self.parser_revision,
             formats=("json", "md"),
             image_export_mode="embedded",
-            generate_page_images=self.generate_page_images,
+            include_page_images=self.generate_page_images,
             images_scale=self.images_scale,
             do_ocr=self.do_ocr,
             force_ocr=False,
@@ -491,7 +496,7 @@ class DoclingServeClient:
                     ("target_type", (None, "inbody")),
                     ("image_export_mode", (None, "embedded")),
                     (
-                        "generate_page_images",
+                        "include_page_images",
                         (None, "true" if self.generate_page_images else "false"),
                     ),
                     ("images_scale", (None, str(self.images_scale))),
@@ -916,6 +921,187 @@ def _docling_size(value: Any, name: str) -> tuple[float, float]:
     return result[0], result[1]
 
 
+class OfficePageCaptureRenderer:
+    """Render office documents to bounded PNG pages when Docling omits them."""
+
+    _EXTENSIONS = frozenset({".ppt", ".pptx", ".odp", ".doc", ".docx", ".odt"})
+
+    def __init__(
+        self,
+        *,
+        dpi: int = 120,
+        max_pages: int = 64,
+        max_image_bytes: int = MAX_PAGE_IMAGE_BYTES,
+        max_total_image_bytes: int = MAX_TOTAL_PAGE_IMAGE_BYTES,
+        operation_timeout: float = 180.0,
+        soffice_executable: str | None = None,
+        pdftocairo_executable: str | None = None,
+    ) -> None:
+        if type(dpi) is not int or not 72 <= dpi <= 300:
+            raise ValueError("office capture DPI must be between 72 and 300")
+        if type(max_pages) is not int or not 1 <= max_pages <= MAX_OFFICE_RENDER_PAGES:
+            raise ValueError("office capture max_pages is outside its supported range")
+        if (
+            type(max_image_bytes) is not int
+            or not 1 <= max_image_bytes <= 64 * 1024 * 1024
+            or type(max_total_image_bytes) is not int
+            or not max_image_bytes <= max_total_image_bytes <= 256 * 1024 * 1024
+        ):
+            raise ValueError("office capture image limits are invalid")
+        self.dpi = dpi
+        self.max_pages = max_pages
+        self.max_image_bytes = max_image_bytes
+        self.max_total_image_bytes = max_total_image_bytes
+        self.operation_timeout = _positive_float(operation_timeout, "operation_timeout")
+        self.soffice_executable = _render_executable(
+            soffice_executable, ("soffice", "libreoffice"), "LibreOffice"
+        )
+        self.pdftocairo_executable = _render_executable(
+            pdftocairo_executable, ("pdftocairo",), "pdftocairo"
+        )
+
+    @property
+    def fingerprint(self) -> str:
+        return component_fingerprint(
+            "office-page-capture",
+            revision="libreoffice-pdf-pdftocairo-v1",
+            dpi=self.dpi,
+            max_pages=self.max_pages,
+            max_image_bytes=self.max_image_bytes,
+            max_total_image_bytes=self.max_total_image_bytes,
+        )
+
+    async def capture(self, source: SourceDocument) -> tuple[PageCapture, ...]:
+        if not isinstance(source, SourceDocument):
+            raise TypeError("source must be a SourceDocument")
+        suffix = Path(source.filename).suffix.casefold()
+        if suffix not in self._EXTENSIONS:
+            return ()
+        _name, content, _media_type = _read_source(source)
+        with tempfile.TemporaryDirectory(prefix="moduagent-office-capture-") as raw:
+            root = Path(raw)
+            source_path = root / ("source" + suffix)
+            output_dir = root / "output"
+            profile_dir = root / "profile"
+            output_dir.mkdir(mode=0o700)
+            profile_dir.mkdir(mode=0o700)
+            source_path.write_bytes(content)
+            await self._command(
+                self.soffice_executable,
+                "--headless",
+                "--nologo",
+                "--nodefault",
+                "--nofirststartwizard",
+                "--norestore",
+                f"-env:UserInstallation={profile_dir.as_uri()}",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                str(output_dir),
+                str(source_path),
+            )
+            pdf_path = output_dir / "source.pdf"
+            _require_rendered_file(pdf_path, MAX_DOCUMENT_BYTES, "rendered PDF")
+            prefix = output_dir / "page"
+            await self._command(
+                self.pdftocairo_executable,
+                "-png",
+                "-r",
+                str(self.dpi),
+                "-f",
+                "1",
+                "-l",
+                str(self.max_pages + 1),
+                str(pdf_path),
+                str(prefix),
+            )
+            return self._captures(output_dir)
+
+    async def _command(self, executable: str, *arguments: str) -> None:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                executable,
+                *arguments,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(process.wait(), timeout=self.operation_timeout)
+        except asyncio.TimeoutError as exc:
+            process.kill()
+            await process.wait()
+            raise DoclingBackendError(
+                "office page capture exceeded its deadline"
+            ) from exc
+        except OSError as exc:
+            raise DoclingBackendError("office page capture could not start") from exc
+        if process.returncode != 0:
+            raise DoclingBackendError("office page capture command failed")
+
+    def _captures(self, output_dir: Path) -> tuple[PageCapture, ...]:
+        indexed: list[tuple[int, Path]] = []
+        for path in output_dir.glob("page-*.png"):
+            match = re.fullmatch(r"page-([0-9]+)\.png", path.name)
+            if match is None:
+                raise DoclingBackendError("office renderer returned an unsafe filename")
+            indexed.append((int(match.group(1)), path))
+        indexed.sort(key=lambda item: item[0])
+        if not indexed or indexed[0][0] != 1:
+            raise DoclingBackendError("office renderer returned no first page")
+        if [page for page, _path in indexed] != list(range(1, len(indexed) + 1)):
+            raise DoclingBackendError("office renderer returned non-contiguous pages")
+        if len(indexed) > self.max_pages:
+            raise DoclingBackendError("office document exceeds its page limit")
+        captures: list[PageCapture] = []
+        total_bytes = 0
+        for page_no, path in indexed:
+            _require_rendered_file(path, self.max_image_bytes, "rendered page")
+            content = path.read_bytes()
+            total_bytes += len(content)
+            if total_bytes > self.max_total_image_bytes:
+                raise DoclingBackendError(
+                    "office page captures exceed their total limit"
+                )
+            uri = "data:image/png;base64," + base64.b64encode(content).decode("ascii")
+            _decoded, width, height, _digest = _decode_page_png(
+                uri, maximum=self.max_image_bytes
+            )
+            captures.append(PageCapture(page_no, uri, width, height))
+        return tuple(captures)
+
+
+def _render_executable(
+    configured: str | None,
+    candidates: tuple[str, ...],
+    name: str,
+) -> str:
+    if configured is not None:
+        if not isinstance(configured, str) or not Path(configured).is_absolute():
+            raise ValueError(f"{name} executable must be an absolute path")
+        resolved = configured
+    else:
+        resolved = next(
+            (value for candidate in candidates if (value := shutil.which(candidate))),
+            None,
+        )
+    if resolved is None or not Path(resolved).is_file():
+        raise ValueError(f"{name} executable is unavailable")
+    return resolved
+
+
+def _require_rendered_file(path: Path, maximum: int, name: str) -> None:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise DoclingBackendError(f"{name} is unavailable") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or path.is_symlink()
+        or not 1 <= info.st_size <= maximum
+    ):
+        raise DoclingBackendError(f"{name} is invalid or exceeds its limit")
+
+
 class VLLMLayoutRefinementClient:
     """Page-scoped, reference-only layout refinement through Gemma vision."""
 
@@ -937,6 +1123,7 @@ class VLLMLayoutRefinementClient:
         max_response_bytes: int = 2 * 1024 * 1024,
         max_output_tokens: int = 16_384,
         allow_exclusions: bool = False,
+        page_capture_renderer: OfficePageCaptureRenderer | None = None,
     ) -> None:
         configured_model = (
             model
@@ -970,6 +1157,12 @@ class VLLMLayoutRefinementClient:
             raise ValueError("max_pdf_pages cannot exceed max_pages")
         if type(allow_exclusions) is not bool:
             raise TypeError("allow_exclusions must be a bool")
+        if page_capture_renderer is not None and not isinstance(
+            page_capture_renderer, OfficePageCaptureRenderer
+        ):
+            raise TypeError(
+                "page_capture_renderer must be an OfficePageCaptureRenderer or None"
+            )
         self.model = configured_model.strip()
         self.operation_timeout = _positive_float(operation_timeout, "operation_timeout")
         self.max_concurrency = max_concurrency
@@ -979,6 +1172,7 @@ class VLLMLayoutRefinementClient:
         self.max_image_bytes = max_image_bytes
         self.max_output_tokens = max_output_tokens
         self.allow_exclusions = allow_exclusions
+        self.page_capture_renderer = page_capture_renderer
         self._transport = _BoundedJSONClient(
             base_url=base_url
             if base_url is not None
@@ -1001,8 +1195,10 @@ class VLLMLayoutRefinementClient:
         return component_fingerprint(
             "vllm-layout-refinement",
             model=self.model,
-            prompt_revision="page-reference-layout-v2",
-            schema_revision="closed-existing-heading-refs-v2",
+            prompt_revision="page-reference-layout-v4-same-box-stability",
+            schema_revision="closed-existing-heading-refs-v3-vllm-compatible",
+            ambiguous_same_box_policy="raw-order-clear-model-relations-v1",
+            invalid_local_heading_policy="drop-reference-v1",
             temperature=0,
             max_tokens=self.max_output_tokens,
             max_pages=self.max_pages,
@@ -1010,6 +1206,11 @@ class VLLMLayoutRefinementClient:
             max_blocks_per_page=self.max_blocks_per_page,
             over_block_cap_policy="raw-noop",
             allow_exclusions=self.allow_exclusions,
+            page_capture_renderer=(
+                None
+                if self.page_capture_renderer is None
+                else self.page_capture_renderer.fingerprint
+            ),
             roles=tuple(sorted(LAYOUT_ROLES)),
             exclusion_reasons=tuple(sorted(LAYOUT_EXCLUSION_REASONS)),
         )
@@ -1023,6 +1224,25 @@ class VLLMLayoutRefinementClient:
     async def __aexit__(self, *_: object) -> None:
         await self.aclose()
 
+    async def capture_pages(
+        self,
+        source: SourceDocument,
+        document: Mapping[str, Any],
+    ) -> tuple[PageCapture, ...]:
+        """Prefer Docling captures, then render supported office files locally."""
+
+        captures = extract_page_captures(
+            document,
+            max_pages=self.max_pages,
+            max_image_bytes=self.max_image_bytes,
+        )
+        if captures or self.page_capture_renderer is None:
+            return captures
+        rendered = await self.page_capture_renderer.capture(source)
+        if len(rendered) > self.max_pages:
+            raise DoclingBackendError("rendered page capture count exceeds its limit")
+        return rendered
+
     async def refine(
         self,
         source: SourceDocument,
@@ -1033,7 +1253,7 @@ class VLLMLayoutRefinementClient:
 
         if not isinstance(source, SourceDocument):
             raise TypeError("source must be a SourceDocument")
-        if isinstance(captures, (str, bytes)) or len(captures) > self.max_pages:
+        if isinstance(captures, (str, bytes)) or len(captures) > MAX_PAGE_CAPTURES:
             raise ValueError("captures must be a bounded sequence")
         capture_values = tuple(captures)
         if any(not isinstance(value, PageCapture) for value in capture_values):
@@ -1086,14 +1306,26 @@ class VLLMLayoutRefinementClient:
 
         async def one(
             capture: PageCapture, page_blocks: tuple[StructuredBlock, ...]
-        ) -> LayoutPatch:
+        ) -> LayoutPatch | None:
             async with semaphore:
-                return await self._refine_page(
-                    source, capture, page_blocks, deadline=deadline
-                )
+                try:
+                    return await self._refine_page(
+                        source, capture, page_blocks, deadline=deadline
+                    )
+                except LayoutRefinementError as exc:
+                    cause = exc.__cause__
+                    if not isinstance(cause, BackendHTTPStatusError):
+                        raise
+                    _LOGGER.warning(
+                        "rag_layout_fallback source_id=%s page_no=%d http_status=%d",
+                        source.source_id,
+                        capture.page_no,
+                        cause.status_code,
+                    )
+                    return None
 
         try:
-            patches = tuple(
+            outcomes = tuple(
                 await asyncio.wait_for(
                     asyncio.gather(*(one(capture, values) for capture, values in work)),
                     timeout=self.operation_timeout,
@@ -1103,10 +1335,9 @@ class VLLMLayoutRefinementClient:
             raise LayoutRefinementError(
                 "vLLM layout refinement exceeded its deadline"
             ) from exc
-        if tuple(value.page_no for value in patches) != tuple(
-            capture.page_no for capture, _values in work
-        ):
-            raise LayoutRefinementError("layout patches do not cover selected pages")
+        patches = tuple(value for value in outcomes if value is not None)
+        if len({value.page_no for value in patches}) != len(patches):
+            raise LayoutRefinementError("layout patches contain duplicate pages")
         return patches
 
     async def _refine_page(
@@ -1124,6 +1355,10 @@ class VLLMLayoutRefinementClient:
         if not decoded:
             raise LayoutRefinementError("page capture is empty")
         block_ids = tuple(value.block_id for value in blocks)
+        geometry_order = _layout_geometry_order(source, blocks, capture.page_no)
+        geometry_rank = {
+            block_id: rank for rank, block_id in enumerate(geometry_order, start=1)
+        }
         schema = _layout_patch_schema(
             capture.page_no,
             block_ids,
@@ -1145,6 +1380,7 @@ class VLLMLayoutRefinementClient:
                     "docling_label": block.label,
                     "modality": block.modality.value,
                     "page_boxes": boxes,
+                    "geometry_rank": geometry_rank[block.block_id],
                 }
             )
         prompt = json.dumps(
@@ -1164,6 +1400,17 @@ class VLLMLayoutRefinementClient:
                     ),
                     "Only infer order, hierarchy, heading references, roles, and grouping.",
                     (
+                        "Use geometry_order_hint as the default reading order. Change it "
+                        "only when the page image clearly proves a different visual "
+                        "grouping. In columns, read left-to-right and top-to-bottom "
+                        "within each column; keep a heading before its body."
+                    ),
+                    (
+                        "Do not label every block as a heading. A title spans the page "
+                        "and a section_header is a short visual label above related "
+                        "body; values and sentences are body content."
+                    ),
+                    (
                         "Exclusion is disabled; every excluded_reason value must be null."
                         if not self.allow_exclusions
                         else "Only the schema-listed decorative/repetition exclusions are allowed."
@@ -1178,6 +1425,7 @@ class VLLMLayoutRefinementClient:
                     "width": capture.width,
                     "height": capture.height,
                     "image_sha256": image_sha256,
+                    "geometry_order_hint": list(geometry_order),
                 },
                 "untrusted_block_metadata": metadata,
             },
@@ -1231,7 +1479,7 @@ class VLLMLayoutRefinementClient:
         except BackendError as exc:
             raise LayoutRefinementError("vLLM layout refinement failed") from exc
         parsed = _layout_chat_json(response)
-        return _parse_layout_patch(
+        patch = _parse_layout_patch(
             parsed,
             page_no=capture.page_no,
             expected_ids=block_ids,
@@ -1239,6 +1487,189 @@ class VLLMLayoutRefinementClient:
             model_fingerprint=self.fingerprint,
             allow_exclusions=self.allow_exclusions,
         )
+        return _stabilize_ambiguous_same_box_blocks(
+            patch,
+            blocks,
+            page_no=capture.page_no,
+        )
+
+
+def _stabilize_ambiguous_same_box_blocks(
+    patch: LayoutPatch,
+    blocks: tuple[StructuredBlock, ...],
+    *,
+    page_no: int,
+) -> LayoutPatch:
+    """Remove model guesses that cannot be mapped to distinct visual regions.
+
+    Office conversion can split one text box into multiple Docling blocks while
+    assigning every block the exact same bounding box.  A page image cannot tell
+    which opaque block ID represents which line inside that shared region.  Keep
+    the canonical Docling order for those IDs and clear model-only relationships
+    that would otherwise manufacture unsupported structure.
+    """
+
+    by_box: dict[tuple[tuple[float, float, float, float], str | None], list[str]] = {}
+    raw_rank = {block.block_id: block.ordinal for block in blocks}
+    for block in blocks:
+        location = next(
+            (
+                value
+                for value in block.provenance
+                if value.page_no == page_no and value.bbox is not None
+            ),
+            None,
+        )
+        if location is None or location.bbox is None:
+            continue
+        key = (tuple(float(value) for value in location.bbox), location.coord_origin)
+        by_box.setdefault(key, []).append(block.block_id)
+
+    groups = tuple(
+        tuple(sorted(ids, key=raw_rank.__getitem__))
+        for ids in by_box.values()
+        if len(ids) > 1
+    )
+    if not groups:
+        return patch
+
+    ambiguous = frozenset(block_id for group in groups for block_id in group)
+    order = list(patch.ordered_block_ids)
+    for group in groups:
+        positions = sorted(order.index(block_id) for block_id in group)
+        for position, block_id in zip(positions, group, strict=True):
+            order[position] = block_id
+
+    parent = dict(patch.parent_by_block)
+    roles = dict(patch.role_by_block)
+    grouping = dict(patch.group_by_block)
+    exclusions = dict(patch.excluded_reason_by_block)
+    sections = {
+        block_id: tuple(
+            heading_id for heading_id in heading_ids if heading_id not in ambiguous
+        )
+        for block_id, heading_ids in patch.section_heading_ids_by_block.items()
+    }
+    for block_id in ambiguous:
+        parent[block_id] = None
+        roles[block_id] = None
+        grouping[block_id] = None
+        exclusions[block_id] = None
+    for block_id, value in tuple(parent.items()):
+        if value in ambiguous:
+            parent[block_id] = None
+    for block_id, value in tuple(grouping.items()):
+        if value in ambiguous:
+            grouping[block_id] = None
+
+    return LayoutPatch(
+        page_no=patch.page_no,
+        ordered_block_ids=tuple(order),
+        parent_by_block=parent,
+        section_heading_ids_by_block=sections,
+        role_by_block=roles,
+        group_by_block=grouping,
+        excluded_reason_by_block=exclusions,
+        model_fingerprint=patch.model_fingerprint,
+    )
+
+
+def _layout_geometry_order(
+    source: SourceDocument,
+    blocks: tuple[StructuredBlock, ...],
+    page_no: int,
+) -> tuple[str, ...]:
+    """Build a deterministic office reading-order hint from canonical boxes."""
+
+    office = Path(source.relative_path).suffix.casefold() in {
+        ".ppt",
+        ".pptx",
+        ".odp",
+        ".doc",
+        ".docx",
+        ".odt",
+    }
+    boxed: list[tuple[StructuredBlock, float, float, float, float]] = []
+    unboxed: list[StructuredBlock] = []
+    for block in blocks:
+        location = next(
+            (
+                value
+                for value in block.provenance
+                if value.page_no == page_no and value.bbox is not None
+            ),
+            None,
+        )
+        if location is None or location.bbox is None:
+            unboxed.append(block)
+            continue
+        left, first_y, right, second_y = location.bbox
+        visual_left, visual_right = sorted((left, right))
+        if office or location.coord_origin != "BOTTOMLEFT":
+            visual_top, visual_bottom = sorted((first_y, second_y))
+        else:
+            # In a true bottom-left coordinate space, larger Y is visually
+            # higher. Negating turns it into a top-to-bottom sort key.
+            visual_top, visual_bottom = -max(first_y, second_y), -min(first_y, second_y)
+        boxed.append((block, visual_left, visual_top, visual_right, visual_bottom))
+    if not boxed:
+        return tuple(block.block_id for block in blocks)
+    page_left = min(item[1] for item in boxed)
+    page_right = max(item[3] for item in boxed)
+    page_top = min(item[2] for item in boxed)
+    page_bottom = max(item[4] for item in boxed)
+    page_width = max(1.0, page_right - page_left)
+    page_height = max(1.0, page_bottom - page_top)
+
+    headers: list[tuple[StructuredBlock, float, float, float, float]] = []
+    footers: list[tuple[StructuredBlock, float, float, float, float]] = []
+    body: list[tuple[StructuredBlock, float, float, float, float]] = []
+    for item in boxed:
+        width = item[3] - item[1]
+        center_y = (item[2] + item[4]) / 2
+        spans = width >= page_width * 0.70
+        if spans and center_y <= page_top + page_height * 0.25:
+            headers.append(item)
+        elif spans and center_y >= page_top + page_height * 0.75:
+            footers.append(item)
+        else:
+            body.append(item)
+
+    def vertical(
+        item: tuple[StructuredBlock, float, float, float, float],
+    ) -> tuple[Any, ...]:
+        return (item[2], item[1], item[0].ordinal)
+
+    ordered = sorted(headers, key=vertical)
+    if body:
+        centers = sorted(
+            (((item[1] + item[3]) / 2, item) for item in body),
+            key=lambda value: (value[0], value[1][0].ordinal),
+        )
+        columns: list[list[tuple[StructuredBlock, float, float, float, float]]] = []
+        column_centers: list[float] = []
+        for center, item in centers:
+            if not columns or center - column_centers[-1] > page_width * 0.25:
+                columns.append([item])
+                column_centers.append(center)
+            else:
+                columns[-1].append(item)
+                column_centers[-1] = sum(
+                    (value[1] + value[3]) / 2 for value in columns[-1]
+                ) / len(columns[-1])
+        for column in columns:
+            ordered.extend(sorted(column, key=vertical))
+    ordered.extend(sorted(footers, key=vertical))
+    ordered.extend(
+        (block, 0.0, 0.0, 0.0, 0.0)
+        for block in sorted(unboxed, key=lambda value: value.ordinal)
+    )
+    identifiers = tuple(item[0].block_id for item in ordered)
+    if len(identifiers) != len(blocks) or len(set(identifiers)) != len(identifiers):
+        raise LayoutRefinementError(
+            "geometry order did not cover layout blocks exactly"
+        )
+    return identifiers
 
 
 def select_layout_captures(
@@ -1258,7 +1689,7 @@ def select_layout_captures(
     if max_pdf_pages > max_pages:
         raise ValueError("max_pdf_pages cannot exceed max_pages")
     values = tuple(captures)
-    if len(values) > max_pages or any(
+    if len(values) > MAX_PAGE_CAPTURES or any(
         not isinstance(item, PageCapture) for item in values
     ):
         raise ValueError("captures must be a bounded PageCapture sequence")
@@ -1269,8 +1700,8 @@ def select_layout_captures(
     is_pdf = source.media_type == "application/pdf" or suffix == ".pdf"
     if is_pdf:
         return ordered[:max_pdf_pages]
-    # PPT/PPTX/ODP and other bounded paginated captures are all reviewed.
-    return ordered
+    # PPT/PPTX/ODP and other paginated captures use the global page budget.
+    return ordered[:max_pages]
 
 
 def _primary_layout_page(block: StructuredBlock) -> int | None:
@@ -1316,7 +1747,6 @@ def _layout_patch_schema(
         "type": "array",
         "items": {"type": "string", "enum": list(block_ids)},
         "maxItems": 16,
-        "uniqueItems": True,
     }
     properties = {
         "page_no": {"type": "integer", "const": page_no},
@@ -1325,7 +1755,6 @@ def _layout_patch_schema(
             "items": {"type": "string", "enum": list(block_ids)},
             "minItems": len(block_ids),
             "maxItems": len(block_ids),
-            "uniqueItems": True,
         },
         "parent_by_block": exact_object(id_value),
         "section_heading_ids_by_block": exact_object(section_heading_ids_value),
@@ -1424,15 +1853,21 @@ def _parse_layout_patch(
         raise LayoutRefinementError(
             "layout raw heading labels do not match page blocks"
         )
-    for heading_ids in section_heading_ids.values():
-        for heading_id in heading_ids:
-            raw_role = raw_labels_by_id[heading_id].strip().lower().replace(" ", "_")
-            if raw_role not in {"title", "section_header"} and roles[
-                heading_id
-            ] not in {"title", "section_header"}:
-                raise LayoutRefinementError(
-                    "layout section path references a non-heading block"
-                )
+    # Section ancestry is optional retrieval metadata.  The closed schema has
+    # already proved that every reference is unique and page-local.  If the
+    # model nevertheless points at a block that neither Docling nor the model
+    # classifies as a heading, discard only that unsupported relationship.  A
+    # malformed/foreign ID still rejects the complete patch above.
+    section_heading_ids = {
+        block_id: tuple(
+            heading_id
+            for heading_id in heading_ids
+            if raw_labels_by_id[heading_id].strip().lower().replace(" ", "_")
+            in {"title", "section_header"}
+            or roles[heading_id] in {"title", "section_header"}
+        )
+        for block_id, heading_ids in section_heading_ids.items()
+    }
     if any(
         item is not None and item not in LAYOUT_EXCLUSION_REASONS
         for item in exclusions.values()

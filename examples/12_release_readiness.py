@@ -7,7 +7,7 @@ from typing import Annotated, Literal, TypedDict
 
 from pydantic import BaseModel, Field, model_validator
 
-from moduagent import Agent, RunLimits, VLLMClient, tool
+from moduagent import Agent, ConsoleEventSink, RunLimits, VLLMClient, tool
 
 
 ReleaseId = Annotated[str, Field(min_length=3, max_length=80)]
@@ -215,7 +215,7 @@ def get_deployment_capacity(
     }
 
 
-def build_agent(model):
+def build_agent(model, *, event_sink=None):
     return Agent.create(
         name="release-readiness",
         model=model,
@@ -252,6 +252,7 @@ def build_agent(model):
             no_progress_model_turn_threshold=3,
         ),
         tool_trace_mode="summary",
+        event_sink=event_sink,
     )
 
 
@@ -260,7 +261,7 @@ async def main() -> None:
     async with VLLMClient.from_env(
         default_options={"temperature": 0, "max_tokens": 768},
     ) as model:
-        result = await build_agent(model).run(
+        result = await build_agent(model, event_sink=ConsoleEventSink()).run(
             "Should payments-api-2026.08.03-rc1 ship to production now?"
         )
 

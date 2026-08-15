@@ -37,7 +37,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from moduagent import Agent, RunLimits, VLLMClient, function_tool
+from moduagent import Agent, ConsoleEventSink, RunLimits, VLLMClient, function_tool
 
 
 MAX_FILES = 10
@@ -1607,7 +1607,7 @@ H1/H2 제목이나 각주 정의를 쓰지 않는다. citations에는 사용한 
 """
 
 
-def build_intent_agent(model: Any) -> Agent:
+def build_intent_agent(model: Any, *, event_sink=None) -> Agent:
     """Build a tool-free structured router over the request text only."""
 
     return Agent.create(
@@ -1626,6 +1626,7 @@ def build_intent_agent(model: Any) -> Agent:
         model_options={"temperature": 0, "max_tokens": 256},
         finalization_mode="structured_only",
         tool_trace_mode="off",
+        event_sink=event_sink,
     )
 
 
@@ -1635,6 +1636,7 @@ def build_question_agent(
     *,
     retriever: EvidenceRetriever | None = None,
     audit: CorpusToolAudit | None = None,
+    event_sink=None,
 ) -> Agent:
     return Agent.create(
         name="document-question-agent",
@@ -1651,6 +1653,7 @@ def build_question_agent(
         ),
         finalization_mode="structured_only",
         tool_trace_mode="summary",
+        event_sink=event_sink,
     )
 
 
@@ -1660,6 +1663,7 @@ def build_outline_agent(
     *,
     retriever: EvidenceRetriever | None = None,
     audit: CorpusToolAudit | None = None,
+    event_sink=None,
 ) -> Agent:
     return Agent.create(
         name="document-report-outline-agent",
@@ -1676,6 +1680,7 @@ def build_outline_agent(
         ),
         finalization_mode="structured_only",
         tool_trace_mode="summary",
+        event_sink=event_sink,
     )
 
 
@@ -1685,6 +1690,7 @@ def build_section_agent(
     *,
     retriever: EvidenceRetriever | None = None,
     audit: CorpusToolAudit | None = None,
+    event_sink=None,
 ) -> Agent:
     return Agent.create(
         name="document-report-section-agent",
@@ -1701,6 +1707,7 @@ def build_section_agent(
         ),
         finalization_mode="structured_only",
         tool_trace_mode="summary",
+        event_sink=event_sink,
     )
 
 
@@ -1711,11 +1718,11 @@ def _validated_prompt(prompt: str) -> str:
     return value
 
 
-async def classify_intent(model: Any, prompt: str) -> RequestIntent:
+async def classify_intent(model: Any, prompt: str, *, event_sink=None) -> RequestIntent:
     """Classify a validated request without exposing documents or Tools."""
 
     request = _validated_prompt(prompt)
-    value = await build_intent_agent(model).ask(
+    value = await build_intent_agent(model, event_sink=event_sink).ask(
         json.dumps(
             {"untrusted_user_request": request, "task": "classify_only"},
             ensure_ascii=False,
@@ -1740,12 +1747,13 @@ async def run_question(
     prompt: str,
     *,
     retriever: EvidenceRetriever | None = None,
+    event_sink=None,
 ) -> str:
     """Run one structured Q&A pass and render verified Markdown."""
 
     audit = CorpusToolAudit()
     answer_value = await build_question_agent(
-        model, corpus, retriever=retriever, audit=audit
+        model, corpus, retriever=retriever, audit=audit, event_sink=event_sink
     ).ask(_validated_prompt(prompt))
     answer = QuestionAnswer.model_validate(answer_value)
     citation_ids = _citation_ids(answer.citations)
@@ -1760,13 +1768,18 @@ async def run_report(
     prompt: str,
     *,
     retriever: EvidenceRetriever | None = None,
+    event_sink=None,
 ) -> str:
     """Plan detailed sections, write each separately, then merge deterministically."""
 
     request = _validated_prompt(prompt)
     outline_audit = CorpusToolAudit()
     outline_value = await build_outline_agent(
-        model, corpus, retriever=retriever, audit=outline_audit
+        model,
+        corpus,
+        retriever=retriever,
+        audit=outline_audit,
+        event_sink=event_sink,
     ).ask(request)
     outline = ReportOutline.model_validate(outline_value)
     outline_ids: list[str] = []
@@ -1779,7 +1792,11 @@ async def run_report(
     for item in outline.sections:
         section_audit = CorpusToolAudit()
         section_agent = build_section_agent(
-            model, corpus, retriever=retriever, audit=section_audit
+            model,
+            corpus,
+            retriever=retriever,
+            audit=section_audit,
+            event_sink=event_sink,
         )
         section_prompt = json.dumps(
             {
@@ -1809,6 +1826,7 @@ async def run_document_request(
     *,
     mode: Literal["auto", "question", "report"] = "auto",
     retriever: EvidenceRetriever | None = None,
+    event_sink=None,
 ) -> str:
     """Route once over an existing corpus, with explicit modes as hard overrides."""
 
@@ -1819,10 +1837,22 @@ async def run_document_request(
     request = _validated_prompt(prompt)
     selected_mode = mode
     if selected_mode == "auto":
-        selected_mode = (await classify_intent(model, request)).mode
+        selected_mode = (
+            await classify_intent(model, request)
+            if event_sink is None
+            else await classify_intent(model, request, event_sink=event_sink)
+        ).mode
     if selected_mode == "question":
-        return await run_question(model, corpus, request, retriever=retriever)
-    return await run_report(model, corpus, request, retriever=retriever)
+        if event_sink is None:
+            return await run_question(model, corpus, request, retriever=retriever)
+        return await run_question(
+            model, corpus, request, retriever=retriever, event_sink=event_sink
+        )
+    if event_sink is None:
+        return await run_report(model, corpus, request, retriever=retriever)
+    return await run_report(
+        model, corpus, request, retriever=retriever, event_sink=event_sink
+    )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -1863,6 +1893,7 @@ async def _run_cli(args: argparse.Namespace) -> str:
             corpus,
             args.prompt,
             mode=args.mode,
+            event_sink=ConsoleEventSink(language="ko"),
         )
 
 

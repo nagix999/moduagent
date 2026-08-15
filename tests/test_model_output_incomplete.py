@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from io import StringIO
 from typing import Any
 
 import pytest
@@ -10,6 +11,7 @@ from pydantic import BaseModel
 from moduagent import (
     Agent,
     AgentRunError,
+    ConsoleEventSink,
     ModelCapabilities,
     ModelOutputIncompleteError,
     ModelRequest,
@@ -160,6 +162,59 @@ def test_successful_final_output_has_no_incomplete_error_metadata() -> None:
         assert result.output == _FinalAnswer(answer="verified")
         assert result.error_summary == {}
         assert "provider_finish_reason" not in result.metadata
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("provider_finish_reason", ["timeout", "length", "max_tokens"])
+def test_incomplete_direct_structured_output_fails_before_decode(
+    provider_finish_reason: str,
+) -> None:
+    async def scenario() -> None:
+        private_partial = '{"answer":"PRIVATE-PARTIAL"'
+        diagnostics = InMemoryDiagnosticSink()
+        console = StringIO()
+        model = _SequenceModel(
+            [
+                ModelResponse(
+                    Message.assistant(private_partial),
+                    finish_reason=provider_finish_reason,
+                ),
+                ModelResponse(Message.assistant('{"answer":"must not retry"}')),
+            ]
+        )
+        agent = Agent.create(
+            model=model,
+            instructions="Return the requested structured answer.",
+            output=_FinalAnswer,
+            retry=RetryConfig(max_attempts=3, initial_delay=0, max_delay=0),
+            event_sink=ConsoleEventSink(
+                stream=console,
+                detail="detailed",
+                color=False,
+            ),
+            diagnostic_sink=diagnostics,
+        )
+
+        result = await agent.run("Return a short answer.")
+
+        assert len(model.requests) == 1
+        assert result.finish_reason is FinishReason.ERROR
+        assert result.error == "model output incomplete"
+        assert result.error_summary["category"] == "model_protocol"
+        assert result.error_summary["code"] == "model_output_incomplete"
+        assert result.error_summary["provider_finish_reason"] == provider_finish_reason
+        assert result.failure_id is not None
+        assert diagnostics.get(result.failure_id) is not None
+        rendered = console.getvalue()
+        assert "Model request failed" in rendered
+        assert "model_output_incomplete" in rendered
+        assert "Model response received" not in rendered
+        assert private_partial not in rendered
+        assert private_partial not in json.dumps(
+            [message.to_dict() for message in result.messages],
+            ensure_ascii=False,
+        )
 
     asyncio.run(scenario())
 

@@ -11,7 +11,7 @@ from xml.sax.saxutils import escape
 
 from pydantic import BaseModel, Field
 
-from moduagent import Agent, VLLMClient, tool
+from moduagent import Agent, ConsoleEventSink, VLLMClient, tool
 
 
 SALES = (
@@ -159,7 +159,7 @@ def _bar_chart_svg(*, labels: list[str], values: list[float], title: str) -> str
     return "\n".join(elements)
 
 
-def build_agent(model):
+def build_agent(model, *, event_sink=None):
     return Agent.create(
         model=model,
         instructions=(
@@ -171,6 +171,7 @@ def build_agent(model):
         tools=[query_sales, plot_graph],
         execution="standard",
         output=SalesReport,
+        event_sink=event_sink,
     )
 
 
@@ -178,7 +179,7 @@ async def main() -> None:
     async with VLLMClient.from_env(
         default_options={"temperature": 0, "max_tokens": 512},
     ) as model:
-        agent = build_agent(model)
+        agent = build_agent(model, event_sink=ConsoleEventSink())
         report = await agent.ask(
             "Report sales from 2025-01-01 through 2025-03-31 for all regions."
         )

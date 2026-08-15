@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 import pytest
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1126,6 +1127,46 @@ def test_chunking_config_or_model_revision_changes_chunk_identity(
     assert models.ProcessingStage.EMBED.value == "embed"
 
 
+def test_chunking_repeats_bounded_document_identity_only_in_embedding_text(
+    tmp_path: Path,
+) -> None:
+    chunking = _module("chunking")
+    scanner = _module("scanner")
+    root = tmp_path / "documents"
+    _write(root, "policy.md", b"policy")
+    source = scanner.scan_document_directory(root)[0]
+    identity = _block(
+        source,
+        ordinal=0,
+        text="Policy CORP-LEAVE-042 for business unit Orion-042.",
+    )
+    rule = _block(
+        source,
+        ordinal=1,
+        text=("This mandatory rule is intentionally long. " * 6).strip(),
+    )
+    config = chunking.ChunkingConfig(
+        max_chars=128,
+        overlap_chars=0,
+        max_document_context_chars=80,
+    )
+
+    chunks = chunking.chunk_blocks(source, [identity, rule], config=config)
+
+    assert len(chunks) >= 2
+    assert "CORP-LEAVE-042" not in chunks[-1].content
+    assert "Document context: Policy CORP-LEAVE-042" in chunks[-1].embedding_text
+    assert all(len(chunk.content) <= config.max_chars for chunk in chunks)
+    assert (
+        chunking.ChunkingConfig(
+            max_chars=128,
+            overlap_chars=0,
+            max_document_context_chars=0,
+        ).fingerprint
+        != config.fingerprint
+    )
+
+
 def test_chunking_splits_long_content_and_isolates_table_modality(
     tmp_path: Path,
 ) -> None:
@@ -1397,6 +1438,398 @@ def test_in_memory_milvus_rejects_wrong_dimension_and_non_finite_vectors(
     _run(scenario())
 
 
+def test_retrieval_evaluation_reports_hit_rate_without_query_or_content(
+    tmp_path: Path,
+) -> None:
+    backends = _module("backends")
+    evaluation = _module("evaluation")
+    scanner = _module("scanner")
+    stores = _module("stores")
+    root = tmp_path / "documents"
+    _write(root, "alpha.txt", b"private alpha policy body")
+    _write(root, "bravo.txt", b"private bravo procedure body")
+    alpha, bravo = scanner.scan_document_directory(root)
+    alpha_chunk = _chunk(alpha, content="private alpha policy body")
+    bravo_chunk = _chunk(bravo, content="private bravo procedure body")
+    store = stores.InMemoryMilvusStore()
+
+    class QueryEmbedder:
+        fingerprint = "query-embedder-v1"
+
+        async def embed(self, texts: Any) -> Any:
+            assert tuple(texts) == ("private alpha query", "private bravo query")
+            return backends.EmbeddingBatch(
+                ((1.0, 0.0), (0.0, 1.0)),
+                self.fingerprint,
+                2,
+            )
+
+    async def scenario() -> None:
+        staging = await store.create_staging("gen_eval", 2, _pipeline())
+        await store.upsert(
+            staging,
+            (alpha_chunk, bravo_chunk),
+            ((1.0, 0.0), (0.0, 1.0)),
+        )
+        assert (
+            await store.validate(
+                staging,
+                expected_chunk_ids=(alpha_chunk.chunk_id, bravo_chunk.chunk_id),
+                expected_count=2,
+            )
+        ).valid
+        await store.publish(staging)
+        report = await evaluation.evaluate_retrieval(
+            QueryEmbedder(),
+            store,
+            (
+                evaluation.RetrievalEvaluationCase(
+                    "alpha",
+                    "private alpha query",
+                    (alpha.source_id,),
+                ),
+                evaluation.RetrievalEvaluationCase(
+                    "bravo",
+                    "private bravo query",
+                    (bravo.source_id,),
+                ),
+            ),
+            top_k=1,
+        )
+        assert report.generation_id == "gen_eval"
+        assert report.hit_count == 2
+        assert report.hit_rate == 1.0
+        assert report.mean_reciprocal_rank == 1.0
+        rendered = repr(report)
+        assert "private alpha query" not in rendered
+        assert "private bravo query" not in rendered
+        assert "private alpha policy body" not in rendered
+
+    _run(scenario())
+
+
+def test_retrieval_evaluation_collapses_chunks_scores_slices_and_quality_gate() -> None:
+    backends = _module("backends")
+    evaluation = _module("evaluation")
+    stores = _module("stores")
+    alpha = "src_" + "a" * 32
+    bravo = "src_" + "b" * 32
+    charlie = "src_" + "c" * 32
+
+    class QueryEmbedder:
+        fingerprint = "query-vectors-v1"
+
+        async def embed(self, texts: Any) -> Any:
+            assert tuple(texts) == ("private query one", "private query two")
+            return backends.EmbeddingBatch(
+                ((1.0, 0.0), (0.0, 1.0)),
+                self.fingerprint,
+                2,
+            )
+
+    class RankedStore:
+        limits: list[int] = []
+
+        async def active_generation_id(self) -> str:
+            return "gen_ranked"
+
+        async def search(self, vector: Any, *, limit: int = 5) -> Any:
+            self.limits.append(limit)
+            if tuple(vector) == (1.0, 0.0):
+                return (
+                    stores.SearchHit("chk_" + "1" * 32, alpha, 0.99),
+                    stores.SearchHit("chk_" + "2" * 32, alpha, 0.98),
+                    stores.SearchHit("chk_" + "3" * 32, charlie, 0.90),
+                    stores.SearchHit("chk_" + "4" * 32, bravo, 0.80),
+                )
+            return (
+                stores.SearchHit("chk_" + "5" * 32, charlie, 0.95),
+                stores.SearchHit("chk_" + "6" * 32, bravo, 0.85),
+            )
+
+    async def scenario() -> None:
+        store = RankedStore()
+        report = await evaluation.evaluate_retrieval(
+            QueryEmbedder(),
+            store,
+            (
+                evaluation.RetrievalEvaluationCase(
+                    "multi",
+                    "private query one",
+                    (alpha, bravo),
+                    (charlie,),
+                    ("exact", "finance"),
+                ),
+                evaluation.RetrievalEvaluationCase(
+                    "single",
+                    "private query two",
+                    (bravo,),
+                    (charlie,),
+                    ("multilingual-ko", "finance"),
+                ),
+            ),
+            top_k=3,
+            thresholds=evaluation.RetrievalEvaluationThresholds(
+                min_hit_rate_at_1=0.75,
+                min_hit_rate_at_k=1.0,
+                min_mean_reciprocal_rank=0.70,
+                min_mean_recall_at_k=1.0,
+                min_mean_average_precision=0.60,
+                max_forbidden_case_rate=0.25,
+                min_slice_hit_rate_at_1=0.75,
+            ),
+        )
+        assert store.limits == [30, 30]
+        assert report.results[0].retrieved_source_ids == (alpha, charlie, bravo)
+        assert report.results[0].expected_ranks == (1, 3)
+        assert report.results[0].recall_at_k == 1.0
+        assert report.results[0].average_precision == pytest.approx(5 / 6)
+        assert report.hit_rate_at_1 == 0.5
+        assert report.hit_rate == 1.0
+        assert report.mean_reciprocal_rank == 0.75
+        assert report.mean_recall_at_k == 1.0
+        assert report.forbidden_case_rate == 1.0
+        assert report.forbidden_at_1_case_rate == 0.5
+        assert report.forbidden_at_1_count == 1
+        assert {item.tag for item in report.slices} == {
+            "exact",
+            "finance",
+            "multilingual-ko",
+        }
+        assert report.passed is False
+        assert report.violations == (
+            "hit_rate_at_1_below_minimum",
+            "forbidden_case_rate_above_maximum",
+            "slice_finance_hit_rate_at_1_below_minimum",
+            "slice_multilingual-ko_hit_rate_at_1_below_minimum",
+        )
+        rendered = repr(report)
+        assert "private query" not in rendered
+
+    _run(scenario())
+
+
+def test_retrieval_evaluation_rejects_unsorted_or_duplicate_backend_hits() -> None:
+    backends = _module("backends")
+    evaluation = _module("evaluation")
+    stores = _module("stores")
+    source = "src_" + "d" * 32
+
+    class Embedder:
+        fingerprint = "query-v1"
+
+        async def embed(self, _: Any) -> Any:
+            return backends.EmbeddingBatch(((1.0, 0.0),), self.fingerprint, 2)
+
+    class Store:
+        duplicate = False
+
+        async def active_generation_id(self) -> str:
+            return "gen_invalid"
+
+        async def search(self, _: Any, *, limit: int = 5) -> Any:
+            first = stores.SearchHit("chk_" + "7" * 32, source, 0.4)
+            second = stores.SearchHit(
+                first.chunk_id if self.duplicate else "chk_" + "8" * 32,
+                source,
+                0.9,
+            )
+            return (first, second)
+
+    case = (evaluation.RetrievalEvaluationCase("case", "private", (source,)),)
+
+    async def scenario() -> None:
+        store = Store()
+        with pytest.raises(evaluation.RetrievalEvaluationError, match="unsorted"):
+            await evaluation.evaluate_retrieval(Embedder(), store, case)
+        store.duplicate = True
+        with pytest.raises(evaluation.RetrievalEvaluationError, match="duplicate"):
+            await evaluation.evaluate_retrieval(Embedder(), store, case)
+
+    _run(scenario())
+
+
+def test_in_memory_hybrid_search_corrects_exact_identifier_near_tie(
+    tmp_path: Path,
+) -> None:
+    scanner = _module("scanner")
+    stores = _module("stores")
+    root = tmp_path / "documents"
+    _write(root, "target.txt", b"target")
+    _write(root, "decoy.txt", b"decoy")
+    sources = scanner.scan_document_directory(root, kb_id="hybrid-kb")
+    target, decoy = sources
+    target_chunk = _chunk(
+        target,
+        content="Policy CORP-LEAVE-042 for business unit Orion-042",
+    )
+    decoy_chunk = _chunk(
+        decoy,
+        content="Policy CORP-LEAVE-999 for business unit Orion-999",
+    )
+
+    async def scenario() -> None:
+        store = stores.InMemoryMilvusStore()
+        staging = await store.create_staging("gen_hybrid", 2, "pipeline-v1")
+        await store.upsert(
+            staging,
+            (target_chunk, decoy_chunk),
+            ((0.995, 0.1), (1.0, 0.0)),
+        )
+        await store.validate(staging, expected_count=2)
+        await store.publish(staging)
+
+        dense = await store.search((1.0, 0.0), limit=2)
+        hybrid = await store.hybrid_search(
+            "CORP-LEAVE-042 Orion-042",
+            (1.0, 0.0),
+            limit=2,
+        )
+
+        assert dense[0].source_id == decoy.source_id
+        assert hybrid[0].source_id == target.source_id
+        assert "CORP-LEAVE-042" not in repr(hybrid)
+
+    _run(scenario())
+
+
+def test_generated_validation_corpus_has_100_diverse_documents_and_500_cases(
+    tmp_path: Path,
+) -> None:
+    package = _module()
+    scanner = _module("scanner")
+    validation = _module("validation")
+    root = tmp_path / "validation-documents"
+
+    corpus = validation.generate_validation_corpus(
+        root,
+        kb_id="quality-kb",
+        document_count=100,
+    )
+    loaded = validation.load_validation_corpus(root)
+
+    assert loaded == corpus
+    assert package.MAX_VALIDATION_DOCUMENTS == validation.MAX_VALIDATION_DOCUMENTS
+    assert package.VALIDATION_SCHEMA_VERSION == validation.VALIDATION_SCHEMA_VERSION
+    assert len(corpus.documents) == 100
+    assert len(corpus.cases) == 500
+    assert {item.format for item in corpus.documents} == {
+        "txt",
+        "md",
+        "html",
+        "csv",
+    }
+    assert {item.category for item in corpus.documents} == {
+        "leave",
+        "incident",
+        "procurement",
+        "retention",
+        "backup",
+        "access",
+        "vendor",
+        "change",
+        "travel",
+        "training",
+    }
+    scanned = scanner.scan_document_directory(root, kb_id="quality-kb")
+    assert len(scanned) == 100
+    assert {item.source_id for item in scanned} == {
+        item.source_id for item in corpus.documents
+    }
+    assert all(case.forbidden_source_ids for case in corpus.cases)
+    assert sum("multilingual-ko" in case.tags for case in corpus.cases) == 200
+    assert sum("anchor-free" in case.tags for case in corpus.cases) == 200
+
+    with pytest.raises(validation.ValidationHarnessError, match="modified"):
+        (root / corpus.documents[0].relative_path).write_text(
+            "external mutation",
+            encoding="utf-8",
+        )
+        validation.generate_validation_corpus(
+            root,
+            kb_id="quality-kb",
+            document_count=100,
+        )
+
+
+def test_validation_corpus_mutation_and_full_manager_lifecycle(tmp_path: Path) -> None:
+    evaluation = _module("evaluation")
+    validation = _module("validation")
+    root = tmp_path / "documents"
+    corpus = validation.generate_validation_corpus(
+        root,
+        kb_id="corporate-assistant",
+        document_count=12,
+    )
+    fixture = _manager_fixture(tmp_path, root)
+
+    async def scenario() -> None:
+        report = await validation.run_validation_lifecycle(
+            fixture.manager,
+            corpus,
+            top_k=5,
+            modify_count=2,
+            delete_count=1,
+            add_count=1,
+            thresholds=evaluation.RetrievalEvaluationThresholds(),
+        )
+        assert report.passed
+        assert report.violations == ()
+        assert report.document_count == 12
+        assert report.query_count == 60
+        assert tuple(item.name for item in report.phases) == (
+            "baseline_rebuild",
+            "baseline_noop",
+            "mutation",
+            "rollback",
+            "recover_mutation",
+            "final_noop",
+        )
+        assert report.phases[0].status == "published"
+        assert report.phases[1].status == "noop"
+        assert report.phases[2].modified_count == 2
+        assert report.phases[2].deleted_count == 1
+        assert report.phases[2].new_count == 1
+        assert report.phases[3].status == "rolled_back"
+        assert report.phases[-1].status == "noop"
+        assert report.baseline_quality.case_count == 60
+        assert report.final_quality.case_count == 60
+        payload = json.dumps(report.as_dict(), ensure_ascii=False)
+        assert "Under CORP" not in payload
+        assert "에 따르면" not in payload
+        assert (await fixture.manager.status()).consistent
+
+    try:
+        _run(scenario())
+    finally:
+        fixture.catalog.close()
+
+
+def test_cli_serializes_lifecycle_and_quality_validation_with_distinct_contracts() -> (
+    None
+):
+    cli = _module("cli")
+    calls: list[tuple[str, bool | None]] = []
+
+    class LifecycleReport:
+        def as_dict(self) -> dict[str, object]:
+            calls.append(("lifecycle", None))
+            return {"kind": "lifecycle"}
+
+    class QualityReport:
+        def as_dict(self, *, include_results: bool = False) -> dict[str, object]:
+            calls.append(("quality", include_results))
+            return {"kind": "quality", "include_results": include_results}
+
+    assert cli._validation_report_payload(
+        LifecycleReport(), validating=True, include_results=False
+    ) == {"kind": "lifecycle"}
+    assert cli._validation_report_payload(
+        QualityReport(), validating=False, include_results=True
+    ) == {"kind": "quality", "include_results": True}
+    assert calls == [("lifecycle", None), ("quality", True)]
+
+
 def test_real_milvus_adapter_is_lazy_until_an_operation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1413,6 +1846,45 @@ def test_real_milvus_adapter_is_lazy_until_an_operation(
     assert client.alias == "assistant_kb_active"
     assert client.fingerprint.startswith("sha256:")
     assert calls == []
+
+
+def test_real_milvus_adapter_uses_alias_catalog_when_collection_metadata_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stores = _module("stores")
+
+    class Milvus26Client:
+        def list_aliases(self, **_: Any) -> dict[str, Any]:
+            return {"aliases": ["assistant_kb_active"], "db_name": "default"}
+
+        def describe_alias(self, alias: str, **_: Any) -> dict[str, Any]:
+            assert alias == "assistant_kb_active"
+            return {
+                "alias": alias,
+                "collection_name": "assistant_kb_g_0123456789abcdef",
+            }
+
+        def list_collections(self, **_: Any) -> list[str]:
+            return ["assistant_kb_g_0123456789abcdef"]
+
+        def describe_collection(self, *_: Any, **__: Any) -> dict[str, Any]:
+            # Milvus 2.6 can return an empty collection-level alias list while
+            # describe_alias still resolves the alias correctly.
+            return {"aliases": []}
+
+    store = stores.MilvusStore(
+        uri="http://milvus.test",
+        client=Milvus26Client(),
+    )
+
+    async def direct_run(function: Any, *args: Any, **kwargs: Any) -> Any:
+        return function(*args, **kwargs)
+
+    # This unit test exercises alias-contract selection, not the production
+    # thread bridge (which the live Milvus integration covers).
+    monkeypatch.setattr(store, "_run", direct_run)
+
+    assert _run(store.current_alias()) == "assistant_kb_g_0123456789abcdef"
 
 
 def test_manager_dry_run_first_sync_and_unchanged_sync_are_side_effect_safe(
@@ -1480,10 +1952,38 @@ def test_manager_modified_source_replaces_stale_chunks_and_force_rebuilds(
     tmp_path: Path,
 ) -> None:
     stores = _module("stores")
+
+    class SelectiveCopyStore(stores.InMemoryMilvusStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.copy_from_active_flags: list[bool] = []
+            self.copied_sources: list[tuple[str, ...]] = []
+
+        async def create_staging(
+            self,
+            generation_id: str,
+            dimension: int,
+            pipeline_fingerprint: Any,
+            *,
+            copy_from_active: bool = False,
+        ) -> Any:
+            self.copy_from_active_flags.append(copy_from_active)
+            return await super().create_staging(
+                generation_id,
+                dimension,
+                pipeline_fingerprint,
+                copy_from_active=copy_from_active,
+            )
+
+        async def copy_sources_to_staging(self, staging: Any, source_ids: Any) -> Any:
+            self.copied_sources.append(tuple(source_ids))
+            return await super().copy_sources_to_staging(staging, source_ids)
+
     root = tmp_path / "documents"
     alpha_path = _write(root, "alpha.txt", b"alpha version one")
     _write(root, "bravo.txt", b"bravo policy")
-    fixture = _manager_fixture(tmp_path, root)
+    selective_store = SelectiveCopyStore()
+    fixture = _manager_fixture(tmp_path, root, store=selective_store)
 
     async def scenario() -> None:
         initial = await fixture.manager.sync()
@@ -1500,6 +2000,9 @@ def test_manager_modified_source_replaces_stale_chunks_and_force_rebuilds(
         assert len(fixture.parser.calls) == old_parser_calls + 1
         new_ids = fixture.catalog.list_chunk_ids("corporate-assistant")
         assert set(new_ids) != set(old_ids)
+        assert selective_store.copy_from_active_flags == [False, False]
+        assert len(selective_store.copied_sources) == 1
+        assert len(selective_store.copied_sources[0]) == 1
 
         active = stores.staging_handle(
             "rag",
@@ -1535,6 +2038,8 @@ def test_manager_modified_source_replaces_stale_chunks_and_force_rebuilds(
         assert rebuilt.pipeline_changed_count == 2
         assert rebuilt.previous_generation_id == modified.generation_id
         assert len(fixture.parser.calls) == counts_before_preview[0] + 2
+        assert selective_store.copy_from_active_flags == [False, False, False]
+        assert len(selective_store.copied_sources) == 1
 
     try:
         _run(scenario())
@@ -2114,6 +2619,42 @@ def test_pipeline_execution_log_is_ordered_opt_in_and_content_free(
         fixture.catalog.close()
 
 
+def test_pipeline_execution_log_pretty_view_is_hierarchical_and_content_free() -> None:
+    diagnostics_module = _module("diagnostics")
+    stream = StringIO()
+    execution_log = diagnostics_module.PipelineExecutionLog.pretty(
+        stream=stream,
+        language="ko",
+        color=False,
+    )
+
+    with execution_log.stage("sync", "run"):
+        with execution_log.stage(
+            "sync",
+            "scan",
+            counts={"documents": 100},
+        ):
+            pass
+        with execution_log.stage(
+            "sync",
+            "embed",
+            source_id="src_opaque",
+            item_index=2,
+            item_count=4,
+            counts={"chunks": 32},
+        ):
+            pass
+
+    output = stream.getvalue()
+    assert "    ◌ 증분 동기화 시작" in output
+    assert "      ◌ 문서 디렉터리 스캔 중 · documents=100" in output
+    assert "      ✓ 문서 디렉터리 스캔 완료 · documents=100" in output
+    assert "      ◌ BGE-M3 임베딩 중 · 2/4 · chunks=32" in output
+    assert "    ✓ 증분 동기화 완료" in output
+    assert "src_opaque" not in output
+    assert "rag_index_progress" not in output
+
+
 def test_management_failure_correlates_pipeline_stage_and_safe_diagnostic(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2462,6 +3003,8 @@ def test_cli_defaults_environment_mapping_and_main_import_guard(
 ) -> None:
     backends = _module("backends")
     cli = _module("cli")
+    # Keep a developer's repository-local .env from changing this defaults test.
+    monkeypatch.chdir(tmp_path)
     for name in (
         "RAG_DOCUMENT_ROOT",
         "RAG_STATE_DIR",
@@ -2471,6 +3014,8 @@ def test_cli_defaults_environment_mapping_and_main_import_guard(
         "RAG_VISION_MODEL",
         "RAG_LAYOUT_MODEL",
         "RAG_EMBEDDING_MODEL",
+        "RAG_LOG_FORMAT",
+        "RAG_LOG_LANGUAGE",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -2487,6 +3032,8 @@ def test_cli_defaults_environment_mapping_and_main_import_guard(
     assert explicit.embedding_dimension == 1024
     assert explicit.apply is False
     assert explicit.verbose is False
+    assert explicit.log_format == "pretty"
+    assert explicit.log_language == "ko"
     verbose = cli.parse_args(
         [
             "--documents",
@@ -2497,6 +3044,8 @@ def test_cli_defaults_environment_mapping_and_main_import_guard(
         ]
     )
     assert verbose.verbose is True
+    assert verbose.log_format == "pretty"
+    assert verbose.log_language == "ko"
     assert backends.VLLMEnrichmentClient().model == "gemma-4-26B-A4B-it"
     layout_client = backends.VLLMLayoutRefinementClient()
     assert layout_client.model == "gemma-4-26B-A4B-it"
@@ -2520,7 +3069,9 @@ def test_cli_defaults_environment_mapping_and_main_import_guard(
     assert _module("__main__") is not None
     cli_source = (EXAMPLE / "cli.py").read_text(encoding="utf-8")
     assert "generate_page_images=True" in cli_source
-    assert "refiner = VLLMLayoutRefinementClient(allow_exclusions=False)" in cli_source
+    assert "refiner = VLLMLayoutRefinementClient(" in cli_source
+    assert "allow_exclusions=False" in cli_source
+    assert 'environment_secret("RAG_VLLM_API_KEY")' in cli_source
     assert "refiner=refiner" in cli_source
 
     package = _module()
@@ -2531,8 +3082,585 @@ def test_cli_defaults_environment_mapping_and_main_import_guard(
     assert package.format_management_failure is agent_module.format_management_failure
 
 
-def test_backend_defaults_use_requested_models_and_credential_free_urls() -> None:
+def test_env_file_loads_cli_defaults_without_overriding_process_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = _module("cli")
+    environment = _module("environment")
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        """
+        # literal values only
+        export RAG_DOCUMENT_ROOT='corpus/documents'
+        RAG_STATE_DIR="runtime/state"
+        RAG_KB_ID=nist-cybersecurity
+        RAG_EMBEDDING_DIMENSION=1024
+        RAG_TEXT_MODEL=$NOT_EXPANDED
+        """,
+        encoding="utf-8",
+    )
+    for name in (
+        "RAG_DOCUMENT_ROOT",
+        "RAG_STATE_DIR",
+        "RAG_KB_ID",
+        "RAG_EMBEDDING_DIMENSION",
+        "RAG_TEXT_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("RAG_KB_ID", "process-wins")
+
+    args = cli.parse_args(
+        ["--env-file", str(env_file), "--request", "변경 계획을 보여줘"]
+    )
+
+    assert args.env_file == str(env_file)
+    assert args.documents == "corpus/documents"
+    assert args.state_dir == "runtime/state"
+    assert args.kb_id == "process-wins"
+    assert args.embedding_dimension == 1024
+    assert os.environ["RAG_TEXT_MODEL"] == "$NOT_EXPANDED"
+    assert environment.load_environment_file(env_file) == {
+        "RAG_DOCUMENT_ROOT": "corpus/documents",
+        "RAG_STATE_DIR": "runtime/state",
+        "RAG_KB_ID": "nist-cybersecurity",
+        "RAG_EMBEDDING_DIMENSION": "1024",
+        "RAG_TEXT_MODEL": "$NOT_EXPANDED",
+    }
+    for name in (
+        "RAG_DOCUMENT_ROOT",
+        "RAG_STATE_DIR",
+        "RAG_EMBEDDING_DIMENSION",
+        "RAG_TEXT_MODEL",
+    ):
+        os.environ.pop(name, None)
+
+
+def test_environment_secret_reads_safe_file_without_exposing_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _module("environment")
+    secret_file = tmp_path / "gemma-token"
+    secret_file.write_text("private-runpod-token\n", encoding="utf-8")
+    monkeypatch.delenv("RAG_VLLM_API_KEY", raising=False)
+    monkeypatch.setenv("RAG_VLLM_API_KEY_FILE", str(secret_file))
+
+    assert environment.environment_secret("RAG_VLLM_API_KEY") == (
+        "private-runpod-token"
+    )
+
+    monkeypatch.setenv("RAG_VLLM_API_KEY", "direct-secret")
+    with pytest.raises(environment.EnvironmentFileError, match="only one") as error:
+        environment.environment_secret("RAG_VLLM_API_KEY")
+    assert "private-runpod-token" not in str(error.value)
+    assert "direct-secret" not in str(error.value)
+
+
+def test_env_file_rejects_duplicates_symlinks_and_explicit_missing_file(
+    tmp_path: Path,
+) -> None:
+    environment = _module("environment")
+    duplicate = tmp_path / "duplicate.env"
+    duplicate.write_text("RAG_KB_ID=one\nRAG_KB_ID=two\n", encoding="utf-8")
+    with pytest.raises(environment.EnvironmentFileError, match="duplicates"):
+        environment.load_environment_file(duplicate)
+
+    target = tmp_path / "target.env"
+    target.write_text("RAG_KB_ID=nist\n", encoding="utf-8")
+    link = tmp_path / "linked.env"
+    link.symlink_to(target)
+    with pytest.raises(environment.EnvironmentFileError, match="safely"):
+        environment.load_environment_file(link)
+    with pytest.raises(environment.EnvironmentFileError, match="not found"):
+        environment.load_environment_file(tmp_path / "missing.env", required=True)
+
+
+def test_continuous_supervisor_stabilizes_syncs_and_resumes_without_duplicate_work(
+    tmp_path: Path,
+) -> None:
+    supervisor_module = _module("supervisor")
+    document_root = tmp_path / "documents"
+    source = _write(document_root, "policies/change.txt", b"version one")
+    fixture = _manager_fixture(tmp_path, document_root)
+    now = [1_000.0]
+    reports: list[Any] = []
+    store = supervisor_module.SupervisorStateStore(
+        tmp_path / "state" / "supervisor-state.json"
+    )
+    policy = supervisor_module.SupervisorPolicy(
+        poll_interval_seconds=1,
+        stability_window_seconds=2,
+        full_reconcile_interval_seconds=60,
+        max_attempts=3,
+        initial_retry_seconds=1,
+        max_retry_seconds=4,
+    )
+    supervisor = supervisor_module.ContinuousIngestionSupervisor(
+        fixture.manager,
+        store,
+        policy=policy,
+        event_sink=reports.append,
+        clock=lambda: now[0],
+    )
+
+    try:
+        first = _run(supervisor.tick())
+        assert first.outcome == "stabilizing"
+        assert fixture.parser.calls == []
+
+        now[0] += 2
+        published = _run(supervisor.tick())
+        assert published.outcome == "synced"
+        assert published.document_count == 1
+        assert published.generation_id is not None
+        assert len(fixture.parser.calls) == 1
+
+        now[0] += 1
+        restarted = supervisor_module.ContinuousIngestionSupervisor(
+            fixture.manager,
+            store,
+            policy=policy,
+            clock=lambda: now[0],
+        )
+        assert _run(restarted.tick()).outcome == "idle"
+        assert len(fixture.parser.calls) == 1
+
+        source.write_bytes(b"version two")
+        changed = _run(restarted.tick())
+        assert changed.outcome == "stabilizing"
+        now[0] += 2
+        updated = _run(restarted.tick())
+        assert updated.outcome == "synced"
+        assert len(fixture.parser.calls) == 2
+
+        serialized = json.dumps([item.to_dict() for item in reports])
+        assert str(document_root) not in serialized
+        assert "version one" not in serialized
+    finally:
+        fixture.catalog.close()
+
+
+def test_continuous_supervisor_retries_quarantines_and_new_revision_recovers(
+    tmp_path: Path,
+) -> None:
+    supervisor_module = _module("supervisor")
+    diagnostics_module = _module("diagnostics")
+    document_root = tmp_path / "documents"
+    source = _write(document_root, "handbook.txt", b"healthy")
+    fixture = _manager_fixture(
+        tmp_path,
+        document_root,
+        execution_log=diagnostics_module.PipelineExecutionLog(max_events=128),
+    )
+    now = [2_000.0]
+    store = supervisor_module.SupervisorStateStore(tmp_path / "supervisor.json")
+    supervisor = supervisor_module.ContinuousIngestionSupervisor(
+        fixture.manager,
+        store,
+        policy=supervisor_module.SupervisorPolicy(
+            poll_interval_seconds=1,
+            stability_window_seconds=0,
+            full_reconcile_interval_seconds=60,
+            max_attempts=2,
+            initial_retry_seconds=1,
+            max_retry_seconds=2,
+        ),
+        clock=lambda: now[0],
+    )
+
+    try:
+        assert _run(supervisor.tick()).outcome == "synced"
+
+        source.write_bytes(b"broken revision")
+        fixture.embedder.fail = True
+        failed = _run(supervisor.tick())
+        assert failed.outcome == "retry_scheduled"
+        assert failed.retry_attempts == 1
+        assert failed.error_code == "embed_failed"
+        assert failed.failure_stage == "embed"
+
+        before_retry = _run(supervisor.tick())
+        assert before_retry.outcome == "retry_wait"
+        now[0] = failed.next_retry_at
+        quarantined = _run(supervisor.tick())
+        assert quarantined.outcome == "quarantined"
+        assert quarantined.retry_attempts == 2
+        assert _run(supervisor.tick()).outcome == "quarantined"
+
+        fixture.embedder.fail = False
+        source.write_bytes(b"recovered revision")
+        recovered = _run(supervisor.tick())
+        assert recovered.outcome == "synced"
+        assert recovered.retry_attempts == 0
+        assert (
+            store.load(
+                kb_id=fixture.manager.config.kb_id,
+                pipeline_digest=fixture.manager.pipeline.digest,
+            ).quarantined_digest
+            is None
+        )
+    finally:
+        fixture.catalog.close()
+
+
+def test_continuous_arrivals_do_not_starve_stable_files_and_deletes_settle(
+    tmp_path: Path,
+) -> None:
+    supervisor_module = _module("supervisor")
+    document_root = tmp_path / "documents"
+    first_path = _write(document_root, "first.txt", b"first")
+    fixture = _manager_fixture(tmp_path, document_root)
+    now = [10_000.0]
+    supervisor = supervisor_module.ContinuousIngestionSupervisor(
+        fixture.manager,
+        supervisor_module.SupervisorStateStore(tmp_path / "supervisor.json"),
+        policy=supervisor_module.SupervisorPolicy(
+            poll_interval_seconds=1,
+            stability_window_seconds=10,
+            full_reconcile_interval_seconds=600,
+            max_attempts=3,
+            initial_retry_seconds=1,
+            max_retry_seconds=2,
+        ),
+        clock=lambda: now[0],
+    )
+
+    try:
+        assert _run(supervisor.tick()).outcome == "stabilizing"
+        now[0] += 5
+        _write(document_root, "second.txt", b"second")
+        assert _run(supervisor.tick()).outcome == "stabilizing"
+
+        now[0] += 5
+        first_published = _run(supervisor.tick())
+        assert first_published.outcome == "synced"
+        assert [call[0] for call in fixture.parser.calls] == [
+            _module("scanner").scan_document_directory(document_root)[0].source_id
+        ]
+        assert len(fixture.catalog.list_documents("corporate-assistant")) == 1
+
+        now[0] += 5
+        second_published = _run(supervisor.tick())
+        assert second_published.outcome == "synced"
+        assert len(fixture.catalog.list_documents("corporate-assistant")) == 2
+
+        first_path.unlink()
+        assert _run(supervisor.tick()).outcome == "stabilizing"
+        assert len(fixture.catalog.list_documents("corporate-assistant")) == 2
+        now[0] += 10
+        deleted = _run(supervisor.tick())
+        assert deleted.outcome == "synced"
+        remaining = fixture.catalog.list_documents("corporate-assistant")
+        assert [item.relative_path for item in remaining] == ["second.txt"]
+    finally:
+        fixture.catalog.close()
+
+
+def test_supervisor_scan_failure_uses_bounded_retry_without_leaking_path(
+    tmp_path: Path,
+) -> None:
+    supervisor_module = _module("supervisor")
+    document_root = tmp_path / "documents"
+    _write(document_root, "policy.txt", b"secret body")
+    fixture = _manager_fixture(tmp_path, document_root)
+    now = [20_000.0]
+    reports: list[Any] = []
+    supervisor = supervisor_module.ContinuousIngestionSupervisor(
+        fixture.manager,
+        supervisor_module.SupervisorStateStore(tmp_path / "supervisor.json"),
+        policy=supervisor_module.SupervisorPolicy(
+            poll_interval_seconds=1,
+            stability_window_seconds=1,
+            full_reconcile_interval_seconds=60,
+            max_attempts=3,
+            initial_retry_seconds=2,
+            max_retry_seconds=4,
+        ),
+        event_sink=reports.append,
+        clock=lambda: now[0],
+    )
+
+    try:
+        for path in document_root.iterdir():
+            path.unlink()
+        document_root.rmdir()
+        failure = _run(supervisor.tick())
+        assert failure.outcome == "retry_scheduled"
+        assert failure.error_code == "scan_failed"
+        assert failure.next_retry_at == now[0] + 2
+        assert _run(supervisor.tick()).outcome == "retry_wait"
+        projection = json.dumps([item.to_dict() for item in reports])
+        assert str(document_root) not in projection
+        assert "secret body" not in projection
+    finally:
+        fixture.catalog.close()
+
+
+def test_supervisor_state_is_strict_and_process_lease_is_exclusive(
+    tmp_path: Path,
+) -> None:
+    supervisor_module = _module("supervisor")
+    state_path = tmp_path / "state" / "supervisor.json"
+    store = supervisor_module.SupervisorStateStore(state_path)
+    initial = store.load(kb_id="corporate-assistant", pipeline_digest="a" * 64)
+    store.save(initial)
+    assert (
+        store.load(
+            kb_id="corporate-assistant",
+            pipeline_digest="a" * 64,
+        )
+        == initial
+    )
+
+    with store.lease():
+        with pytest.raises(supervisor_module.SupervisorAlreadyRunningError):
+            with store.lease():
+                pass
+
+    state_path.write_text('{"schema_version":1}', encoding="utf-8")
+    with pytest.raises(supervisor_module.SupervisorError, match="schema"):
+        store.load(kb_id="corporate-assistant", pipeline_digest="a" * 64)
+
+
+def test_manager_write_lease_prevents_cross_process_generation_races(
+    tmp_path: Path,
+) -> None:
+    supervisor_module = _module("supervisor")
+    document_root = tmp_path / "documents"
+    _write(document_root, "policy.txt", b"policy")
+    fixture = _manager_fixture(tmp_path, document_root)
+    store = supervisor_module.SupervisorStateStore(tmp_path / "supervisor.json")
+    fixture.manager.write_lease = store.operation_lease
+
+    try:
+        with store.operation_lease():
+            with pytest.raises(
+                supervisor_module.SupervisorAlreadyRunningError,
+                match="write operation",
+            ):
+                _run(fixture.manager.sync())
+        assert fixture.parser.calls == []
+        assert _run(fixture.manager.sync()).status == "published"
+    finally:
+        fixture.catalog.close()
+
+
+def test_management_status_reports_continuous_ingestion_health(
+    tmp_path: Path,
+) -> None:
+    agent_module = _module("agent")
+    supervisor_module = _module("supervisor")
+    document_root = tmp_path / "documents"
+    document_root.mkdir()
+    fixture = _manager_fixture(tmp_path, document_root)
+    state = supervisor_module.SupervisorState(
+        schema_version=1,
+        kb_id=fixture.manager.config.kb_id,
+        pipeline_digest=fixture.manager.pipeline.digest,
+        last_success_at=1_000.0,
+    )
+    payload = {
+        "operation": "status",
+        "status": "observed",
+        "kb_id": "corporate-assistant",
+        "summary": "자동 수집이 정상입니다.",
+        "generation_id": None,
+        "previous_generation_id": None,
+        "document_count": 0,
+        "chunk_count": 0,
+        "new_count": 0,
+        "modified_count": 0,
+        "pipeline_changed_count": 0,
+        "deleted_count": 0,
+        "unchanged_count": 0,
+        "warnings": ["continuous_ingestion=healthy"],
+    }
+    model = ScriptedManagementModel(_management_model_responses(payload))
+
+    async def scenario() -> Any:
+        return await agent_module.run_management_request(
+            model,
+            fixture.manager,
+            "자동 수집 상태를 알려줘",
+            supervisor_state_provider=lambda: state,
+        )
+
+    try:
+        result = _run(scenario())
+        assert result.warnings == ["continuous_ingestion=healthy"]
+    finally:
+        fixture.catalog.close()
+
+
+def test_cli_watch_mode_uses_env_backed_bounded_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = _module("cli")
+    monkeypatch.setenv("RAG_DOCUMENT_ROOT", str(tmp_path / "documents"))
+    monkeypatch.setenv("RAG_WATCH_POLL_SECONDS", "2")
+    monkeypatch.setenv("RAG_WATCH_STABILITY_SECONDS", "20")
+    monkeypatch.setenv("RAG_WATCH_RECONCILE_SECONDS", "600")
+    monkeypatch.setenv("RAG_WATCH_MAX_ATTEMPTS", "7")
+    args = cli.parse_args(["--watch"])
+    assert args.watch is True
+    assert args.request is None
+    assert args.poll_seconds == 2
+    assert args.stability_seconds == 20
+    assert args.reconcile_seconds == 600
+    assert args.max_attempts == 7
+
+    with pytest.raises(ValueError, match="separate operating modes"):
+        _run(cli.run_cli(cli.parse_args(["--watch", "--request", "상태"])))
+
+
+def test_nist_corpus_downloader_pins_checksums_and_resumes_without_network(
+    tmp_path: Path,
+) -> None:
+    nist = _module("sample_data.nist")
+    calls: list[str] = []
+    listing = """
+        <a href="/pubs/sp/800/2/final">SP 800-2</a>
+        <a href="/pubs/sp/800/1/rev-1/final">SP 800-1 Rev. 1</a>
+        <a href="/pubs/sp/800/3/ipd">draft is excluded</a>
+    """
+    details = {
+        "/pubs/sp/800/2/final": (
+            "Second publication",
+            "NIST.SP.800-2.pdf",
+        ),
+        "/pubs/sp/800/1/rev-1/final": (
+            "First revised publication",
+            "NIST.SP.800-1r1.pdf",
+        ),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        assert request.headers["user-agent"].startswith("moduagent-rag-example/")
+        if request.url.path == "/publications/sp800":
+            return httpx.Response(200, text=listing)
+        if request.url.host == "csrc.nist.gov":
+            title, filename = details[request.url.path]
+            return httpx.Response(
+                200,
+                text=(
+                    f"<h1>{title}</h1>"
+                    f'<a href="https://nvlpubs.nist.gov/nistpubs/'
+                    f'SpecialPublications/{filename}">Download URL</a>'
+                    '<a href="https://nvlpubs.nist.gov/other/supplement.pdf">'
+                    "Supplemental Material</a>"
+                ),
+            )
+        filename = Path(request.url.path).name
+        return httpx.Response(200, content=b"%PDF-1.7\n" + filename.encode("ascii"))
+
+    corpus_root = tmp_path / "nist-corpus"
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with nist.NISTCorpusDownloader(
+            client=client,
+            delay_seconds=0,
+            sleeper=lambda _: None,
+        ) as downloader:
+            documents = downloader.download(corpus_root, count=2)
+
+    assert [item.filename for item in documents] == [
+        "NIST.SP.800-2.pdf",
+        "NIST.SP.800-1r1.pdf",
+    ]
+    assert all(item.sha256 and len(item.sha256) == 64 for item in documents)
+    manifest = json.loads(
+        (corpus_root / "corpus-manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["domain"] == "NIST SP 800 cybersecurity and privacy"
+    assert manifest["document_count"] == 2
+    scanner = _module("scanner")
+    assert len(scanner.scan_document_directory(corpus_root / "documents")) == 2
+    assert calls == [
+        "/publications/sp800",
+        "/pubs/sp/800/2/final",
+        "/pubs/sp/800/1/rev-1/final",
+        "/nistpubs/SpecialPublications/NIST.SP.800-2.pdf",
+        "/nistpubs/SpecialPublications/NIST.SP.800-1r1.pdf",
+    ]
+
+    def fail_network(_: httpx.Request) -> httpx.Response:
+        raise AssertionError("a verified saved corpus must resume without HTTP")
+
+    with httpx.Client(transport=httpx.MockTransport(fail_network)) as client:
+        with nist.NISTCorpusDownloader(client=client, delay_seconds=0) as downloader:
+            resumed = downloader.download(corpus_root, count=2)
+    assert resumed == documents
+
+
+def test_nist_corpus_rejects_unapproved_redirects_and_non_pdf_payloads(
+    tmp_path: Path,
+) -> None:
+    nist = _module("sample_data.nist")
+
+    def redirected(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"location": "https://example.com/file"})
+
+    with httpx.Client(transport=httpx.MockTransport(redirected)) as client:
+        downloader = nist.NISTCorpusDownloader(client=client, max_attempts=1)
+        with pytest.raises(nist.NISTCorpusError, match="approved HTTPS hosts"):
+            downloader._get_text(nist.NIST_SP800_INDEX_URL, maximum=1024)
+
+    selection = {
+        "schema_version": 1,
+        "source": nist.NIST_SP800_INDEX_URL,
+        "documents": [
+            {
+                "title": "Policy",
+                "detail_url": "https://csrc.nist.gov/pubs/sp/800/1/final",
+                "download_url": (
+                    "https://nvlpubs.nist.gov/nistpubs/"
+                    "SpecialPublications/NIST.SP.800-1.pdf"
+                ),
+                "filename": "NIST.SP.800-1.pdf",
+            }
+        ],
+    }
+    corpus_root = tmp_path / "bad-corpus"
+    corpus_root.mkdir()
+    (corpus_root / "selection.json").write_text(json.dumps(selection), encoding="utf-8")
+
+    def not_pdf(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"private response body")
+
+    with httpx.Client(transport=httpx.MockTransport(not_pdf)) as client:
+        downloader = nist.NISTCorpusDownloader(client=client, max_attempts=1)
+        with pytest.raises(nist.NISTCorpusError, match="not a PDF"):
+            downloader.download(corpus_root, count=1)
+    assert not (corpus_root / "documents" / "NIST.SP.800-1.pdf").exists()
+
+
+def test_rag_example_compose_and_sample_cli_are_packaged_and_import_safe() -> None:
+    compose = yaml.safe_load((EXAMPLE / "compose.yaml").read_text(encoding="utf-8"))
+    assert set(compose["services"]) == {"docling", "etcd", "minio", "milvus"}
+    assert compose["services"]["milvus"]["image"].endswith("milvusdb/milvus:v2.5.27}")
+    assert compose["services"]["docling"]["image"].endswith(
+        "docling-project/docling-serve-cpu:v1.21.0}"
+    )
+    assert _module("sample_data") is not None
+    assert _module("sample_data.__main__") is not None
+    sample_main = (EXAMPLE / "sample_data" / "__main__.py").read_text(encoding="utf-8")
+    assert 'if __name__ == "__main__":' in sample_main
+    assert (EXAMPLE / ".env.example").is_file()
+
+
+def test_backend_defaults_use_requested_models_and_credential_free_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     backends = _module("backends")
+    for name in (
+        "RAG_TEXT_MODEL",
+        "RAG_VISION_MODEL",
+        "RAG_LAYOUT_MODEL",
+        "RAG_EMBEDDING_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
     assert backends.DEFAULT_GEMMA_MODEL == "gemma-4-26B-A4B-it"
     assert backends.DEFAULT_EMBEDDING_MODEL == "BGE-M3"
@@ -2608,7 +3736,8 @@ def test_docling_client_uploads_scanned_bytes_and_polls_complete_result(
             assert b"PDF fixture bytes" in body
             assert b'name="to_formats"' in body
             assert b"json" in body and b"md" in body
-            assert b'name="generate_page_images"' in body
+            assert b'name="include_page_images"' in body
+            assert b'name="generate_page_images"' not in body
             assert b"true" in body
             assert b'name="images_scale"' in body
             assert b"1.0" in body
@@ -2783,6 +3912,7 @@ def test_vllm_enrichment_uses_strict_schema_and_preserves_source_text(
         ) as http_client:
             client = backends.VLLMEnrichmentClient(
                 base_url="http://vllm.test/v1",
+                model=backends.DEFAULT_GEMMA_MODEL,
                 http_client=http_client,
                 max_attempts=1,
             )
@@ -2855,6 +3985,7 @@ def test_bge_m3_embedding_batches_reorder_and_normalize_vectors() -> None:
         ) as http_client:
             client = backends.VLLMEmbeddingClient(
                 base_url="http://embedding.test/v1",
+                model=backends.DEFAULT_EMBEDDING_MODEL,
                 http_client=http_client,
                 batch_size=2,
                 max_attempts=1,
@@ -3484,6 +4615,63 @@ def test_docling_whole_page_capture_uses_official_json_shape_and_null_fallback()
     assert backends.extract_page_captures(_whole_page_document(image_uri=None)) == ()
 
 
+def test_layout_client_falls_back_to_bounded_office_page_renderer(
+    tmp_path: Path,
+) -> None:
+    backends = _module("backends")
+    models = _module("models")
+    scanner = _module("scanner")
+    root = tmp_path / "documents"
+    _write(root, "deck.pptx", b"synthetic deck")
+    source = scanner.scan_document_directory(root)[0]
+    capture = models.PageCapture(1, _ONE_PIXEL_PNG, 1, 1)
+
+    class FakeOfficeRenderer(backends.OfficePageCaptureRenderer):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        @property
+        def fingerprint(self) -> str:
+            return "office-renderer-v1"
+
+        async def capture(self, value: Any) -> Any:
+            assert value == source
+            self.calls += 1
+            return (capture,)
+
+    renderer = FakeOfficeRenderer()
+    client = backends.VLLMLayoutRefinementClient(
+        base_url="http://layout.test/v1",
+        page_capture_renderer=renderer,
+    )
+
+    async def scenario() -> None:
+        assert await client.capture_pages(
+            source, _whole_page_document(image_uri=None)
+        ) == (capture,)
+        assert renderer.calls == 1
+        assert "office-renderer-v1" not in repr(client)
+        await client.aclose()
+
+    _run(scenario())
+
+
+def test_office_page_renderer_skips_non_office_sources_without_subprocess(
+    tmp_path: Path,
+) -> None:
+    backends = _module("backends")
+    scanner = _module("scanner")
+    root = tmp_path / "documents"
+    _write(root, "policy.txt", b"policy")
+    source = scanner.scan_document_directory(root)[0]
+    renderer = backends.OfficePageCaptureRenderer(
+        soffice_executable="/bin/true",
+        pdftocairo_executable="/bin/true",
+    )
+
+    assert _run(renderer.capture(source)) == ()
+
+
 @pytest.mark.parametrize(
     ("document", "kwargs", "match"),
     [
@@ -3606,6 +4794,7 @@ def test_layout_vlm_prompt_treats_document_instructions_as_data_only(
         assert injection not in serialized
         schema = payload["response_format"]["json_schema"]["schema"]
         assert schema["additionalProperties"] is False
+        assert "uniqueItems" not in json.dumps(schema)
         assert set(schema["properties"]) == {
             "page_no",
             "ordered_block_ids",
@@ -3638,6 +4827,7 @@ def test_layout_vlm_prompt_treats_document_instructions_as_data_only(
         ) as http_client:
             client = backends.VLLMLayoutRefinementClient(
                 base_url="http://layout.test/v1",
+                model=backends.DEFAULT_GEMMA_MODEL,
                 http_client=http_client,
                 max_attempts=1,
             )
@@ -3648,6 +4838,104 @@ def test_layout_vlm_prompt_treats_document_instructions_as_data_only(
     assert len(requests) == 1
     assert patches[0].ordered_block_ids == (second.block_id, first.block_id)
     assert patches[0].model_fingerprint.startswith("sha256:")
+
+
+def test_layout_vlm_preserves_raw_order_for_blocks_with_the_same_visual_box(
+    tmp_path: Path,
+) -> None:
+    backends = _module("backends")
+    models = _module("models")
+    scanner = _module("scanner")
+    root = tmp_path / "documents"
+    _write(root, "shared-text-box.pptx", b"deck")
+    source = scanner.scan_document_directory(root)[0]
+    title = _layout_block(
+        models,
+        source,
+        ordinal=0,
+        text="Policy reference CORP-PPT-701",
+        page_no=1,
+        bbox=(60, 100, 600, 300),
+    )
+    value = _layout_block(
+        models,
+        source,
+        ordinal=1,
+        text="Business unit Orion-PPT-701",
+        page_no=1,
+        bbox=(60, 100, 600, 300),
+    )
+    separate = _layout_block(
+        models,
+        source,
+        ordinal=2,
+        text="Separate visual region",
+        page_no=1,
+        bbox=(680, 100, 1200, 300),
+    )
+    block_ids = (title.block_id, value.block_id, separate.block_id)
+    response = _layout_response(
+        block_ids,
+        ordered_ids=(value.block_id, title.block_id, separate.block_id),
+    )
+    response["role_by_block"] = {
+        title.block_id: "body",
+        value.block_id: "section_header",
+        separate.block_id: "body",
+    }
+    response["parent_by_block"] = {
+        title.block_id: value.block_id,
+        value.block_id: None,
+        separate.block_id: value.block_id,
+    }
+    response["group_by_block"] = {
+        title.block_id: value.block_id,
+        value.block_id: None,
+        separate.block_id: value.block_id,
+    }
+    response["section_heading_ids_by_block"] = {
+        title.block_id: [value.block_id],
+        value.block_id: [value.block_id],
+        separate.block_id: [value.block_id],
+    }
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": json.dumps(response)},
+                    }
+                ]
+            },
+        )
+
+    async def scenario() -> Any:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            client = backends.VLLMLayoutRefinementClient(
+                base_url="http://layout.test/v1",
+                http_client=http_client,
+                max_attempts=1,
+            )
+            return await client.refine(
+                source,
+                (title, value, separate),
+                (backends.extract_page_captures(_whole_page_document())[0],),
+            )
+
+    patch = _run(scenario())[0]
+
+    assert patch.ordered_block_ids == block_ids
+    assert patch.role_by_block[title.block_id] is None
+    assert patch.role_by_block[value.block_id] is None
+    assert patch.role_by_block[separate.block_id] == "body"
+    assert all(patch.parent_by_block[block_id] is None for block_id in block_ids)
+    assert all(patch.group_by_block[block_id] is None for block_id in block_ids)
+    assert all(not values for values in patch.section_heading_ids_by_block.values())
 
 
 def test_layout_vlm_response_and_page_work_are_bounded_before_acceptance(
@@ -3719,6 +5007,95 @@ def test_layout_vlm_response_and_page_work_are_bounded_before_acceptance(
         != backends.VLLMLayoutRefinementClient(max_blocks_per_page=32).fingerprint
     )
 
+    selected_calls: list[httpx.Request] = []
+
+    def selected_page(request: httpx.Request) -> httpx.Response:
+        selected_calls.append(request)
+        response = _layout_response((blocks[0].block_id,))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": json.dumps(response)},
+                    }
+                ]
+            },
+        )
+
+    async def selection_cap() -> Any:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(selected_page)
+        ) as http_client:
+            client = backends.VLLMLayoutRefinementClient(
+                base_url="http://layout.test/v1",
+                http_client=http_client,
+                max_attempts=1,
+                max_pages=1,
+                max_pdf_pages=1,
+            )
+            second_capture = models.PageCapture(
+                page_no=2,
+                image_data_uri=capture.image_data_uri,
+                width=capture.width,
+                height=capture.height,
+            )
+            return await client.refine(
+                source,
+                blocks[:1],
+                (capture, second_capture),
+            )
+
+    assert len(_run(selection_cap())) == 1
+    assert len(selected_calls) == 1
+
+
+def test_layout_vlm_http_failure_falls_back_per_page_without_exposing_content(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    backends = _module("backends")
+    models = _module("models")
+    scanner = _module("scanner")
+    root = tmp_path / "documents"
+    _write(root, "secret-deck.pptx", b"not logged secret content")
+    source = scanner.scan_document_directory(root)[0]
+    block = _layout_block(
+        models,
+        source,
+        ordinal=0,
+        text="private slide text",
+        page_no=1,
+        bbox=(0, 0, 10, 10),
+    )
+    capture = backends.extract_page_captures(_whole_page_document())[0]
+
+    def unavailable(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"private": "provider body"})
+
+    async def scenario() -> Any:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(unavailable)
+        ) as http_client:
+            client = backends.VLLMLayoutRefinementClient(
+                base_url="http://layout.test/v1",
+                http_client=http_client,
+                max_attempts=1,
+            )
+            return await client.refine(source, (block,), (capture,))
+
+    with caplog.at_level("WARNING", "moduagent.examples.rag_index_manager"):
+        assert _run(scenario()) == ()
+    rendered = caplog.text
+    assert "rag_layout_fallback" in rendered
+    assert source.source_id in rendered
+    assert "page_no=1" in rendered
+    assert "http_status=500" in rendered
+    assert "private slide text" not in rendered
+    assert "provider body" not in rendered
+    assert "secret-deck" not in rendered
+
 
 @pytest.mark.parametrize("case", ["forged", "missing", "duplicate"])
 def test_layout_vlm_rejects_non_exact_model_block_references(
@@ -3786,7 +5163,7 @@ def test_layout_vlm_rejects_non_exact_model_block_references(
         ("arbitrary", "section heading IDs"),
         ("foreign", "section heading IDs"),
         ("duplicate", "section heading IDs"),
-        ("non_heading", "non-heading"),
+        ("non_heading", "discarded"),
     ],
 )
 def test_layout_vlm_rejects_hallucinated_or_non_heading_section_references(
@@ -3842,7 +5219,7 @@ def test_layout_vlm_rejects_hallucinated_or_non_heading_section_references(
             },
         )
 
-    async def scenario() -> None:
+    async def scenario() -> Any:
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(handler)
         ) as http_client:
@@ -3852,10 +5229,14 @@ def test_layout_vlm_rejects_hallucinated_or_non_heading_section_references(
                 max_attempts=1,
             )
             capture = backends.extract_page_captures(_whole_page_document())[0]
-            await client.refine(source, (heading, body), (capture,))
+            return await client.refine(source, (heading, body), (capture,))
 
-    with pytest.raises(models.LayoutRefinementError, match=match):
-        _run(scenario())
+    if case == "non_heading":
+        patch = _run(scenario())[0]
+        assert patch.section_heading_ids_by_block[body.block_id] == ()
+    else:
+        with pytest.raises(models.LayoutRefinementError, match=match):
+            _run(scenario())
 
 
 class FakePageDoclingParser(FakeDoclingParser):

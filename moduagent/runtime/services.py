@@ -597,6 +597,7 @@ class RuntimeServices:
                 if not isinstance(response, ModelResponse):
                     raise ModelProtocolError("model client must return ModelResponse")
                 context.run.usage = context.run.usage + response.usage
+                _require_complete_model_response(response)
                 context.run.status = RunStatus.RUNNING
                 await self._queue_model_completed(
                     context,
@@ -804,6 +805,7 @@ class RuntimeServices:
                         "model stream returned no terminal response"
                     )
                 context.run.usage = context.run.usage + response.usage
+                _require_complete_model_response(response)
                 context.run.status = RunStatus.RUNNING
                 await self._queue_model_completed(
                     context,
@@ -2129,6 +2131,14 @@ class RuntimeServices:
         if call is None or getattr(call, "name", None) not in SKILL_RESOURCE_TOOL_NAMES:
             return None
         return call
+
+
+def _require_complete_model_response(response: ModelResponse) -> None:
+    """Reject a provider-truncated response before policy or output decoding."""
+
+    finish_reason = (response.finish_reason or "").lower()
+    if finish_reason in {"timeout", "length", "max_tokens"}:
+        raise ModelOutputIncompleteError(finish_reason)
 
 
 def _memory_phase(value: str) -> MemoryPhase:

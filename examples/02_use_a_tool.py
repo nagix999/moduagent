@@ -2,7 +2,7 @@
 
 import asyncio
 
-from moduagent import Agent, VLLMClient, tool
+from moduagent import Agent, ConsoleEventSink, VLLMClient, tool
 
 
 ORDERS = {
@@ -28,7 +28,7 @@ def lookup_order(order_id: str) -> dict[str, str]:
     return {"order_id": normalized_id, **order}
 
 
-def build_agent(model):
+def build_agent(model, *, event_sink=None):
     return Agent.create(
         model=model,
         instructions=(
@@ -36,6 +36,7 @@ def build_agent(model):
             "provided, and never invent an order status."
         ),
         tools=[lookup_order],
+        event_sink=event_sink,
     )
 
 
@@ -43,7 +44,7 @@ async def main() -> None:
     async with VLLMClient.from_env(
         default_options={"temperature": 0, "max_tokens": 256},
     ) as model:
-        agent = build_agent(model)
+        agent = build_agent(model, event_sink=ConsoleEventSink())
         answer = await agent.ask("Where is order ORD-1001?")
         print(answer)
 

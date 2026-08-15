@@ -35,6 +35,7 @@ from moduagent import (
     Agent,
     AgentConfig,
     AgentResult,
+    ConsoleEventSink,
     EventType,
     InMemoryCheckpointStore,
     InMemoryConversationStore,
@@ -857,6 +858,7 @@ def build_agent() -> Agent:
         output_codec=PydanticOutputCodec(model=ReportOutput),
         conversation_store=InMemoryConversationStore(ttl_seconds=3600),
         checkpoint_store=InMemoryCheckpointStore(),
+        event_sink=ConsoleEventSink(language="ko"),
     )
 
 

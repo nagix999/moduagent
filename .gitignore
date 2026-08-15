@@ -15,3 +15,4 @@ dist/
 .pypi-token
 tmp/
 examples/artifacts/
+examples/14_rag_index_manager/.runtime/

@@ -1,6 +1,6 @@
 # 중급 예제
 
-이 예제는 ModuAgent `0.6.0`을 기준으로 합니다. 먼저 [`README.md`](README.md)의
+이 예제는 ModuAgent `0.6.2`를 기준으로 합니다. 먼저 [`README.md`](README.md)의
 초급 과정을 마친 다음 `10` → `11` → `12` → `13` 순서로 진행하세요. 각 예제는
 독립적으로 실행할 수 있습니다. 예제 `10`–`12`는 애플리케이션이 소유한 결정론적
 데이터를 사용하고, 예제 `13`은 운영자가 승인한 로컬 파일과 Docling Serve endpoint를
@@ -12,7 +12,7 @@
 정확한 릴리스 버전을 설치합니다.
 
 ```bash
-python -m pip install "moduagent==0.6.0"
+python -m pip install "moduagent==0.6.2"
 ```
 
 또는 이 소스 체크아웃에서 현재 작업 트리를 사용합니다.
@@ -29,6 +29,11 @@ export VLLM_BASE_URL="<your vLLM base URL>"
 export VLLM_MODEL="<your tool-capable model>"
 export VLLM_API_KEY="<optional token>"
 ```
+
+실행 가능한 예제는 `ConsoleEventSink`를 연결해 Agent·모델·Tool 진행 상태를
+내용 비노출 방식으로 stderr에 표시합니다. builder의 `event_sink=`에
+`ConsoleEventSink(language="ko", detail="detailed")`를 전달하면 Jupyter에서도
+같은 진행 화면을 사용할 수 있습니다.
 
 ## 학습 경로
 

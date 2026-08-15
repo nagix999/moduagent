@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import secrets
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
 from .artifacts import ArtifactError, ArtifactStore
 from .backends import (
@@ -27,6 +29,7 @@ from .models import (
     LayoutPatch,
     LayoutRefinementPolicy,
     LayoutRefiner,
+    ManifestDocument,
     PageCapture,
     PipelineFingerprint,
     ProcessingStage,
@@ -40,7 +43,7 @@ from .models import (
 from .planner import plan_incremental_sync
 from .restructure import restructure_docling_document
 from .scanner import ScanPolicy, scan_document_directory
-from .stores import IndexValidation, StagingGeneration, VectorStore
+from .stores import CopyResult, IndexValidation, StagingGeneration, VectorStore
 
 
 class PipelineError(RAGIndexError):
@@ -190,6 +193,7 @@ class RAGIndexManager:
         vector_store: VectorStore,
         refiner: LayoutRefiner | None = None,
         execution_log: PipelineExecutionLog | None = None,
+        write_lease: Callable[[], Any] | None = None,
     ) -> None:
         if not isinstance(config, ManagerConfig):
             raise TypeError("config must be a ManagerConfig")
@@ -231,6 +235,8 @@ class RAGIndexManager:
             PipelineExecutionLog,
         ):
             raise TypeError("execution_log must be a PipelineExecutionLog")
+        if write_lease is not None and not callable(write_lease):
+            raise TypeError("write_lease must be callable or None")
         if (
             pipeline.embedding_dimension is not None
             and pipeline.embedding_dimension != config.embedding_dimension
@@ -246,7 +252,9 @@ class RAGIndexManager:
         self.embedder = embedder
         self.vector_store = vector_store
         self.execution_log = execution_log
+        self.write_lease = write_lease
         self._lock = asyncio.Lock()
+        self._write_entry_lock = asyncio.Lock()
 
     def _stage(
         self,
@@ -305,10 +313,49 @@ class RAGIndexManager:
         if type(force_rebuild) is not bool:
             raise TypeError("force_rebuild must be a bool")
         operation = "rebuild" if force_rebuild else "sync"
-        with self._stage(operation, "run"):
-            return await self._sync_unlogged(force_rebuild=force_rebuild)
+        async with self._write_entry_lock:
+            lease = (
+                self.write_lease() if self.write_lease is not None else nullcontext()
+            )
+            with lease:
+                with self._stage(operation, "run"):
+                    return await self._sync_unlogged(force_rebuild=force_rebuild)
 
-    async def _sync_unlogged(self, *, force_rebuild: bool) -> SyncReport:
+    async def sync_snapshot(
+        self,
+        sources: Sequence[SourceDocument],
+    ) -> SyncReport:
+        """Sync one application-verified stable subset from a continuous watcher."""
+
+        source_values = tuple(sources)
+        if any(not isinstance(value, SourceDocument) for value in source_values):
+            raise TypeError("sources must contain SourceDocument values")
+        if any(value.kb_id != self.config.kb_id for value in source_values):
+            raise PipelineError(
+                "stable source snapshot belongs to another knowledge base"
+            )
+        expected_root = Path(os.path.abspath(os.fspath(self.config.document_root)))
+        if any(value.root != expected_root for value in source_values):
+            raise PipelineError(
+                "stable source snapshot has an unexpected document root"
+            )
+        async with self._write_entry_lock:
+            lease = (
+                self.write_lease() if self.write_lease is not None else nullcontext()
+            )
+            with lease:
+                with self._stage("sync", "run"):
+                    return await self._sync_unlogged(
+                        force_rebuild=False,
+                        source_snapshot=source_values,
+                    )
+
+    async def _sync_unlogged(
+        self,
+        *,
+        force_rebuild: bool,
+        source_snapshot: tuple[SourceDocument, ...] | None = None,
+    ) -> SyncReport:
         if type(force_rebuild) is not bool:
             raise TypeError("force_rebuild must be a bool")
         async with self._lock:
@@ -320,6 +367,7 @@ class RAGIndexManager:
             sources, plan = self._scan_and_plan(
                 force_rebuild=force_rebuild,
                 operation=operation,
+                source_snapshot=source_snapshot,
             )
             dimension_migration = self._requires_dimension_migration(
                 plan,
@@ -368,11 +416,12 @@ class RAGIndexManager:
                         generation_id,
                         self.config.embedding_dimension,
                         self.pipeline,
-                        copy_from_active=(
-                            previous_generation is not None
-                            and not force_rebuild
-                            and not dimension_migration
-                        ),
+                        # Copying the complete active collection and then
+                        # deleting changed sources is not safe on real Milvus:
+                        # a delete issued immediately after a generation copy
+                        # can remain temporarily invisible.  Start empty and
+                        # copy only sources whose vectors are being retained.
+                        copy_from_active=False,
                     )
                 action_count = len(plan.actions)
                 for item_index, action in enumerate(plan.actions, start=1):
@@ -385,6 +434,11 @@ class RAGIndexManager:
                     if action.change is ChangeKind.UNCHANGED:
                         assert action.previous is not None
                         with self._stage(operation, "carry_forward", **action_fields):
+                            copied = await self.vector_store.copy_sources_to_staging(
+                                staging,
+                                (action.source_id,),
+                            )
+                            self._require_copied_source(copied, action.previous)
                             self.catalog.carry_forward_document(
                                 run_id,
                                 action.previous,
@@ -405,6 +459,11 @@ class RAGIndexManager:
                         and not force_rebuild
                     ):
                         with self._stage(operation, "reuse_index", **action_fields):
+                            copied = await self.vector_store.copy_sources_to_staging(
+                                staging,
+                                (action.source_id,),
+                            )
+                            self._require_copied_source(copied, action.previous)
                             self.catalog.carry_forward_document(
                                 run_id,
                                 action.previous,
@@ -547,8 +606,13 @@ class RAGIndexManager:
                 raise
 
     async def rollback(self) -> SyncReport:
-        with self._stage("rollback", "run"):
-            return await self._rollback_unlogged()
+        async with self._write_entry_lock:
+            lease = (
+                self.write_lease() if self.write_lease is not None else nullcontext()
+            )
+            with lease:
+                with self._stage("rollback", "run"):
+                    return await self._rollback_unlogged()
 
     async def _rollback_unlogged(self) -> SyncReport:
         async with self._lock:
@@ -636,12 +700,17 @@ class RAGIndexManager:
         *,
         force_rebuild: bool,
         operation: str,
+        source_snapshot: tuple[SourceDocument, ...] | None = None,
     ) -> tuple[tuple[SourceDocument, ...], SyncPlan]:
         with self._stage(operation, "scan"):
-            sources = scan_document_directory(
-                self.config.document_root,
-                kb_id=self.config.kb_id,
-                policy=self.config.scan_policy,
+            sources = (
+                scan_document_directory(
+                    self.config.document_root,
+                    kb_id=self.config.kb_id,
+                    policy=self.config.scan_policy,
+                )
+                if source_snapshot is None
+                else source_snapshot
             )
         with self._stage(
             operation,
@@ -797,7 +866,12 @@ class RAGIndexManager:
 
         if self.pipeline.layout_refinement is not None:
             with self._stage(operation, "extract_page_captures", **source_fields):
-                captures = extract_page_captures(document)
+                capture_pages = getattr(self.refiner, "capture_pages", None)
+                captures = (
+                    await capture_pages(source, document)
+                    if callable(capture_pages)
+                    else extract_page_captures(document)
+                )
                 if not isinstance(captures, tuple) or any(
                     not isinstance(item, PageCapture) for item in captures
                 ):
@@ -992,6 +1066,15 @@ class RAGIndexManager:
     def _require_valid_staging(value: IndexValidation) -> None:
         if not isinstance(value, IndexValidation) or not value.valid:
             raise PipelineError("Milvus staging validation failed")
+
+    @staticmethod
+    def _require_copied_source(value: CopyResult, document: ManifestDocument) -> None:
+        if (
+            not isinstance(value, CopyResult)
+            or value.source_ids != (document.source_id,)
+            or value.copied_rows != document.chunk_count
+        ):
+            raise PipelineError("Milvus did not copy the retained source exactly")
 
     async def _rollback_index_after_catalog_failure(
         self, *, expected_previous: str | None

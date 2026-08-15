@@ -25,10 +25,18 @@ DEFAULT_EXTENSIONS = frozenset(
         ".md",
         ".txt",
         ".csv",
-        ".json",
-        ".xml",
-        ".odt",
+        ".adoc",
+        ".asciidoc",
+        ".asc",
+        ".vtt",
+        ".tex",
+        ".eml",
         ".epub",
+        ".wav",
+        ".mp3",
+        ".m4a",
+        ".flac",
+        ".ogg",
         ".png",
         ".jpg",
         ".jpeg",
@@ -78,8 +86,11 @@ def scan_document_directory(
     """Scan regular documents below ``root`` in normalized path order.
 
     Symbolic links and duplicate inodes are rejected rather than followed.
-    Unsupported regular files are ignored by default, allowing a source tree
-    to contain README or application files that are not part of the corpus.
+    The defaults mirror ordinary Docling Serve input formats. Generic JSON and
+    XML are deliberately excluded: Docling accepts only its own JSON schema and
+    specific XML dialects, which cannot be identified safely by suffix alone.
+    Unsupported regular files are ignored by default, allowing a source tree to
+    contain README or application files that are not part of the corpus.
     """
 
     resolved_policy = policy or ScanPolicy()

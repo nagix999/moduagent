@@ -6,6 +6,7 @@ from typing import Literal
 
 from moduagent import (
     Agent,
+    ConsoleEventSink,
     InMemoryDiagnosticSink,
     LoggingEventSink,
     VLLMClient,
@@ -28,7 +29,7 @@ def get_service_status(
     return {"service": service, **SERVICE_STATUS[service]}
 
 
-def build_agent(model, diagnostics: InMemoryDiagnosticSink):
+def build_agent(model, diagnostics: InMemoryDiagnosticSink, *, event_sink=None):
     return Agent.create(
         model=model,
         instructions=(
@@ -36,7 +37,7 @@ def build_agent(model, diagnostics: InMemoryDiagnosticSink):
             "Never invent operational status."
         ),
         tools=[get_service_status],
-        event_sink=LoggingEventSink(),
+        event_sink=LoggingEventSink() if event_sink is None else event_sink,
         diagnostic_sink=diagnostics,
         tool_trace_mode="summary",
     )
@@ -50,7 +51,11 @@ async def main() -> None:
     async with VLLMClient.from_env(
         default_options={"temperature": 0, "max_tokens": 256},
     ) as model:
-        agent = build_agent(model, diagnostics)
+        agent = build_agent(
+            model,
+            diagnostics,
+            event_sink=ConsoleEventSink(detail="detailed"),
+        )
         result = await agent.run("Is the orders service healthy?")
 
     print("output:", result.output)

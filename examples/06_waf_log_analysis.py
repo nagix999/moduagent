@@ -26,6 +26,7 @@ from pydantic import (
 
 from moduagent import (
     Agent,
+    ConsoleEventSink,
     AuthorizationDecision,
     RunLimits,
     ToolExecutionContext,
@@ -896,6 +897,7 @@ def build_agent(
     scope: WAFRunScope | None = None,
     evidence_provider: WAFEvidenceProvider | None = None,
     parallel_tool_calls: bool = False,
+    event_sink=None,
 ):
     if type(parallel_tool_calls) is not bool:
         raise TypeError("parallel_tool_calls must be a bool")
@@ -929,6 +931,7 @@ def build_agent(
             max_model_turns=10,
             no_progress_model_turn_threshold=3,
         ),
+        event_sink=event_sink,
     )
 
 
@@ -940,6 +943,7 @@ async def analyze_waf_log(
     evidence_provider: WAFEvidenceProvider | None = None,
     include_decoded_previews: bool = False,
     parallel_tool_calls: bool = False,
+    event_sink=None,
 ) -> WAFAnalysis:
     """Analyze a caller-redacted log and return a validated Pydantic result."""
 
@@ -955,6 +959,7 @@ async def analyze_waf_log(
         scope=scope,
         evidence_provider=evidence_provider,
         parallel_tool_calls=parallel_tool_calls,
+        event_sink=event_sink,
     ).run(
         build_analysis_request(log, event_id=scope.event_id),
         user_context={"authorized_event_id": scope.event_id},
@@ -988,6 +993,7 @@ async def main() -> None:
             model,
             SAMPLE_WAF_LOG,
             event_id=SAMPLE_EVENT_ID,
+            event_sink=ConsoleEventSink(),
         )
         print(analysis.model_dump_json(indent=2))
 

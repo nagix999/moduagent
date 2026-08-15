@@ -5,13 +5,14 @@ import importlib.util
 import os
 import sys
 from collections.abc import Mapping, Sequence
+from io import StringIO
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 import pytest
 
-from moduagent import FinishReason, VLLMClient
+from moduagent import ConsoleEventSink, FinishReason, VLLMClient
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -81,6 +82,14 @@ def _assert_run_observability(
     assert all(entry.get("error") is None for entry in trace)
 
 
+def _assert_console_progress(stream: StringIO, expected_tools: Sequence[str]) -> None:
+    rendered = stream.getvalue()
+    assert "Agent run started" in rendered
+    assert "Agent run completed" in rendered
+    for tool_name in expected_tools:
+        assert f"Running tool · {tool_name}" in rendered
+
+
 def test_vllm_investigates_incident_with_parallel_evidence_live() -> None:
     _live_environment()
     module = _load_example("incident")
@@ -94,8 +103,16 @@ def test_vllm_investigates_incident_with_parallel_evidence_live() -> None:
 
     async def scenario() -> None:
         module.CALL_LOG.clear()
+        console = StringIO()
         async with _client(max_tokens=8192) as model:
-            agent = module.build_agent(model)
+            agent = module.build_agent(
+                model,
+                event_sink=ConsoleEventSink(
+                    stream=console,
+                    detail="detailed",
+                    color=False,
+                ),
+            )
             result = await agent.run("Investigate incident INC-2042.")
 
         _assert_run_observability(
@@ -132,6 +149,7 @@ def test_vllm_investigates_incident_with_parallel_evidence_live() -> None:
         assert call_names[0] == "get_incident"
         assert len(call_names) == len(set(call_names)) == len(expected_tools)
         assert set(call_names) == set(expected_tools)
+        _assert_console_progress(console, expected_tools)
 
     asyncio.run(scenario())
 
@@ -149,8 +167,12 @@ def test_vllm_prepares_safe_customer_resolution_live() -> None:
 
     async def scenario() -> None:
         module.CALL_LOG.clear()
+        console = StringIO()
         async with _client(max_tokens=768) as model:
-            agent = module.build_agent(model)
+            agent = module.build_agent(
+                model,
+                event_sink=ConsoleEventSink(stream=console, color=False),
+            )
             result = await agent.run(
                 "Review CASE-2048 and prepare a safe return and refund proposal. "
                 "Do not execute any action."
@@ -173,6 +195,7 @@ def test_vllm_prepares_safe_customer_resolution_live() -> None:
         call_names = [entry["tool"] for entry in module.CALL_LOG]
         assert call_names == expected_tools
         assert [entry["tool_name"] for entry in result.tool_trace] == expected_tools
+        _assert_console_progress(console, expected_tools)
 
     asyncio.run(scenario())
 
@@ -190,8 +213,12 @@ def test_vllm_holds_high_risk_security_blocked_release_live() -> None:
 
     async def scenario() -> None:
         module.CALL_LOG.clear()
+        console = StringIO()
         async with _client(max_tokens=768) as model:
-            agent = module.build_agent(model)
+            agent = module.build_agent(
+                model,
+                event_sink=ConsoleEventSink(stream=console, color=False),
+            )
             result = await agent.run(
                 "Should payments-api-2026.08.03-rc1 ship to production now?"
             )
@@ -221,5 +248,6 @@ def test_vllm_holds_high_risk_security_blocked_release_live() -> None:
         call_names = [entry["tool_name"] for entry in module.CALL_LOG]
         assert call_names == expected_tools
         assert [entry["tool_name"] for entry in result.tool_trace] == expected_tools
+        _assert_console_progress(console, expected_tools)
 
     asyncio.run(scenario())
